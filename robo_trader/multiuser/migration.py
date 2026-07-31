@@ -1,21 +1,14 @@
-"""
-Database migration for multiuser/multi-portfolio support.
+"""Quarantined legacy multiuser/multi-portfolio migration.
 
-Adds portfolio_id column to positions, trades, account, equity_history, and signals.
-Creates new portfolios table. All existing data gets portfolio_id='default'.
-
-This migration is safe and backward-compatible:
-- Only runs once (checks migration version)
-- Creates backup before modifying tables
-- Existing single-portfolio usage continues to work unchanged
+The former migration copied only the SQLite main file, rewrote financial
+tables with foreign keys disabled, collapsed account rows, and attempted
+rollback by overwriting the authoritative database.  Read-only version
+inspection and the already-applied no-op remain available.  Every mutation,
+backup, restore, and table-rewrite entrypoint now fails closed.
 """
 
-import asyncio
-import shutil
-import sqlite3
-from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import aiosqlite
 
@@ -23,14 +16,7 @@ from ..logger import get_logger
 
 logger = get_logger(__name__)
 
-MIGRATION_VERSION = 1  # Increment when adding new migrations
-
-
-# D-17: defense-in-depth allowlist. table_name in this module is always a
-# hardcoded literal from the call sites in _apply_migration_v1, but the DDL
-# below uses f-string interpolation — assert the value is one of the known
-# tables before any DDL executes so a future refactor that accidentally
-# threads a caller-supplied name through this path fails loudly.
+MIGRATION_VERSION = 1
 ALLOWED_MIGRATION_TABLES = frozenset(
     {
         "positions",
@@ -44,347 +30,86 @@ ALLOWED_MIGRATION_TABLES = frozenset(
     }
 )
 
+_QUARANTINE_MESSAGE = (
+    "legacy multiuser mutation is disabled: use descriptor-bound online backup, "
+    "clean-room restore, and a reviewed migration dry-run on a synthetic copy"
+)
+
+
+class LegacyMultiuserMigrationDisabled(RuntimeError):
+    """The unsafe legacy migration or overwrite restore was requested."""
+
 
 class MultiuserMigration:
-    """Handles database schema migration for multi-portfolio support."""
+    """Provide inspection and fail-closed compatibility for the old API."""
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
 
     async def get_migration_version(self, conn: aiosqlite.Connection) -> int:
-        """Get current migration version from database."""
+        """Read the legacy migration version without modifying schema."""
+
         try:
             cursor = await conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
             )
             row = await cursor.fetchone()
-            return row[0] if row else 0
-        except sqlite3.OperationalError:
-            # Table doesn't exist yet
+            return int(row[0]) if row else 0
+        except aiosqlite.OperationalError:
             return 0
 
     async def needs_migration(self) -> bool:
-        """Check if the database needs the multiuser migration."""
-        async with aiosqlite.connect(self.db_path) as conn:
-            current = await self.get_migration_version(conn)
+        """Report whether the quarantined legacy schema would need migration."""
+
+        if not self.db_path.exists():
+            return True
+        async with aiosqlite.connect(self._readonly_uri(), uri=True) as connection:
+            current = await self.get_migration_version(connection)
             return current < MIGRATION_VERSION
 
-    async def _create_backup(self) -> Optional[Path]:
-        """Create a backup of the database before migration.
+    async def _create_backup(self) -> None:
+        """Reject the legacy raw-copy backup path."""
 
-        Returns:
-            Path to backup file, or None if db doesn't exist
-        """
-        if not self.db_path.exists():
-            return None
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = self.db_path.with_suffix(f".backup_premultiuser_{timestamp}.db")
-        # Use asyncio.to_thread to avoid blocking the event loop
-        await asyncio.to_thread(shutil.copy2, self.db_path, backup_path)
-        logger.info(f"Created database backup at: {backup_path}")
-        return backup_path
+        raise LegacyMultiuserMigrationDisabled(_QUARANTINE_MESSAGE)
 
     async def migrate(self, default_cash: float = 100_000.0) -> bool:
-        """Run the multiuser migration.
+        """No-op if absent/applied; reject every legacy mutation request."""
 
-        Args:
-            default_cash: Starting cash for the 'default' portfolio record
-
-        Returns:
-            True if migration was applied, False if already up to date
-        """
+        del default_cash
         if not self.db_path.exists():
-            logger.info("No database found - migration will be applied on first init")
+            logger.info("No database found; quarantined migration made no changes")
             return False
-
-        migration_error = None
-        backup_path = None
-
-        async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute("PRAGMA journal_mode=WAL")
-            await conn.execute("PRAGMA busy_timeout=10000")
-            await conn.execute("PRAGMA foreign_keys=OFF")
-
-            current_version = await self.get_migration_version(conn)
+        async with aiosqlite.connect(self._readonly_uri(), uri=True) as connection:
+            current_version = await self.get_migration_version(connection)
             if current_version >= MIGRATION_VERSION:
-                logger.info(f"Database already at migration version {current_version}, skipping")
+                logger.info(
+                    "Database already at migration version %s; no changes made",
+                    current_version,
+                )
                 return False
+        raise LegacyMultiuserMigrationDisabled(_QUARANTINE_MESSAGE)
 
-            # Create backup BEFORE any changes
-            backup_path = await self._create_backup()
-            logger.info(f"Starting multiuser migration (v{current_version} → v{MIGRATION_VERSION})")
-
-            try:
-                await self._apply_migration_v1(conn, default_cash)
-                await conn.commit()
-                logger.info("Multiuser migration completed successfully")
-                return True
-
-            except (sqlite3.Error, aiosqlite.Error) as e:
-                logger.error(f"Migration failed: {e}")
-                await conn.rollback()
-                migration_error = e
-
-        # Connection is closed -- safe to restore backup by overwriting the DB file
-        if migration_error:
-            if backup_path and backup_path.exists():
-                await self._restore_from_backup(backup_path)
-            raise migration_error
+    def _readonly_uri(self) -> str:
+        path = self.db_path.expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path.as_uri() + "?mode=ro"
 
     async def _restore_from_backup(self, backup_path: Path) -> None:
-        """Restore database from backup after a failed migration.
+        """Reject overwrite-based rollback even when called directly."""
 
-        Verifies integrity of the restored database. If the restore itself
-        fails, raises RuntimeError with the backup path so the user can
-        recover manually.
-        """
-        try:
-            logger.info(f"Restoring database from backup: {backup_path}")
-            await asyncio.to_thread(shutil.copy2, backup_path, self.db_path)
+        del backup_path
+        raise LegacyMultiuserMigrationDisabled(_QUARANTINE_MESSAGE)
 
-            # Verify restored database integrity
-            conn = sqlite3.connect(self.db_path)
-            try:
-                cursor = conn.cursor()
-                cursor.execute("PRAGMA integrity_check")
-                result = cursor.fetchone()
-                if result[0] != "ok":
-                    raise RuntimeError(f"Restored database failed integrity check: {result[0]}")
-            finally:
-                conn.close()
+    async def _apply_migration_v1(
+        self,
+        conn: aiosqlite.Connection,
+        default_cash: float,
+    ) -> None:
+        """Reject the old table-rewrite migration even when called directly."""
 
-            logger.info("Database restored successfully from backup")
-
-        except Exception as restore_error:
-            logger.critical(
-                f"FAILED to restore database from backup: {restore_error}. "
-                f"Manual recovery required. Backup file: {backup_path}"
-            )
-            raise RuntimeError(
-                f"Migration failed AND backup restore failed. "
-                f"Manual recovery required. Copy this backup over the database: "
-                f"{backup_path}"
-            ) from restore_error
-
-    async def _apply_migration_v1(self, conn: aiosqlite.Connection, default_cash: float):
-        """Apply migration version 1: Add multi-portfolio support."""
-
-        # 1. Create schema_migrations table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY,
-                description TEXT NOT NULL,
-                applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 2. Create portfolios table
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS portfolios (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                starting_cash REAL NOT NULL DEFAULT 100000,
-                symbols TEXT NOT NULL DEFAULT '',
-                active INTEGER NOT NULL DEFAULT 1,
-                max_position_pct REAL,
-                max_daily_loss_pct REAL,
-                max_open_positions INTEGER,
-                stop_loss_pct REAL,
-                trailing_stop_pct REAL,
-                use_trailing_stop INTEGER,
-                enabled_strategies TEXT,
-                min_confidence REAL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 3. Insert 'default' portfolio if not exists
-        await conn.execute(
-            """
-            INSERT OR IGNORE INTO portfolios (id, name, starting_cash)
-            VALUES ('default', 'Default Portfolio', ?)
-        """,
-            (default_cash,),
-        )
-
-        # 4. Migrate positions table: add portfolio_id, change unique constraint
-        await self._migrate_table_add_portfolio_id(
-            conn,
-            table_name="positions",
-            create_sql="""
-                CREATE TABLE positions_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    portfolio_id TEXT NOT NULL DEFAULT 'default',
-                    symbol TEXT NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    avg_cost REAL NOT NULL,
-                    market_price REAL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(portfolio_id, symbol)
-                )
-            """,
-            insert_sql="""
-                INSERT INTO positions_new (id, portfolio_id, symbol, quantity, avg_cost, market_price, timestamp)
-                SELECT id, 'default', symbol, quantity, avg_cost, market_price, timestamp
-                FROM positions
-            """,
-            index_sql=[
-                "CREATE INDEX IF NOT EXISTS idx_positions_portfolio ON positions (portfolio_id)",
-            ],
-        )
-
-        # 5. Migrate trades table: add portfolio_id
-        await self._migrate_table_add_portfolio_id(
-            conn,
-            table_name="trades",
-            create_sql="""
-                CREATE TABLE trades_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    portfolio_id TEXT NOT NULL DEFAULT 'default',
-                    symbol TEXT NOT NULL,
-                    side TEXT NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    price REAL NOT NULL,
-                    notional REAL DEFAULT 0,
-                    slippage REAL DEFAULT 0,
-                    commission REAL DEFAULT 0,
-                    pnl REAL DEFAULT NULL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """,
-            insert_sql="""
-                INSERT INTO trades_new (id, portfolio_id, symbol, side, quantity, price, notional, slippage, commission, pnl, timestamp)
-                SELECT id, 'default', symbol, side, quantity, price, notional, slippage, commission, pnl, timestamp
-                FROM trades
-            """,
-            index_sql=[
-                "CREATE INDEX IF NOT EXISTS idx_trades_portfolio ON trades (portfolio_id)",
-                "CREATE INDEX IF NOT EXISTS idx_trades_portfolio_symbol ON trades (portfolio_id, symbol, timestamp DESC)",
-            ],
-        )
-
-        # 6. Migrate account table: replace id=1 with portfolio_id
-        # Account previously had an autoincrement `id`; multiple rows may have
-        # accumulated over time. We collapse to a single 'default' row, keeping
-        # the MOST RECENT row (highest id). Warn if more than one row was found
-        # so the operator knows older snapshots are not represented in the new
-        # account table (trades/equity_history retain full history regardless).
-        try:
-            cursor = await conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='account'"
-            )
-            account_exists = await cursor.fetchone()
-            if account_exists:
-                cursor = await conn.execute("PRAGMA table_info(account)")
-                cols = [c[1] for c in await cursor.fetchall()]
-                if "portfolio_id" not in cols:
-                    cursor = await conn.execute("SELECT COUNT(*) FROM account")
-                    account_row_count = (await cursor.fetchone())[0]
-                    if account_row_count > 1:
-                        cursor = await conn.execute("SELECT MAX(id), MIN(id) FROM account")
-                        max_id, min_id = await cursor.fetchone()
-                        logger.warning(
-                            f"account table has {account_row_count} rows; "
-                            f"migration keeps only the most recent row "
-                            f"(id={max_id}; older rows id={min_id}..{max_id - 1} "
-                            f"will not appear in the new portfolio-scoped account table)."
-                        )
-        except Exception as e:
-            # Don't abort migration over a logging/diagnostic failure
-            logger.debug(f"Could not pre-check account row count: {e}")
-
-        await self._migrate_table_add_portfolio_id(
-            conn,
-            table_name="account",
-            create_sql="""
-                CREATE TABLE account_new (
-                    portfolio_id TEXT PRIMARY KEY,
-                    cash REAL NOT NULL,
-                    equity REAL NOT NULL,
-                    daily_pnl REAL DEFAULT 0,
-                    realized_pnl REAL DEFAULT 0,
-                    unrealized_pnl REAL DEFAULT 0,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """,
-            insert_sql="""
-                INSERT INTO account_new (portfolio_id, cash, equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp)
-                SELECT 'default', cash, equity, daily_pnl, realized_pnl, unrealized_pnl, timestamp
-                FROM account
-                ORDER BY id DESC LIMIT 1
-            """,
-            index_sql=[],
-        )
-
-        # 7. Migrate equity_history table: add portfolio_id, change unique constraint
-        await self._migrate_table_add_portfolio_id(
-            conn,
-            table_name="equity_history",
-            create_sql="""
-                CREATE TABLE equity_history_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    portfolio_id TEXT NOT NULL DEFAULT 'default',
-                    date TEXT NOT NULL,
-                    equity REAL NOT NULL,
-                    cash REAL DEFAULT 0,
-                    positions_value REAL DEFAULT 0,
-                    realized_pnl REAL DEFAULT 0,
-                    unrealized_pnl REAL DEFAULT 0,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(portfolio_id, date)
-                )
-            """,
-            insert_sql="""
-                INSERT INTO equity_history_new (id, portfolio_id, date, equity, cash, positions_value, realized_pnl, unrealized_pnl, timestamp)
-                SELECT id, 'default', date, equity, cash, positions_value, realized_pnl, unrealized_pnl, timestamp
-                FROM equity_history
-            """,
-            index_sql=[
-                "CREATE INDEX IF NOT EXISTS idx_equity_history_portfolio ON equity_history (portfolio_id, date)",
-            ],
-        )
-
-        # 8. Migrate signals table: add portfolio_id
-        await self._migrate_table_add_portfolio_id(
-            conn,
-            table_name="signals",
-            create_sql="""
-                CREATE TABLE signals_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    portfolio_id TEXT NOT NULL DEFAULT 'default',
-                    symbol TEXT NOT NULL,
-                    strategy TEXT NOT NULL,
-                    signal_type TEXT NOT NULL,
-                    strength REAL,
-                    metadata TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """,
-            insert_sql="""
-                INSERT INTO signals_new (id, portfolio_id, symbol, strategy, signal_type, strength, metadata, timestamp)
-                SELECT id, 'default', symbol, strategy, signal_type, strength, metadata, timestamp
-                FROM signals
-            """,
-            index_sql=[
-                "CREATE INDEX IF NOT EXISTS idx_signals_portfolio ON signals (portfolio_id)",
-            ],
-        )
-
-        # 9. Record migration
-        await conn.execute(
-            """
-            INSERT INTO schema_migrations (version, description)
-            VALUES (?, ?)
-        """,
-            (
-                MIGRATION_VERSION,
-                "Add multi-portfolio support: portfolio_id on positions, trades, account, equity_history, signals",
-            ),
-        )
-
-        logger.info("Migration v1 applied: multi-portfolio schema ready")
+        del conn, default_cash
+        raise LegacyMultiuserMigrationDisabled(_QUARANTINE_MESSAGE)
 
     async def _migrate_table_add_portfolio_id(
         self,
@@ -393,64 +118,13 @@ class MultiuserMigration:
         create_sql: str,
         insert_sql: str,
         index_sql: List[str],
-    ):
-        """Migrate a table by recreating it with portfolio_id column.
+    ) -> None:
+        """Retain validation compatibility, then reject all table rewrites."""
 
-        Uses the rename-recreate pattern since SQLite doesn't support
-        ALTER TABLE ADD CONSTRAINT.
-        """
-        # D-17: refuse any table_name outside the hardcoded allowlist before
-        # any DDL (f-string interpolated) executes. The current call sites
-        # only pass literal table names, but this guards against future
-        # regressions where caller-supplied values could thread through.
+        del conn, create_sql, insert_sql, index_sql
         if table_name not in ALLOWED_MIGRATION_TABLES:
             raise ValueError(
                 f"unexpected table_name in migration: {table_name!r}; "
                 f"must be one of {sorted(ALLOWED_MIGRATION_TABLES)}"
             )
-
-        # Check if table exists
-        cursor = await conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-            (table_name,),
-        )
-        exists = await cursor.fetchone()
-
-        if not exists:
-            # Table doesn't exist yet - create directly with portfolio_id
-            await conn.execute(create_sql.replace(f"{table_name}_new", table_name))
-            for idx_sql in index_sql:
-                await conn.execute(idx_sql)
-            logger.info(f"Created new table: {table_name} (with portfolio_id)")
-            return
-
-        # Check if already has portfolio_id column
-        cursor = await conn.execute(f"PRAGMA table_info({table_name})")
-        columns = await cursor.fetchall()
-        column_names = [col[1] for col in columns]
-
-        if "portfolio_id" in column_names:
-            logger.info(f"Table {table_name} already has portfolio_id column, skipping")
-            return
-
-        # Count existing rows for logging
-        # nosec B608 - table_name comes from hardcoded strings in this file, not user input
-        cursor = await conn.execute(f"SELECT COUNT(*) FROM {table_name}")  # nosec B608
-        row_count = (await cursor.fetchone())[0]
-
-        # Create new table
-        await conn.execute(create_sql)
-
-        # Copy data
-        if row_count > 0:
-            await conn.execute(insert_sql)
-
-        # Drop old table and rename new one
-        await conn.execute(f"DROP TABLE {table_name}")
-        await conn.execute(f"ALTER TABLE {table_name}_new RENAME TO {table_name}")
-
-        # Create indexes
-        for idx_sql in index_sql:
-            await conn.execute(idx_sql)
-
-        logger.info(f"Migrated table {table_name}: {row_count} rows, added portfolio_id column")
+        raise LegacyMultiuserMigrationDisabled(_QUARANTINE_MESSAGE)

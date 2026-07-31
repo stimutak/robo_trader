@@ -12,7 +12,10 @@ import pytest
 from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.multiuser.db_proxy import PortfolioScopedDB
-from robo_trader.multiuser.migration import MultiuserMigration
+from robo_trader.multiuser.migration import (
+    LegacyMultiuserMigrationDisabled,
+    MultiuserMigration,
+)
 from robo_trader.multiuser.portfolio_config import PortfolioConfig, load_portfolio_configs
 
 # ──────────────────────────────────────────────
@@ -267,181 +270,30 @@ async def create_legacy_schema(db_path: Path):
 
 class TestMultiuserMigration:
     @pytest.mark.asyncio
-    async def test_migration_on_legacy_db(self, temp_db):
-        """Test that migration correctly adds portfolio_id to all tables."""
-        import aiosqlite
-
-        # Create legacy schema with data
+    async def test_unmigrated_legacy_db_is_quarantined_without_changes(self, temp_db):
         await create_legacy_schema(temp_db)
-
-        # Run migration
+        before = temp_db.read_bytes()
         migration = MultiuserMigration(temp_db)
+
         assert await migration.needs_migration() is True
-        result = await migration.migrate(default_cash=100000)
-        assert result is True
+        with pytest.raises(LegacyMultiuserMigrationDisabled, match="legacy multiuser"):
+            await migration.migrate(default_cash=100000)
+        assert temp_db.read_bytes() == before
+        assert list(temp_db.parent.glob(f"{temp_db.stem}.backup_premultiuser_*")) == []
 
-        # Verify migration applied
+    @pytest.mark.asyncio
+    async def test_already_applied_migration_remains_a_noop(self, temp_db):
+        import aiosqlite
+
+        async with aiosqlite.connect(temp_db) as connection:
+            await connection.execute(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, description TEXT)"
+            )
+            await connection.execute("INSERT INTO schema_migrations VALUES (1, 'applied')")
+            await connection.commit()
+        migration = MultiuserMigration(temp_db)
         assert await migration.needs_migration() is False
-
-        # Verify data integrity
-        async with aiosqlite.connect(temp_db) as conn:
-            # Check portfolios table exists with default entry
-            cursor = await conn.execute("SELECT id, name, starting_cash FROM portfolios")
-            rows = await cursor.fetchall()
-            assert len(rows) == 1
-            assert rows[0][0] == "default"
-
-            # Check positions have portfolio_id
-            cursor = await conn.execute("SELECT portfolio_id, symbol, quantity FROM positions")
-            rows = await cursor.fetchall()
-            assert len(rows) == 2
-            assert all(row[0] == "default" for row in rows)
-
-            # Check trades have portfolio_id
-            cursor = await conn.execute("SELECT portfolio_id, symbol, side FROM trades")
-            rows = await cursor.fetchall()
-            assert len(rows) == 1
-            assert rows[0][0] == "default"
-
-            # Check account uses portfolio_id instead of id=1
-            cursor = await conn.execute("SELECT portfolio_id, cash, equity FROM account")
-            rows = await cursor.fetchall()
-            assert len(rows) == 1
-            assert rows[0][0] == "default"
-            assert rows[0][1] == 80000  # cash preserved
-
-            # Check equity_history has portfolio_id
-            cursor = await conn.execute("SELECT portfolio_id, date, equity FROM equity_history")
-            rows = await cursor.fetchall()
-            assert len(rows) == 1
-            assert rows[0][0] == "default"
-
-            # Check signals have portfolio_id
-            cursor = await conn.execute("SELECT portfolio_id, symbol, strategy FROM signals")
-            rows = await cursor.fetchall()
-            assert len(rows) == 1
-            assert rows[0][0] == "default"
-
-    @pytest.mark.asyncio
-    async def test_migration_is_idempotent(self, temp_db):
-        """Running migration twice should be safe."""
-        await create_legacy_schema(temp_db)
-
-        migration = MultiuserMigration(temp_db)
-        result1 = await migration.migrate()
-        assert result1 is True
-
-        result2 = await migration.migrate()
-        assert result2 is False  # Already applied
-
-    @pytest.mark.asyncio
-    async def test_migration_creates_backup(self, temp_db):
-        """Migration should create a backup file."""
-        await create_legacy_schema(temp_db)
-
-        migration = MultiuserMigration(temp_db)
-        await migration.migrate()
-
-        backups = list(temp_db.parent.glob(f"{temp_db.stem}.backup_premultiuser_*"))
-        assert len(backups) >= 1
-
-    @pytest.mark.asyncio
-    async def test_migration_on_empty_db(self, temp_db):
-        """Migration on a fresh/empty database should work."""
-        import aiosqlite
-
-        # Create empty DB with just the tables (no data)
-        async with aiosqlite.connect(temp_db) as conn:
-            await conn.execute("""
-                CREATE TABLE positions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    avg_cost REAL NOT NULL,
-                    market_price REAL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(symbol)
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE trades (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    side TEXT NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    price REAL NOT NULL,
-                    notional REAL DEFAULT 0,
-                    slippage REAL DEFAULT 0,
-                    commission REAL DEFAULT 0,
-                    pnl REAL DEFAULT NULL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE account (
-                    id INTEGER PRIMARY KEY,
-                    cash REAL NOT NULL,
-                    equity REAL NOT NULL,
-                    daily_pnl REAL DEFAULT 0,
-                    realized_pnl REAL DEFAULT 0,
-                    unrealized_pnl REAL DEFAULT 0,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE equity_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL UNIQUE,
-                    equity REAL NOT NULL,
-                    cash REAL DEFAULT 0,
-                    positions_value REAL DEFAULT 0,
-                    realized_pnl REAL DEFAULT 0,
-                    unrealized_pnl REAL DEFAULT 0,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE signals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    strategy TEXT NOT NULL,
-                    signal_type TEXT NOT NULL,
-                    strength REAL,
-                    metadata TEXT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await conn.commit()
-
-        migration = MultiuserMigration(temp_db)
-        result = await migration.migrate()
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_unique_constraint_portfolio_symbol(self, temp_db):
-        """Two portfolios can hold the same symbol independently."""
-        import aiosqlite
-
-        await create_legacy_schema(temp_db)
-        migration = MultiuserMigration(temp_db)
-        await migration.migrate()
-
-        async with aiosqlite.connect(temp_db) as conn:
-            # Portfolio A has AAPL (from migration, portfolio_id='default')
-            # Portfolio B can also have AAPL
-            await conn.execute(
-                "INSERT INTO positions (portfolio_id, symbol, quantity, avg_cost) VALUES (?, ?, ?, ?)",
-                ("portfolio_b", "AAPL", 50, 190.00),
-            )
-            await conn.commit()
-
-            cursor = await conn.execute(
-                "SELECT portfolio_id, symbol, quantity FROM positions WHERE symbol = 'AAPL'"
-            )
-            rows = await cursor.fetchall()
-            assert len(rows) == 2
-            portfolios = {row[0] for row in rows}
-            assert portfolios == {"default", "portfolio_b"}
+        assert await migration.migrate() is False
 
     @pytest.mark.asyncio
     async def test_no_db_file_returns_false(self, temp_db):
@@ -1361,100 +1213,22 @@ class TestUpsertPortfolio:
 
 
 class TestMigrationEdgeCases:
-    """Additional migration edge cases."""
+    """The legacy mutation path cannot run even on unusual fixture content."""
 
     @pytest.mark.asyncio
-    async def test_migration_version_recorded_correctly(self, temp_db):
-        """Migration version is recorded in schema_migrations table."""
+    async def test_quarantine_preserves_null_prices_pnl_and_many_rows(self, temp_db):
         import aiosqlite
 
         await create_legacy_schema(temp_db)
-        migration = MultiuserMigration(temp_db)
-        await migration.migrate()
-
-        async with aiosqlite.connect(temp_db) as conn:
-            cursor = await conn.execute("SELECT version, description FROM schema_migrations")
-            rows = await cursor.fetchall()
-            assert len(rows) == 1
-            assert rows[0][0] == 1  # Version 1
-            assert "multi-portfolio" in rows[0][1].lower()
-
-    @pytest.mark.asyncio
-    async def test_migration_preserves_null_market_price(self, temp_db):
-        """Migration preserves NULL market_price values."""
-        import aiosqlite
-
-        await create_legacy_schema(temp_db)
-
-        # Add a position with NULL market_price
         async with aiosqlite.connect(temp_db) as conn:
             await conn.execute(
                 "INSERT INTO positions (symbol, quantity, avg_cost) VALUES (?, ?, ?)",
                 ("TSLA", 30, 250.00),
             )
-            await conn.commit()
-
-        migration = MultiuserMigration(temp_db)
-        await migration.migrate()
-
-        async with aiosqlite.connect(temp_db) as conn:
-            cursor = await conn.execute(
-                "SELECT symbol, market_price FROM positions WHERE symbol = 'TSLA'"
-            )
-            row = await cursor.fetchone()
-            assert row[0] == "TSLA"
-            assert row[1] is None  # NULL preserved
-
-    @pytest.mark.asyncio
-    async def test_migration_preserves_trade_pnl(self, temp_db):
-        """Migration preserves PnL values on trades."""
-        import aiosqlite
-
-        await create_legacy_schema(temp_db)
-
-        async with aiosqlite.connect(temp_db) as conn:
             await conn.execute(
                 "INSERT INTO trades (symbol, side, quantity, price, notional, pnl) VALUES (?, ?, ?, ?, ?, ?)",
                 ("AAPL", "SELL", 50, 195.0, 9750.0, 750.0),
             )
-            await conn.commit()
-
-        migration = MultiuserMigration(temp_db)
-        await migration.migrate()
-
-        async with aiosqlite.connect(temp_db) as conn:
-            cursor = await conn.execute("SELECT symbol, side, pnl FROM trades WHERE side = 'SELL'")
-            row = await cursor.fetchone()
-            assert row[0] == "AAPL"
-            assert row[2] == 750.0  # PnL preserved
-
-    @pytest.mark.asyncio
-    async def test_migration_backup_is_valid_sqlite(self, temp_db):
-        """Backup file created by migration is a valid SQLite database."""
-        import aiosqlite
-
-        await create_legacy_schema(temp_db)
-        migration = MultiuserMigration(temp_db)
-        await migration.migrate()
-
-        backups = list(temp_db.parent.glob(f"{temp_db.stem}.backup_premultiuser_*"))
-        assert len(backups) >= 1
-
-        # Verify backup is valid SQLite
-        async with aiosqlite.connect(backups[0]) as conn:
-            cursor = await conn.execute("SELECT COUNT(*) FROM positions")
-            count = (await cursor.fetchone())[0]
-            assert count == 2  # Original 2 positions
-
-    @pytest.mark.asyncio
-    async def test_migration_with_many_trades(self, temp_db):
-        """Migration handles a moderate number of trades correctly."""
-        import aiosqlite
-
-        await create_legacy_schema(temp_db)
-
-        # Insert 500 additional trades
-        async with aiosqlite.connect(temp_db) as conn:
             for i in range(500):
                 symbol = ["AAPL", "NVDA", "MSFT", "TSLA", "GOOG"][i % 5]
                 side = "BUY" if i % 3 != 0 else "SELL"
@@ -1466,19 +1240,20 @@ class TestMigrationEdgeCases:
             await conn.commit()
 
         migration = MultiuserMigration(temp_db)
-        await migration.migrate()
+        with pytest.raises(LegacyMultiuserMigrationDisabled):
+            await migration.migrate()
 
         async with aiosqlite.connect(temp_db) as conn:
-            cursor = await conn.execute("SELECT COUNT(*) FROM trades")
-            count = (await cursor.fetchone())[0]
-            assert count == 501  # 1 original + 500 added
-
-            # All should have portfolio_id='default'
-            cursor = await conn.execute(
-                "SELECT COUNT(*) FROM trades WHERE portfolio_id = 'default'"
-            )
-            default_count = (await cursor.fetchone())[0]
-            assert default_count == 501
+            assert await (
+                await conn.execute("SELECT market_price FROM positions WHERE symbol='TSLA'")
+            ).fetchone() == (None,)
+            assert await (
+                await conn.execute("SELECT pnl FROM trades WHERE side='SELL' AND pnl=750.0")
+            ).fetchone() == (750.0,)
+            count = await (await conn.execute("SELECT COUNT(*) FROM trades")).fetchone()
+            assert count == (502,)
+            columns = await (await conn.execute("PRAGMA table_info(trades)")).fetchall()
+            assert "portfolio_id" not in {column[1] for column in columns}
 
 
 # ──────────────────────────────────────────────
@@ -1860,94 +1635,20 @@ class TestScopeLeakDetection:
 
 
 class TestMigrationRestoreErrorHandling:
-    """Test that migration backup restore handles failures safely."""
+    """Legacy backup/restore entrypoints fail before touching either file."""
 
     @pytest.mark.asyncio
-    async def test_restore_verifies_integrity(self, temp_db):
-        """After restoring from backup, the database integrity is verified."""
+    async def test_backup_and_restore_are_quarantined(self, temp_db):
         await create_legacy_schema(temp_db)
         migration = MultiuserMigration(temp_db)
+        before = temp_db.read_bytes()
 
-        # Create backup manually and verify _restore_from_backup works
-        backup_path = await migration._create_backup()
-        assert backup_path.exists()
-
-        # Corrupt the main DB
-        temp_db.write_bytes(b"not a database")
-
-        # Restore should succeed and fix the DB
-        await migration._restore_from_backup(backup_path)
-
-        # Verify restored DB is valid
-        import aiosqlite
-
-        async with aiosqlite.connect(temp_db) as conn:
-            cursor = await conn.execute("SELECT COUNT(*) FROM positions")
-            count = (await cursor.fetchone())[0]
-            assert count == 2  # Original test data
-
-    @pytest.mark.asyncio
-    async def test_restore_raises_on_missing_backup(self, temp_db):
-        """Restore raises RuntimeError when backup file doesn't exist."""
-        await create_legacy_schema(temp_db)
-        migration = MultiuserMigration(temp_db)
-
-        fake_backup = temp_db.with_suffix(".fake_backup.db")
-        with pytest.raises(RuntimeError, match="backup restore failed"):
-            await migration._restore_from_backup(fake_backup)
-
-    @pytest.mark.asyncio
-    async def test_restore_raises_on_corrupted_backup(self, temp_db):
-        """Restore raises RuntimeError when backup is corrupted."""
-        await create_legacy_schema(temp_db)
-        migration = MultiuserMigration(temp_db)
-
-        # Create a fake corrupted backup
-        corrupted_backup = temp_db.with_suffix(".corrupted.db")
-        corrupted_backup.write_bytes(b"corrupted data that is not sqlite")
-
-        with pytest.raises(RuntimeError, match="backup restore failed"):
-            await migration._restore_from_backup(corrupted_backup)
-
-        corrupted_backup.unlink(missing_ok=True)
-
-    @pytest.mark.asyncio
-    async def test_failed_migration_triggers_restore(self, temp_db):
-        """When migration fails, it automatically restores from backup."""
-        import aiosqlite
-
-        await create_legacy_schema(temp_db)
-        migration = MultiuserMigration(temp_db)
-
-        # Patch _apply_migration_v1 to raise an error mid-migration
-        original_apply = migration._apply_migration_v1
-
-        async def failing_apply(conn, default_cash):
-            # Create the schema_migrations table so it looks like we started
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version INTEGER PRIMARY KEY,
-                    description TEXT NOT NULL,
-                    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            raise aiosqlite.Error("Simulated migration failure")
-
-        migration._apply_migration_v1 = failing_apply
-
-        with pytest.raises(aiosqlite.Error, match="Simulated migration failure"):
-            await migration.migrate()
-
-        # Verify the DB was restored to pre-migration state (no portfolio_id column)
-        async with aiosqlite.connect(temp_db) as conn:
-            cursor = await conn.execute("PRAGMA table_info(positions)")
-            columns = [col[1] for col in await cursor.fetchall()]
-            assert "portfolio_id" not in columns  # Restored to legacy schema
-
-            # Data should be intact
-            cursor = await conn.execute("SELECT COUNT(*) FROM positions")
-            count = (await cursor.fetchone())[0]
-            assert count == 2
+        with pytest.raises(LegacyMultiuserMigrationDisabled):
+            await migration._create_backup()
+        with pytest.raises(LegacyMultiuserMigrationDisabled):
+            await migration._restore_from_backup(temp_db.with_suffix(".backup.db"))
+        assert temp_db.read_bytes() == before
+        assert not temp_db.with_suffix(".backup.db").exists()
 
 
 # ──────────────────────────────────────────────

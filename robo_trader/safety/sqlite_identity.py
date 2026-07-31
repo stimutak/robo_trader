@@ -14,13 +14,14 @@ import sys
 import sysconfig
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import _sqlite3
 
 _SQLITE_FCNTL_FILE_POINTER = 7
 _SQLITE_FCNTL_VFS_POINTER = 27
 _SQLITE_OK = 0
+_SQLITE_DESERIALIZE_READONLY = 4
 _SQLITE_C_API = None
 _SQLITE_UNIX_VFS_NAMES = frozenset(
     {
@@ -127,6 +128,91 @@ def _sqlite_c_api():
         ) from exc
     _SQLITE_C_API = api
     return api
+
+
+def sqlite_connection_serialize(connection: sqlite3.Connection) -> bytes:
+    """Return SQLite's exact in-memory main-database image.
+
+    Maintenance uses this to keep SQLite away from any filesystem target
+    namespace.  The byte buffer is allocated and released by the same SQLite
+    library that owns the CPython connection.
+    """
+
+    if type(connection) is not sqlite3.Connection:
+        raise SQLiteIdentityError("connection must be an exact sqlite3.Connection")
+    api = _sqlite_c_api()
+    try:
+        serialize = api.sqlite3_serialize
+        sqlite_free = api.sqlite3_free
+    except AttributeError as exc:
+        raise SQLiteIdentityError("active SQLite library cannot serialize databases") from exc
+    serialize.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_longlong),
+        ctypes.c_uint,
+    )
+    serialize.restype = ctypes.c_void_p
+    sqlite_free.argtypes = (ctypes.c_void_p,)
+    sqlite_free.restype = None
+    pointer = _CPythonSQLiteConnectionHead.from_address(id(connection)).db
+    if not pointer:
+        raise SQLiteIdentityError("connection has no active SQLite handle")
+    size = ctypes.c_longlong()
+    serialized = serialize(pointer, b"main", ctypes.byref(size), 0)
+    if not serialized or size.value < 0:
+        raise SQLiteIdentityError("SQLite could not serialize the database")
+    try:
+        return ctypes.string_at(serialized, size.value)
+    finally:
+        sqlite_free(serialized)
+
+
+def sqlite_connection_deserialize(
+    connection: sqlite3.Connection,
+    payload: bytes,
+) -> Any:
+    """Install ``payload`` as an in-memory main database and retain its buffer.
+
+    The returned ctypes buffer must remain alive until the connection is
+    closed.  Keeping ownership in Python avoids version-sensitive ownership
+    behavior in ``SQLITE_DESERIALIZE_FREEONCLOSE`` and supports CPython 3.10,
+    whose sqlite3 module does not expose ``Connection.deserialize``.
+    """
+
+    if type(connection) is not sqlite3.Connection:
+        raise SQLiteIdentityError("connection must be an exact sqlite3.Connection")
+    if not isinstance(payload, bytes) or not payload:
+        raise SQLiteIdentityError("database image must be non-empty bytes")
+    api = _sqlite_c_api()
+    try:
+        deserialize = api.sqlite3_deserialize
+    except AttributeError as exc:
+        raise SQLiteIdentityError("active SQLite library cannot deserialize databases") from exc
+    deserialize.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_longlong,
+        ctypes.c_longlong,
+        ctypes.c_uint,
+    )
+    deserialize.restype = ctypes.c_int
+    pointer = _CPythonSQLiteConnectionHead.from_address(id(connection)).db
+    if not pointer:
+        raise SQLiteIdentityError("connection has no active SQLite handle")
+    retained_buffer = ctypes.create_string_buffer(payload, len(payload))
+    result = deserialize(
+        pointer,
+        b"main",
+        ctypes.cast(retained_buffer, ctypes.c_void_p),
+        len(payload),
+        len(payload),
+        _SQLITE_DESERIALIZE_READONLY,
+    )
+    if result != _SQLITE_OK:
+        raise SQLiteIdentityError("SQLite could not deserialize the database image")
+    return retained_buffer
 
 
 def sqlite_connection_file_identity(
