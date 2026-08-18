@@ -1198,6 +1198,89 @@ def test_migration_accepts_table_declaration_named_after_sqlite_function(
     assert report.source_unchanged is True
 
 
+def test_migration_ignores_function_syntax_inside_schema_string_literals(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            "CREATE TABLE literal_defaults ("
+            "id INTEGER PRIMARY KEY, note TEXT DEFAULT 'randomblob('"
+            ")"
+        )
+        assert sqlite_service_module._schema_function_calls(connection) == ()
+
+    report = SQLiteMaintenanceService().dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="allow-function-syntax-string-literal",
+            steps=(
+                MigrationStep(
+                    "INSERT INTO literal_defaults(id, note) VALUES (?, ?)",
+                    (1, "safe"),
+                ),
+            ),
+        ),
+    )
+
+    assert report.outcome == "applied_to_synthetic_copy"
+    assert report.error_code is None
+    assert report.before != report.after
+    assert report.source_unchanged is True
+
+
+def test_schema_function_scan_does_not_rescan_schema_per_registered_function(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute("CREATE TABLE records (value TEXT NOT NULL)")
+        dynamically_compiled_patterns: list[str] = []
+        rescanned_characters = 0
+        real_compile = sqlite_service_module.re.compile
+
+        def recording_compile(pattern, flags=0):
+            compiled = real_compile(pattern, flags)
+            if not isinstance(pattern, str) or not pattern.startswith("(?<!"):
+                return compiled
+            dynamically_compiled_patterns.append(pattern)
+
+            class RecordingPattern:
+                def finditer(self, text):
+                    nonlocal rescanned_characters
+                    rescanned_characters += len(text)
+                    return compiled.finditer(text)
+
+            return RecordingPattern()
+
+        monkeypatch.setattr(sqlite_service_module.re, "compile", recording_compile)
+
+        assert sqlite_service_module._schema_function_calls(connection) == ()
+
+    assert dynamically_compiled_patterns == []
+    assert rescanned_characters == 0
+
+
+@pytest.mark.parametrize(
+    "quoted_call",
+    ('"randomblob"(1)', "`randomblob`(1)", "[randomblob](1)"),
+)
+def test_schema_function_scan_preserves_quoted_callable_identifiers(
+    tmp_path: Path,
+    quoted_call: str,
+) -> None:
+    source = tmp_path / "source.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            "CREATE TABLE guarded (" f"value INTEGER NOT NULL CHECK({quoted_call} IS NOT NULL)" ")"
+        )
+
+        assert sqlite_service_module._schema_function_calls(connection) == ("randomblob",)
+
+
 def test_read_only_select_whitespace_does_not_trigger_callable_schema_screen(
     tmp_path: Path,
 ) -> None:

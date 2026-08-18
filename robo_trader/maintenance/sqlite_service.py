@@ -1212,26 +1212,15 @@ def _schema_function_calls(connection: sqlite3.Connection) -> tuple[str, ...]:
         for row in connection.execute("PRAGMA function_list").fetchall()
         if row and isinstance(row[0], str) and row[0]
     }
-    schema_fragments = [
-        _schema_sql_without_comments(str(row[0]))
-        for row in connection.execute(
-            "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL"
-        ).fetchall()
-    ]
-    found: list[str] = []
-    for name in sorted(function_names):
-        escaped = re.escape(name)
-        candidate = re.compile(
-            rf'(?<![A-Za-z0-9_])(?:["`\[])?{escaped}(?:["`\]])?\s*\(',
-            flags=re.IGNORECASE,
+    found: set[str] = set()
+    for row in connection.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL").fetchall():
+        found.update(
+            _schema_fragment_function_calls(
+                _schema_sql_without_comments(str(row[0])),
+                function_names,
+            )
         )
-        if any(
-            not _schema_match_is_object_declaration(fragment, match.start())
-            for fragment in schema_fragments
-            for match in candidate.finditer(fragment)
-        ):
-            found.append(name)
-    return tuple(found)
+    return tuple(sorted(found))
 
 
 _SCHEMA_IDENTIFIER = r'(?:[A-Za-z_][A-Za-z0-9_]*|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\])'
@@ -1242,10 +1231,62 @@ _SCHEMA_OBJECT_DECLARATION_PREFIX = re.compile(
 )
 
 
-def _schema_match_is_object_declaration(sql: str, match_start: int) -> bool:
-    """Return whether a name-plus-parenthesis token declares a table or view."""
+def _schema_fragment_function_calls(
+    sql: str,
+    function_names: set[str],
+) -> set[str]:
+    """Scan one schema fragment once for callable registered identifiers."""
 
-    return _SCHEMA_OBJECT_DECLARATION_PREFIX.fullmatch(sql[:match_start]) is not None
+    declaration = _SCHEMA_OBJECT_DECLARATION_PREFIX.match(sql)
+    declaration_name_start = declaration.end() if declaration is not None else None
+    found: set[str] = set()
+    index = 0
+    while index < len(sql):
+        character = sql[index]
+        if character == "'":
+            index = _schema_quoted_token_end(sql, index, "'")
+            continue
+        token_start = index
+        if character in {'"', "`", "["}:
+            closing = "]" if character == "[" else character
+            token_end = _schema_quoted_token_end(sql, index, closing)
+            token = sql[index + 1 : token_end - 1].replace(closing * 2, closing)
+            index = token_end
+        elif character == "_" or character.isalpha():
+            index += 1
+            while index < len(sql) and (sql[index] == "_" or sql[index].isalnum()):
+                index += 1
+            token = sql[token_start:index]
+        else:
+            index += 1
+            continue
+        call_start = index
+        while call_start < len(sql) and sql[call_start].isspace():
+            call_start += 1
+        normalized = token.casefold()
+        if (
+            call_start < len(sql)
+            and sql[call_start] == "("
+            and normalized in function_names
+            and token_start != declaration_name_start
+        ):
+            found.add(normalized)
+    return found
+
+
+def _schema_quoted_token_end(sql: str, start: int, closing: str) -> int:
+    """Return the end of a quoted SQL token, rejecting malformed schema SQL."""
+
+    index = start + 1
+    while index < len(sql):
+        if sql[index] != closing:
+            index += 1
+            continue
+        if closing != "]" and index + 1 < len(sql) and sql[index + 1] == closing:
+            index += 2
+            continue
+        return index + 1
+    raise SQLiteMaintenanceError("persistent schema contains an unterminated quoted token")
 
 
 def _assert_supported_copy_source_size(
