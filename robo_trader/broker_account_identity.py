@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-_REAL_PAPER_ACCOUNT_RE = re.compile(r"^DU[0-9]{4,20}$")
+_REAL_PAPER_ACCOUNT_RE = re.compile(r"^DUN?[0-9]{4,20}$")
 _SYNTHETIC_PAPER_ACCOUNTS = frozenset({"DU_TEST_PAPER", "DU_CI_PAPER"})
 _SYNTHETIC_ENVIRONMENTS = frozenset({"dev", "test"})
 
@@ -24,7 +24,7 @@ def is_supported_paper_account_identifier(
     """Accept broker-issued paper IDs everywhere and fixed fixtures only off-prod.
 
     The two synthetic identifiers are reserved for deterministic tests and CI.
-    Production-like environments still require IBKR's ``DU`` plus digits shape,
+    Production-like environments still require IBKR's ``DU`` or ``DUN`` plus digits shape,
     and every downstream broker snapshot independently requires the connected
     Gateway to report the exact configured account.
     """
