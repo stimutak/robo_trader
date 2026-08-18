@@ -1198,6 +1198,33 @@ def test_migration_accepts_table_declaration_named_after_sqlite_function(
     assert report.source_unchanged is True
 
 
+def test_read_only_select_whitespace_does_not_trigger_callable_schema_screen(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            "CREATE TABLE guarded ("
+            "value INTEGER NOT NULL CHECK(length(randomblob(50000000)) > 0)"
+            ")"
+        )
+
+    report = SQLiteMaintenanceService().dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="allow-whitespace-select-noop",
+            steps=(MigrationStep("SELECT \t 1"),),
+        ),
+    )
+
+    assert report.outcome == "applied_to_synthetic_copy"
+    assert report.error_code is None
+    assert report.before == report.after
+    assert report.source_unchanged is True
+
+
 def test_migration_screens_virtual_generated_functions_before_row_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -419,7 +419,10 @@ class SQLiteMaintenanceService:
         """
 
         _validate_migration_plan(plan)
-        plan_can_write = any(step.sql.strip().upper() != "SELECT 1" for step in plan.steps)
+        plan_can_write = any(
+            _MIGRATION_READ_ONLY_STATEMENT.fullmatch(step.sql.strip()) is None
+            for step in plan.steps
+        )
 
         def screen_source_schema(connection: sqlite3.Connection) -> None:
             if plan_can_write and _schema_function_calls(connection):
@@ -1098,8 +1101,9 @@ _MIGRATION_COLUMN = (
     rf"(?:\s+PRIMARY\s+KEY)?(?:\s+NOT\s+NULL)?"
     rf"(?:\s+DEFAULT\s+{_MIGRATION_LITERAL})?"
 )
+_MIGRATION_READ_ONLY_STATEMENT = re.compile(r"SELECT\s+1", re.IGNORECASE | re.ASCII)
 _MIGRATION_STATEMENTS = (
-    re.compile(r"SELECT\s+1", re.IGNORECASE | re.ASCII),
+    _MIGRATION_READ_ONLY_STATEMENT,
     re.compile(
         rf"CREATE\s+TABLE\s+{_MIGRATION_IDENTIFIER}\s*\(\s*"
         rf"{_MIGRATION_COLUMN}(?:\s*,\s*{_MIGRATION_COLUMN})*\s*\)",
