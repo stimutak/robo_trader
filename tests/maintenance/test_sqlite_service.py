@@ -141,6 +141,33 @@ def test_online_copy_rejects_oversized_source_before_materializing_target(
     assert not target.exists()
 
 
+def test_migration_rejects_oversized_source_before_schema_screen(tmp_path: Path) -> None:
+    source = tmp_path / "oversized-schema.db"
+    target = tmp_path / "dry-run.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute(
+            "CREATE TABLE guarded (" "value BLOB NOT NULL CHECK(randomblob(1) IS NOT NULL)" ")"
+        )
+        connection.execute("INSERT INTO guarded(value) VALUES (zeroblob(2000000))")
+
+    with pytest.raises(SQLiteMaintenanceError, match="artifact size limit"):
+        SQLiteMaintenanceService(max_source_bytes=1024 * 1024).dry_run_migration(
+            source,
+            target,
+            plan=MigrationPlan(
+                migration_id="size-before-schema-screen",
+                steps=(
+                    MigrationStep(
+                        "UPDATE guarded SET value=? WHERE rowid=?",
+                        (b"replacement", 1),
+                    ),
+                ),
+            ),
+        )
+
+    assert not target.exists()
+
+
 @pytest.mark.parametrize(
     "invalid_limit",
     [True, 1024 * 1024 - 1, 1024 * 1024 * 1024 + 1],
@@ -1147,6 +1174,30 @@ def test_migration_rejects_functions_embedded_in_source_schema(tmp_path: Path) -
     assert not target.exists()
 
 
+def test_migration_accepts_table_declaration_named_after_sqlite_function(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    with sqlite3.connect(source) as connection:
+        connection.execute("CREATE TABLE changes (id INTEGER PRIMARY KEY)")
+        assert sqlite_service_module._schema_function_calls(connection) == ()
+
+    report = SQLiteMaintenanceService().dry_run_migration(
+        source,
+        target,
+        plan=MigrationPlan(
+            migration_id="allow-function-name-table-declaration",
+            steps=(MigrationStep("INSERT INTO changes(id) VALUES (?)", (1,)),),
+        ),
+    )
+
+    assert report.outcome == "applied_to_synthetic_copy"
+    assert report.error_code is None
+    assert report.before != report.after
+    assert report.source_unchanged is True
+
+
 def test_migration_screens_virtual_generated_functions_before_row_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1371,7 +1422,12 @@ def test_final_source_evidence_failure_prevents_synthetic_publication(
     _create_multiportfolio_database(source).close()
     service = SQLiteMaintenanceService()
 
-    def fail_final_evidence(_source_path: Path | str):
+    def fail_final_evidence(
+        _source_path: Path | str,
+        *,
+        source_pre_evidence_hook=None,
+    ):
+        assert source_pre_evidence_hook is not None
         raise SQLiteMaintenanceError("injected final evidence failure")
 
     monkeypatch.setattr(service, "_live_source_evidence", fail_final_evidence)
@@ -1388,6 +1444,40 @@ def test_final_source_evidence_failure_prevents_synthetic_publication(
 
     assert not target.exists()
     assert list(tmp_path.glob(f".{target.name}.robo-trader-stage-*")) == []
+
+
+def test_migration_rescreens_changed_live_schema_before_final_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    target = tmp_path / "dry-run.db"
+    writer = _create_multiportfolio_database(source, wal=True)
+    callable_schema_committed = False
+
+    def add_callable_schema(_operation: str, _remaining: int, _total: int) -> None:
+        nonlocal callable_schema_committed
+        if callable_schema_committed:
+            return
+        writer.execute(
+            "ALTER TABLE positions ADD COLUMN inflated TEXT "
+            "GENERATED ALWAYS AS (hex(zeroblob(1))) VIRTUAL"
+        )
+        writer.commit()
+        callable_schema_committed = True
+
+    try:
+        with pytest.raises(SQLiteMaintenanceError, match="source schema"):
+            SQLiteMaintenanceService(progress_hook=add_callable_schema).dry_run_migration(
+                source,
+                target,
+                plan=MigrationPlan(
+                    migration_id="rescreen-final-live-schema",
+                    steps=(MigrationStep("ALTER TABLE portfolios ADD COLUMN note TEXT"),),
+                ),
+            )
+    finally:
+        writer.close()
+
+    assert callable_schema_committed
+    assert not target.exists()
 
 
 def test_migration_uses_the_copy_connection_without_a_writable_reopen(

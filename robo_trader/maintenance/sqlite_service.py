@@ -526,7 +526,10 @@ class SQLiteMaintenanceService:
             before, outcome, error_code = migration_result
             if not isinstance(before, DatabaseEvidence):
                 raise SQLiteMaintenanceError("migration evidence is unavailable")
-            source_after = self._live_source_evidence(source_path)
+            source_after = self._live_source_evidence(
+                source_path,
+                source_pre_evidence_hook=screen_source_schema,
+            )
             return before, outcome, error_code, source_after
 
         copy_manifest, migration_result = self._online_copy(
@@ -558,7 +561,12 @@ class SQLiteMaintenanceService:
             error_code=error_code,
         )
 
-    def _live_source_evidence(self, source_path: Path | str) -> DatabaseEvidence:
+    def _live_source_evidence(
+        self,
+        source_path: Path | str,
+        *,
+        source_pre_evidence_hook: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> DatabaseEvidence:
         """Capture logical evidence from a bound read snapshot, including WAL state."""
 
         source_candidate = _absolute_canonical_path(source_path)
@@ -571,6 +579,13 @@ class SQLiteMaintenanceService:
                 readonly=True,
             )
             connection.execute("BEGIN")
+            _assert_supported_copy_source_size(
+                connection,
+                source,
+                max_source_bytes=self._max_source_bytes,
+            )
+            if source_pre_evidence_hook is not None:
+                source_pre_evidence_hook(connection)
             evidence = _database_evidence(connection)
             companions = _adopt_connection_companions(source.path, initial_companions)
             source.assert_connection_identity(sqlite_connection_file_identity(connection))
@@ -754,13 +769,13 @@ class SQLiteMaintenanceService:
                 immutable_readonly=expected_source_manifest is not None,
             )
             source_connection.execute("BEGIN")
-            if source_pre_evidence_hook is not None:
-                source_pre_evidence_hook(source_connection)
             _assert_supported_copy_source_size(
                 source_connection,
                 source,
                 max_source_bytes=self._max_source_bytes,
             )
+            if source_pre_evidence_hook is not None:
+                source_pre_evidence_hook(source_connection)
             source_evidence = _database_evidence(source_connection)
             source_companions = _adopt_connection_companions(
                 source.path,
@@ -1194,22 +1209,39 @@ def _schema_function_calls(connection: sqlite3.Connection) -> tuple[str, ...]:
         if row and isinstance(row[0], str) and row[0]
     }
     schema_fragments = [
-        str(row[0])
+        _schema_sql_without_comments(str(row[0]))
         for row in connection.execute(
             "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL"
         ).fetchall()
     ]
-    combined_schema = _schema_sql_without_comments("\n".join(schema_fragments))
     found: list[str] = []
     for name in sorted(function_names):
         escaped = re.escape(name)
-        if re.search(
+        candidate = re.compile(
             rf'(?<![A-Za-z0-9_])(?:["`\[])?{escaped}(?:["`\]])?\s*\(',
-            combined_schema,
             flags=re.IGNORECASE,
+        )
+        if any(
+            not _schema_match_is_object_declaration(fragment, match.start())
+            for fragment in schema_fragments
+            for match in candidate.finditer(fragment)
         ):
             found.append(name)
     return tuple(found)
+
+
+_SCHEMA_IDENTIFIER = r'(?:[A-Za-z_][A-Za-z0-9_]*|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\])'
+_SCHEMA_OBJECT_DECLARATION_PREFIX = re.compile(
+    rf"\s*CREATE\s+(?:(?:TEMP|TEMPORARY)\s+)?(?:TABLE|VIEW)\s+"
+    rf"(?:IF\s+NOT\s+EXISTS\s+)?(?:{_SCHEMA_IDENTIFIER}\s*\.\s*)?",
+    flags=re.IGNORECASE | re.ASCII,
+)
+
+
+def _schema_match_is_object_declaration(sql: str, match_start: int) -> bool:
+    """Return whether a name-plus-parenthesis token declares a table or view."""
+
+    return _SCHEMA_OBJECT_DECLARATION_PREFIX.fullmatch(sql[:match_start]) is not None
 
 
 def _assert_supported_copy_source_size(
