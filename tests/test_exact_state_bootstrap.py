@@ -55,6 +55,10 @@ _TEST_PRIVATE_KEYS: dict[str, Path] = {}
 _TEST_PUBLICATION_NONCE = "bootstrap-publication-v1-" + "a" * 64
 
 
+def _evidence_path(root: Path, filename: str) -> Path:
+    return root / "evidence" / filename
+
+
 @pytest.fixture(autouse=True)
 def _bootstrap_evidence_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     producers = ("broker_snapshot", "reconciliation_report", "protective_mark")
@@ -283,6 +287,9 @@ def _candidate_bundle(
     legacy_hash: str | None = None,
     flat: bool = False,
 ) -> tuple[ExactStateBootstrapCandidate, object, RuntimeContract]:
+    if artifact_root == path.parent:
+        artifact_root = artifact_root / "evidence"
+        artifact_root.mkdir(exist_ok=True)
     effective = datetime.now(timezone.utc).replace(microsecond=0)
     runtime_contract = _runtime_contract(path)
     journal_path = Path(str(runtime_contract.safety_journal_path))
@@ -519,13 +526,28 @@ def _candidate_bundle(
         artifact_kind="reconciliation_report",
     )
     completion_path = artifact_root / "bundle_complete.json"
+    completion_path.unlink(missing_ok=True)
+    artifact_manifest = []
+    for artifact_path in sorted(artifact_root.iterdir(), key=lambda item: item.name):
+        metadata = artifact_path.stat(follow_symlinks=False)
+        payload = artifact_path.read_bytes()
+        artifact_manifest.append(
+            {
+                "device": metadata.st_dev,
+                "filename": artifact_path.name,
+                "inode": metadata.st_ino,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": len(payload),
+            }
+        )
     completion_path.write_text(
         json.dumps(
             {
+                "artifact_manifest": artifact_manifest,
                 "bundle_id": bundle_id,
                 "publication_directory": str(artifact_root),
                 "publication_nonce": _TEST_PUBLICATION_NONCE,
-                "schema_version": 1,
+                "schema_version": 2,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1217,11 +1239,11 @@ async def test_bootstrap_is_insert_only_exact_and_receipt_replay_is_rejected(
         )
         with pytest.raises(ExactStateBootstrapError, match="receipt replay"):
             load_exact_state_bootstrap_evidence(
-                reconciliation_path=tmp_path / "reconciliation.json",
-                broker_snapshot_path=tmp_path / "broker.json",
+                reconciliation_path=_evidence_path(tmp_path, "reconciliation.json"),
+                broker_snapshot_path=_evidence_path(tmp_path, "broker.json"),
                 protective_mark_paths=[
-                    tmp_path / "mark-NVDA.json",
-                    tmp_path / "mark-TSLA.json",
+                    _evidence_path(tmp_path, "mark-NVDA.json"),
+                    _evidence_path(tmp_path, "mark-TSLA.json"),
                 ],
                 expected_runtime_contract=runtime_contract,
             )
@@ -1416,7 +1438,7 @@ def test_evidence_loader_rejects_tampered_broker_and_wrong_runtime_scope(
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     _, _, runtime_contract = _candidate_bundle(path, tmp_path)
-    broker_path = tmp_path / "broker.json"
+    broker_path = _evidence_path(tmp_path, "broker.json")
     broker = json.loads(broker_path.read_text(encoding="utf-8"))
     broker["snapshot"]["positions"] = [{"symbol": "AAPL", "quantity": "1"}]
     _write_artifact(
@@ -1429,9 +1451,12 @@ def test_evidence_loader_rejects_tampered_broker_and_wrong_runtime_scope(
 
     with pytest.raises(ExactStateBootstrapError, match="collection evidence counts"):
         load_exact_state_bootstrap_evidence(
-            reconciliation_path=tmp_path / "reconciliation.json",
+            reconciliation_path=_evidence_path(tmp_path, "reconciliation.json"),
             broker_snapshot_path=broker_path,
-            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            protective_mark_paths=[
+                _evidence_path(tmp_path, "mark-NVDA.json"),
+                _evidence_path(tmp_path, "mark-TSLA.json"),
+            ],
             expected_runtime_contract=runtime_contract,
         )
 
@@ -1592,12 +1617,15 @@ def test_external_json_without_authenticated_receipt_has_no_authority(tmp_path: 
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     _, _, runtime = _candidate_bundle(path, tmp_path)
-    (tmp_path / "broker.json.auth.json").unlink()
+    _evidence_path(tmp_path, "broker.json.auth.json").unlink()
     with pytest.raises(ExactStateBootstrapError, match="authentication receipt"):
         load_exact_state_bootstrap_evidence(
-            reconciliation_path=tmp_path / "reconciliation.json",
-            broker_snapshot_path=tmp_path / "broker.json",
-            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            reconciliation_path=_evidence_path(tmp_path, "reconciliation.json"),
+            broker_snapshot_path=_evidence_path(tmp_path, "broker.json"),
+            protective_mark_paths=[
+                _evidence_path(tmp_path, "mark-NVDA.json"),
+                _evidence_path(tmp_path, "mark-TSLA.json"),
+            ],
             expected_runtime_contract=runtime,
         )
 
@@ -1606,7 +1634,7 @@ def test_current_authentication_cannot_refresh_thirty_day_old_snapshot(tmp_path:
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     _, _, runtime = _candidate_bundle(path, tmp_path)
-    broker_path = tmp_path / "broker.json"
+    broker_path = _evidence_path(tmp_path, "broker.json")
     broker = json.loads(broker_path.read_text())
     stale = datetime.now(timezone.utc) - timedelta(days=30)
     snapshot = broker["snapshot"]
@@ -1641,7 +1669,7 @@ def test_current_authentication_cannot_refresh_thirty_day_old_snapshot(tmp_path:
         runtime_fingerprint=runtime.fingerprint,
         account_scope=ACCOUNT_SCOPE,
     )
-    reconciliation_path = tmp_path / "reconciliation.json"
+    reconciliation_path = _evidence_path(tmp_path, "reconciliation.json")
     reconciliation = json.loads(reconciliation_path.read_text())
     reconciliation["broker_snapshot_hash"] = broker_hash
     _write_artifact(
@@ -1653,7 +1681,10 @@ def test_current_authentication_cannot_refresh_thirty_day_old_snapshot(tmp_path:
         load_exact_state_bootstrap_evidence(
             reconciliation_path=reconciliation_path,
             broker_snapshot_path=broker_path,
-            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            protective_mark_paths=[
+                _evidence_path(tmp_path, "mark-NVDA.json"),
+                _evidence_path(tmp_path, "mark-TSLA.json"),
+            ],
             expected_runtime_contract=runtime,
         )
 
@@ -1662,7 +1693,7 @@ def test_expired_producer_receipt_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     _, _, runtime = _candidate_bundle(path, tmp_path)
-    broker_path = tmp_path / "broker.json"
+    broker_path = _evidence_path(tmp_path, "broker.json")
     broker = json.loads(broker_path.read_text())
     _write_artifact(
         broker_path,
@@ -1674,9 +1705,12 @@ def test_expired_producer_receipt_is_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ExactStateBootstrapError, match="expired"):
         load_exact_state_bootstrap_evidence(
-            reconciliation_path=tmp_path / "reconciliation.json",
+            reconciliation_path=_evidence_path(tmp_path, "reconciliation.json"),
             broker_snapshot_path=broker_path,
-            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            protective_mark_paths=[
+                _evidence_path(tmp_path, "mark-NVDA.json"),
+                _evidence_path(tmp_path, "mark-TSLA.json"),
+            ],
             expected_runtime_contract=runtime,
         )
 
@@ -1691,7 +1725,7 @@ def test_broker_integer_fields_reject_json_booleans(
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     _, _, runtime = _candidate_bundle(path, tmp_path)
-    broker_path = tmp_path / "broker.json"
+    broker_path = _evidence_path(tmp_path, "broker.json")
     broker = json.loads(broker_path.read_text())
     if field == "schema_version":
         broker["snapshot"]["schema_version"] = invalid
@@ -1706,9 +1740,12 @@ def test_broker_integer_fields_reject_json_booleans(
     )
     with pytest.raises(ExactStateBootstrapError, match="JSON integer"):
         load_exact_state_bootstrap_evidence(
-            reconciliation_path=tmp_path / "reconciliation.json",
+            reconciliation_path=_evidence_path(tmp_path, "reconciliation.json"),
             broker_snapshot_path=broker_path,
-            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            protective_mark_paths=[
+                _evidence_path(tmp_path, "mark-NVDA.json"),
+                _evidence_path(tmp_path, "mark-TSLA.json"),
+            ],
             expected_runtime_contract=runtime,
         )
 
@@ -1730,7 +1767,7 @@ def test_reconciliation_integer_fields_reject_json_floats(tmp_path: Path, field:
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     _, _, runtime = _candidate_bundle(path, tmp_path)
-    reconciliation_path = tmp_path / "reconciliation.json"
+    reconciliation_path = _evidence_path(tmp_path, "reconciliation.json")
     reconciliation = json.loads(reconciliation_path.read_text())
     reconciliation[field] = float(reconciliation[field])
     _write_artifact(
@@ -1741,8 +1778,11 @@ def test_reconciliation_integer_fields_reject_json_floats(tmp_path: Path, field:
     with pytest.raises(ExactStateBootstrapError, match="JSON integer"):
         load_exact_state_bootstrap_evidence(
             reconciliation_path=reconciliation_path,
-            broker_snapshot_path=tmp_path / "broker.json",
-            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            broker_snapshot_path=_evidence_path(tmp_path, "broker.json"),
+            protective_mark_paths=[
+                _evidence_path(tmp_path, "mark-NVDA.json"),
+                _evidence_path(tmp_path, "mark-TSLA.json"),
+            ],
             expected_runtime_contract=runtime,
         )
 
@@ -1763,7 +1803,7 @@ def test_reconciliation_strong_broker_and_position_bindings_cannot_drift(
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     _, _, runtime = _candidate_bundle(path, tmp_path)
-    reconciliation_path = tmp_path / "reconciliation.json"
+    reconciliation_path = _evidence_path(tmp_path, "reconciliation.json")
     reconciliation = json.loads(reconciliation_path.read_text(encoding="utf-8"))
     if field == "broker_artifact_hash":
         reconciliation[field] = "0" * 64
@@ -1788,10 +1828,10 @@ def test_reconciliation_strong_broker_and_position_bindings_cannot_drift(
     ):
         load_exact_state_bootstrap_evidence(
             reconciliation_path=reconciliation_path,
-            broker_snapshot_path=tmp_path / "broker.json",
+            broker_snapshot_path=_evidence_path(tmp_path, "broker.json"),
             protective_mark_paths=[
-                tmp_path / "mark-NVDA.json",
-                tmp_path / "mark-TSLA.json",
+                _evidence_path(tmp_path, "mark-NVDA.json"),
+                _evidence_path(tmp_path, "mark-TSLA.json"),
             ],
             expected_runtime_contract=runtime,
         )
@@ -1803,7 +1843,7 @@ def test_fabricated_current_authentication_receipt_is_rejected(
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     _, _, runtime = _candidate_bundle(path, tmp_path)
-    receipt_path = tmp_path / "broker.json.auth.json"
+    receipt_path = _evidence_path(tmp_path, "broker.json.auth.json")
     monkeypatch.setenv("SAFETY_ACCOUNT_SCOPE_KEY", "fedcba9876543210" * 4)
     receipt = json.loads(receipt_path.read_text())
     receipt["issued_at"] = datetime.now(timezone.utc).isoformat()
@@ -1814,9 +1854,12 @@ def test_fabricated_current_authentication_receipt_is_rejected(
     receipt_path.chmod(0o400)
     with pytest.raises(ExactStateBootstrapError, match="signature is invalid"):
         load_exact_state_bootstrap_evidence(
-            reconciliation_path=tmp_path / "reconciliation.json",
-            broker_snapshot_path=tmp_path / "broker.json",
-            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            reconciliation_path=_evidence_path(tmp_path, "reconciliation.json"),
+            broker_snapshot_path=_evidence_path(tmp_path, "broker.json"),
+            protective_mark_paths=[
+                _evidence_path(tmp_path, "mark-NVDA.json"),
+                _evidence_path(tmp_path, "mark-TSLA.json"),
+            ],
             expected_runtime_contract=runtime,
         )
 
@@ -1847,9 +1890,12 @@ def test_bootstrap_consumer_refuses_private_signing_capability(
     )
     with pytest.raises(ExactStateBootstrapError, match="refuses evidence trust/signing overrides"):
         load_exact_state_bootstrap_evidence(
-            reconciliation_path=tmp_path / "reconciliation.json",
-            broker_snapshot_path=tmp_path / "broker.json",
-            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            reconciliation_path=_evidence_path(tmp_path, "reconciliation.json"),
+            broker_snapshot_path=_evidence_path(tmp_path, "broker.json"),
+            protective_mark_paths=[
+                _evidence_path(tmp_path, "mark-NVDA.json"),
+                _evidence_path(tmp_path, "mark-TSLA.json"),
+            ],
             expected_runtime_contract=runtime,
         )
 
@@ -1866,9 +1912,12 @@ def test_bootstrap_consumer_refuses_public_trust_root_substitution(
     )
     with pytest.raises(ExactStateBootstrapError, match="refuses evidence trust/signing overrides"):
         load_exact_state_bootstrap_evidence(
-            reconciliation_path=tmp_path / "reconciliation.json",
-            broker_snapshot_path=tmp_path / "broker.json",
-            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            reconciliation_path=_evidence_path(tmp_path, "reconciliation.json"),
+            broker_snapshot_path=_evidence_path(tmp_path, "broker.json"),
+            protective_mark_paths=[
+                _evidence_path(tmp_path, "mark-NVDA.json"),
+                _evidence_path(tmp_path, "mark-TSLA.json"),
+            ],
             expected_runtime_contract=runtime,
         )
 
@@ -1895,11 +1944,11 @@ def test_wrong_producer_key_or_kind_cannot_authenticate_broker(tmp_path: Path, a
     path = tmp_path / "legacy.db"
     _legacy_database(path)
     _, _, runtime = _candidate_bundle(path, tmp_path)
-    receipt_path = tmp_path / "broker.json.auth.json"
+    receipt_path = _evidence_path(tmp_path, "broker.json.auth.json")
     receipt_path.unlink()
     if attack == "wrong_key":
         _emit_test_receipt(
-            artifact_path=tmp_path / "broker.json",
+            artifact_path=_evidence_path(tmp_path, "broker.json"),
             artifact_kind="broker_snapshot",
             signing_kind="protective_mark",
             runtime_fingerprint=runtime.fingerprint,
@@ -1907,16 +1956,19 @@ def test_wrong_producer_key_or_kind_cannot_authenticate_broker(tmp_path: Path, a
         )
     else:
         _emit_test_receipt(
-            artifact_path=tmp_path / "broker.json",
+            artifact_path=_evidence_path(tmp_path, "broker.json"),
             artifact_kind="protective_mark",
             runtime_fingerprint=runtime.fingerprint,
             account_scope=ACCOUNT_SCOPE,
         )
     with pytest.raises(ExactStateBootstrapError, match="wrong key|wrong producer|wrong.*kind"):
         load_exact_state_bootstrap_evidence(
-            reconciliation_path=tmp_path / "reconciliation.json",
-            broker_snapshot_path=tmp_path / "broker.json",
-            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            reconciliation_path=_evidence_path(tmp_path, "reconciliation.json"),
+            broker_snapshot_path=_evidence_path(tmp_path, "broker.json"),
+            protective_mark_paths=[
+                _evidence_path(tmp_path, "mark-NVDA.json"),
+                _evidence_path(tmp_path, "mark-TSLA.json"),
+            ],
             expected_runtime_contract=runtime,
         )
 
@@ -1937,9 +1989,12 @@ def test_pinned_public_verification_key_identity_is_strict(tmp_path: Path, attac
         os.link(public_path, tmp_path / "broker-public-alias.pem")
     with pytest.raises(ExactStateBootstrapError, match="immutable fingerprint|sealed owner file"):
         load_exact_state_bootstrap_evidence(
-            reconciliation_path=tmp_path / "reconciliation.json",
-            broker_snapshot_path=tmp_path / "broker.json",
-            protective_mark_paths=[tmp_path / "mark-NVDA.json", tmp_path / "mark-TSLA.json"],
+            reconciliation_path=_evidence_path(tmp_path, "reconciliation.json"),
+            broker_snapshot_path=_evidence_path(tmp_path, "broker.json"),
+            protective_mark_paths=[
+                _evidence_path(tmp_path, "mark-NVDA.json"),
+                _evidence_path(tmp_path, "mark-TSLA.json"),
+            ],
             expected_runtime_contract=runtime,
         )
 

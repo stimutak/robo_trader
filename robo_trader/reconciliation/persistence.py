@@ -184,9 +184,19 @@ class ReconciliationPersistence:
                 "runtime evidence belongs to a different database identity"
             )
 
-    async def initialize(self) -> None:
-        """Register and validate this component without touching legacy rows."""
+    async def migrate_for_operator(self, *, operator_confirmed: bool) -> None:
+        """Apply reconciliation schema migrations after explicit operator approval.
 
+        Runtime startup must never call this method.  Keeping the mutating path
+        separately named and confirmation-gated makes schema installation an
+        operator-backed deployment action rather than an implicit side effect of
+        collecting broker evidence.
+        """
+
+        if operator_confirmed is not True:
+            raise ReconciliationPersistenceError(
+                "reconciliation migration requires explicit operator confirmation"
+            )
         connection, binding = await self._connect(initialize=True)
         try:
             await connection.execute("BEGIN IMMEDIATE")
@@ -201,6 +211,33 @@ class ReconciliationPersistence:
         finally:
             await connection.close()
             binding.close()
+
+    async def initialize(self) -> None:
+        """Assert the installed schema read-only; never create or repair it."""
+
+        binding: SQLitePathBinding | None = None
+        connection: aiosqlite.Connection | None = None
+        try:
+            binding = SQLitePathBinding.open_readonly(self._database_path)
+            uri = f"file:{binding.path.as_posix()}?mode=ro"
+            connection = await aiosqlite.connect(uri, uri=True, isolation_level=None)
+            binding = binding.bind_sqlite_connection(await self._descriptor_identity(connection))
+            await connection.execute("PRAGMA query_only = ON")
+            await connection.execute("PRAGMA foreign_keys = ON")
+            await assert_reconciliation_schema(connection)
+            await self._assert_binding(connection, binding)
+            binding.assert_path_identity()
+        except (ReconciliationPersistenceError, RuntimeError):
+            raise
+        except Exception as exc:
+            raise ReconciliationPersistenceError(
+                "reconciliation schema is unavailable or malformed"
+            ) from exc
+        finally:
+            if connection is not None:
+                await connection.close()
+            if binding is not None:
+                binding.close()
 
     async def append_reconciliation(
         self,

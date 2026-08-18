@@ -281,6 +281,36 @@ class _Provider:
 
 
 @pytest.mark.asyncio
+async def test_runtime_consumed_broker_envelope_cannot_be_handed_off_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=_runtime(database),
+        capability_directory=capability,
+        output_directory=tmp_path / "evidence",
+    )
+    provider = _Provider(_broker_result(datetime.now(timezone.utc)))
+    envelope = await provider.produce_normalized_snapshot(
+        receiver=receivers.broker_snapshot,
+        max_age_seconds=30.0,
+    )
+
+    receiver_core.assert_and_consume_verified_broker_evidence(envelope)
+    receiver_core._handoff_consumed_verified_broker_evidence_to_runtime(envelope)
+    receiver_core.assert_and_consume_verified_broker_evidence(envelope)
+
+    with pytest.raises(BootstrapEvidenceReceiverError, match="already handed off"):
+        receiver_core._handoff_consumed_verified_broker_evidence_to_runtime(envelope)
+    with pytest.raises(BootstrapEvidenceReceiverError, match="already consumed"):
+        receiver_core.assert_and_consume_verified_broker_evidence(envelope)
+    receivers.close()
+
+
+@pytest.mark.asyncio
 async def test_full_empty_position_evidence_chain_is_typed_and_one_shot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -289,13 +319,15 @@ async def test_full_empty_position_evidence_chain_is_typed_and_one_shot(
     database = tmp_path / "ledger.db"
     _ledger(database)
     runtime = _runtime(database)
+    output = tmp_path / ("evidence-" + "é" * 40)
     receivers = create_bootstrap_evidence_receivers(
         runtime_contract=runtime,
         capability_directory=capability,
-        output_directory=tmp_path / "evidence",
+        output_directory=output,
     )
     result = _broker_result(datetime.now(timezone.utc) - timedelta(milliseconds=50))
     provider = _Provider(result)
+    predicted_bundle_size: list[int] = []
 
     async def no_marks(**kwargs: object) -> tuple:
         assert kwargs["mark_identities"] == ()
@@ -307,6 +339,7 @@ async def test_full_empty_position_evidence_chain_is_typed_and_one_shot(
         )
         assert type(mark_identity) is ProtectiveMarkBundleIdentity
         assert mark_identity.reconciliation_snapshot_id.startswith("bootstrap-reconciliation-v1-")
+        predicted_bundle_size.append(receivers.unpublished_bundle_size_bytes(set()))
         provider.events.append("marks")
         return ()
 
@@ -321,11 +354,12 @@ async def test_full_empty_position_evidence_chain_is_typed_and_one_shot(
     assert provider.events == ["snapshot", "quote-source", "marks", "close"]
     assert report["authorizes_startup"] is False
     assert report["status"] == "EVIDENCE_COMPLETE_GATE_A_STILL_CLOSED"
-    assert (tmp_path / "evidence" / "broker_snapshot.json").stat().st_mode & 0o777 == 0o400
-    assert (tmp_path / "evidence" / "reconciliation_report.json").is_file()
+    assert (output / "broker_snapshot.json").stat().st_mode & 0o777 == 0o400
+    assert (output / "reconciliation_report.json").is_file()
+    assert predicted_bundle_size == [sum(path.stat().st_size for path in output.iterdir())]
     loaded = load_exact_state_bootstrap_evidence(
-        reconciliation_path=tmp_path / "evidence" / "reconciliation_report.json",
-        broker_snapshot_path=tmp_path / "evidence" / "broker_snapshot.json",
+        reconciliation_path=output / "reconciliation_report.json",
+        broker_snapshot_path=output / "broker_snapshot.json",
         protective_mark_paths=[],
         expected_runtime_contract=runtime,
     )
@@ -337,6 +371,74 @@ async def test_full_empty_position_evidence_chain_is_typed_and_one_shot(
 
     with pytest.raises(Exception, match="already consumed|absent|released"):
         receivers.broker_snapshot.receive_broker_snapshot_producer_result(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("injected_mode", "error_match"),
+    [
+        (0o400, "changed after retention measurement"),
+        (0o600, "unsafe entry"),
+    ],
+)
+async def test_retention_measurement_change_preserves_unpublished_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    injected_mode: int,
+    error_match: str,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    runtime = _runtime(database)
+    output = tmp_path / "evidence"
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=runtime,
+        capability_directory=capability,
+        output_directory=output,
+    )
+    provider = _Provider(_broker_result(datetime.now(timezone.utc)))
+    measured_size: list[int] = []
+
+    async def inject_after_measurement(**kwargs: object) -> tuple:
+        assert kwargs["mark_identities"] == ()
+        measured_size.append(receivers.unpublished_bundle_size_bytes(set()))
+        injected = receivers._state.staging_output_directory / "raced-sealed-evidence.json"
+        injected.write_bytes(b"operator-evidence-must-survive")
+        injected.chmod(injected_mode)
+        return ()
+
+    original_publish = receiver_core.BootstrapEvidenceReceiverSet.publish_complete_bundle
+
+    def publish_with_admission_binding(self, expected_marks):
+        return original_publish(
+            self,
+            expected_marks,
+            expected_bundle_size_bytes=measured_size[0],
+        )
+
+    monkeypatch.setattr(
+        receiver_core.BootstrapEvidenceReceiverSet,
+        "publish_complete_bundle",
+        publish_with_admission_binding,
+    )
+
+    with pytest.raises(
+        BootstrapEvidenceReceiverError,
+        match=error_match,
+    ):
+        await produce_bootstrap_evidence_bundle(
+            runtime_contract=runtime,
+            snapshot_provider=provider,
+            receivers=receivers,
+            protective_mark_collector=inject_after_measurement,
+        )
+
+    assert measured_size
+    assert (output / "raced-sealed-evidence.json").read_bytes() == (
+        b"operator-evidence-must-survive"
+    )
+    assert not (output / "bundle_complete.json").exists()
 
 
 def test_invalid_capability_does_not_create_output_directory(
@@ -986,3 +1088,80 @@ async def test_completion_rename_success_then_error_resolves_as_committed(
         expected_runtime_contract=runtime,
     )
     assert loaded.marks == ()
+
+    broker_path = Path(str(report["broker_snapshot"]))
+    replacement = output / ".same-broker-new-inode"
+    replacement.write_bytes(broker_path.read_bytes())
+    replacement.chmod(0o400)
+    os.replace(replacement, broker_path)
+    with pytest.raises(
+        ExactStateBootstrapError,
+        match="entry does not match the completion manifest",
+    ):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=Path(str(report["reconciliation_report"])),
+            broker_snapshot_path=broker_path,
+            protective_mark_paths=[],
+            expected_runtime_contract=runtime,
+        )
+
+
+@pytest.mark.asyncio
+async def test_completion_manifest_rejects_file_injected_before_marker_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = _install_test_trust(monkeypatch, tmp_path)
+    database = tmp_path / "ledger.db"
+    _ledger(database)
+    runtime = _runtime(database)
+    output = tmp_path / "evidence"
+    receivers = create_bootstrap_evidence_receivers(
+        runtime_contract=runtime,
+        capability_directory=capability,
+        output_directory=output,
+    )
+    provider = _Provider(_broker_result(datetime.now(timezone.utc) - timedelta(milliseconds=50)))
+    real_write = receiver_core._write_new_sealed_file_at
+    injected = False
+
+    def inject_before_completion_write(
+        directory_fd: int,
+        filename: str,
+        payload: bytes,
+    ) -> None:
+        nonlocal injected
+        if not injected and filename.startswith(".bundle_complete.json.stage-"):
+            injected = True
+            path = output / "raced-after-measurement.json"
+            path.write_bytes(b"preserve-untrusted-raced-evidence")
+            path.chmod(0o400)
+        real_write(directory_fd, filename, payload)
+
+    monkeypatch.setattr(receiver_core, "_write_new_sealed_file_at", inject_before_completion_write)
+
+    async def no_marks(**_kwargs: object) -> tuple:
+        return ()
+
+    report = await produce_bootstrap_evidence_bundle(
+        runtime_contract=runtime,
+        snapshot_provider=provider,
+        receivers=receivers,
+        protective_mark_collector=no_marks,
+    )
+
+    assert injected is True
+    assert (output / "raced-after-measurement.json").read_bytes() == (
+        b"preserve-untrusted-raced-evidence"
+    )
+    assert (output / "bundle_complete.json").is_file()
+    with pytest.raises(
+        ExactStateBootstrapError,
+        match="entries do not match the completion manifest",
+    ):
+        load_exact_state_bootstrap_evidence(
+            reconciliation_path=Path(str(report["reconciliation_report"])),
+            broker_snapshot_path=Path(str(report["broker_snapshot"])),
+            protective_mark_paths=[],
+            expected_runtime_contract=runtime,
+        )
