@@ -427,12 +427,15 @@ def test_local_trade_before_broker_execution_window_is_not_compared():
     assert "BROKER_EXECUTIONS_CANNOT_BE_IDENTITY_MATCHED_TO_LOCAL_TRADES" not in report.caveats
 
 
-def test_public_report_rejects_account_fragments_in_metadata_and_execution_evidence():
+@pytest.mark.parametrize("account_fragment", ["DU1234567", "DUN1234567"])
+def test_public_report_rejects_account_fragments_in_metadata_and_execution_evidence(
+    account_fragment,
+):
     with pytest.raises(BrokerEvidenceError, match="sensitive identity"):
         reconcile(
             _snapshot(),
             _ledger(),
-            runtime_fingerprint="runtime-DU1234567",
+            runtime_fingerprint=f"runtime-{account_fragment}",
             database_identity="paper:db",
             expected_account_alias="***4567",
             now=NOW,
@@ -440,7 +443,7 @@ def test_public_report_rejects_account_fragments_in_metadata_and_execution_evide
 
     with pytest.raises(BrokerEvidenceError, match="sensitive identity"):
         BrokerExecution(
-            execution_id="exec-DU1234567-fill",
+            execution_id=f"exec-{account_fragment}-fill",
             order_id="19",
             contract=_contract("AAPL", 1),
             side="BOT",

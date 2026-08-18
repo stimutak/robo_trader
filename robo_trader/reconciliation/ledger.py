@@ -22,7 +22,7 @@ from .models import (
 
 _PORTFOLIO_ID = re.compile(r"^[a-z0-9_-]{1,64}$")
 _SYMBOL = re.compile(r"^[A-Z]{1,5}(?:\.[A-Z]{1,2})?$")
-_ACCOUNT_FRAGMENT = re.compile(r"(?:DU|U)\d{4,}", re.IGNORECASE)
+_ACCOUNT_FRAGMENT = re.compile(r"(?:DUN?|U)\d{4,}", re.IGNORECASE)
 _REQUIRED_COLUMNS = {
     "positions": {
         "portfolio_id": "TEXT",

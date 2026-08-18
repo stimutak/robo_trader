@@ -8,10 +8,11 @@ from robo_trader.broker_account_identity import (
 )
 
 
+@pytest.mark.parametrize("account", ["DU1234567", "DUN1234567"])
 @pytest.mark.parametrize("environment", ["dev", "test", "staging", "production", ""])
-def test_real_broker_paper_accounts_are_valid_in_every_environment(environment):
+def test_real_broker_paper_accounts_are_valid_in_every_environment(account, environment):
     assert is_supported_paper_account_identifier(
-        "DU1234567",
+        account,
         environment=environment,
     )
 
@@ -44,6 +45,9 @@ def test_reserved_synthetic_accounts_are_rejected_for_production_like_runtime(
         " DU_TEST_PAPER",
         "U1234567",
         "DU123",
+        "DUN123",
+        "DUN12A4567",
+        "DUN123456789012345678901",
         "DU123456789012345678901",
     ],
 )

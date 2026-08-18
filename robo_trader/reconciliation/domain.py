@@ -35,7 +35,7 @@ MAX_COLLECTION_WINDOW_SECONDS = 60
 MAX_RETRIEVAL_DELAY_SECONDS = 5
 
 _ACCOUNT_SCOPE = re.compile(r"^acct_v1_[0-9a-f]{64}$")
-_ACCOUNT_FRAGMENT = re.compile(r"(?:DU|U)\d{4,}", re.IGNORECASE)
+_ACCOUNT_FRAGMENT = re.compile(r"(?:DUN?|U)\d{4,}", re.IGNORECASE)
 _MASKED_ACCOUNT_ALIAS = re.compile(r"^\*{3}[A-Za-z0-9]{1,4}$")
 _SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")

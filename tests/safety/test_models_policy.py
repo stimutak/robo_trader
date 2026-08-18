@@ -226,6 +226,8 @@ def test_models_are_frozen_and_raw_accounts_are_rejected(now):
     with pytest.raises(ValidationError):
         replace(intent, reason="copied from DU1234567")
     with pytest.raises(ValidationError):
+        replace(intent, reason="copied from DUN1234567")
+    with pytest.raises(ValidationError):
         replace(intent, reason="prefixxDU1234567xsuffix")
     with pytest.raises(ValidationError):
         replace(intent, strategy="embeddedDU7654321inside")
