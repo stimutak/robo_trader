@@ -394,11 +394,29 @@ def test_launcher_uses_absolute_project_paths_after_gateway_start():
     source = (ROOT / "START_TRADER.sh").read_text()
 
     assert 'cd "$IBC_PATH"\n    # Long-lived descendants' not in source
-    assert '(\n        cd "$IBC_PATH" || exit 1\n        exec ./gatewaystartmacos.sh' in source
+    assert (
+        '(\n        cd "$IBC_PATH" || exit 1\n' "        exec /usr/bin/nohup ./gatewaystartmacos.sh"
+    ) in source
     assert '"$PYTHON" "$SCRIPT_DIR/scripts/preflight_check.py"' in source
     assert '"$PYTHON" "$SCRIPT_DIR/app.py" >' in source
     assert 'PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"' in source
     assert '"$PYTHON" -m robo_trader.runner_async' in source
+
+
+def test_gateway_launch_has_static_terminal_detachment_contract():
+    """The paper Gateway launch is detached, input-free, and log-bounded."""
+
+    source = (ROOT / "START_TRADER.sh").read_text()
+    gateway_launch = source[
+        source.index('GATEWAY_LAUNCH_LOG="$LOG_PATH/gateway_launcher_stdout.log"') : source.index(
+            "IBC_PID=$!"
+        )
+    ]
+
+    assert "/usr/bin/nohup ./gatewaystartmacos.sh -inline" in gateway_launch
+    assert "</dev/null" in gateway_launch
+    assert 'rotate_log "$GATEWAY_LAUNCH_LOG"' in gateway_launch
+    assert '>"$GATEWAY_LAUNCH_LOG" 2>&1' in gateway_launch
 
 
 def test_launcher_never_interprets_exit_two_as_force_without_force_reason():

@@ -343,12 +343,16 @@ start_gateway() {
     echo "   Check your IBKR Mobile app for 2FA prompt"
     echo ""
 
+    GATEWAY_LAUNCH_LOG="$LOG_PATH/gateway_launcher_stdout.log"
+    rotate_log "$GATEWAY_LAUNCH_LOG"
+
     # Launch Gateway inline without changing the launcher's working directory.
-    # Later safety gates and entrypoints must remain anchored to SCRIPT_DIR even
-    # when IBC needs to run from its own directory.
+    # Detach it from this terminal so an expected preflight BLOCK cannot send
+    # SIGHUP to IBC/Gateway when this supervised launcher exits.
     (
         cd "$IBC_PATH" || exit 1
-        exec ./gatewaystartmacos.sh -inline
+        exec /usr/bin/nohup ./gatewaystartmacos.sh -inline </dev/null \
+            >"$GATEWAY_LAUNCH_LOG" 2>&1
     ) 200>&- &
     IBC_PID=$!
 
