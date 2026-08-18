@@ -343,10 +343,13 @@ start_gateway() {
     echo "   Check your IBKR Mobile app for 2FA prompt"
     echo ""
 
-    # Launch Gateway inline (blocks until Gateway exits or we Ctrl+C)
-    cd "$IBC_PATH"
-    # Long-lived descendants must not inherit the launcher's lifecycle lock.
-    ./gatewaystartmacos.sh -inline 200>&- &
+    # Launch Gateway inline without changing the launcher's working directory.
+    # Later safety gates and entrypoints must remain anchored to SCRIPT_DIR even
+    # when IBC needs to run from its own directory.
+    (
+        cd "$IBC_PATH" || exit 1
+        exec ./gatewaystartmacos.sh -inline
+    ) 200>&- &
     IBC_PID=$!
 
     # Wait for Gateway to start and API port to open
@@ -652,15 +655,19 @@ echo "4.5. Running preflight safety gate..."
 PREFLIGHT_RC=0
 if [ -n "$PREFLIGHT_FORCE_REASON" ]; then
     echo "   (operator --force supplied — bypass will be audited to data/preflight_bypass.log)"
-    $PYTHON scripts/preflight_check.py --force "$PREFLIGHT_FORCE_REASON" || PREFLIGHT_RC=$?
+    "$PYTHON" "$SCRIPT_DIR/scripts/preflight_check.py" --force "$PREFLIGHT_FORCE_REASON" || PREFLIGHT_RC=$?
 else
-    $PYTHON scripts/preflight_check.py || PREFLIGHT_RC=$?
+    "$PYTHON" "$SCRIPT_DIR/scripts/preflight_check.py" || PREFLIGHT_RC=$?
 fi
 case "$PREFLIGHT_RC" in
     0)
         echo "   ✓ Preflight gate passed"
         ;;
     2)
+        if [ -z "$PREFLIGHT_FORCE_REASON" ]; then
+            echo "FATAL: preflight returned bypass status without --force; refusing unaudited bypass." >&2
+            exit 3
+        fi
         echo ""
         echo "=========================================="
         echo "⚠️  PREFLIGHT BYPASSED VIA --force"
@@ -723,7 +730,7 @@ done
 # generation, then truncate on each start so these can't grow unbounded
 # across restarts while still preserving the prior attempt's crash output.
 rotate_log "$SCRIPT_DIR/dashboard_stdout.log"
-$PYTHON app.py > "$SCRIPT_DIR/dashboard_stdout.log" 2>&1 200>&- &
+"$PYTHON" "$SCRIPT_DIR/app.py" > "$SCRIPT_DIR/dashboard_stdout.log" 2>&1 200>&- &
 DASH_PID=$!
 for _ in $(seq 1 10); do
     if "$LSOF" -nP -a -p "$DASH_PID" -iTCP:"$DASH_PORT" -sTCP:LISTEN >/dev/null 2>&1 && \
@@ -763,7 +770,9 @@ export LOG_FILE="$SCRIPT_DIR/robo_trader.log"
 # market hours the runner now sleeps until open (extended hours still
 # covered by ENABLE_EXTENDED_HOURS via is_trading_allowed).
 rotate_log "$SCRIPT_DIR/runner_stdout.log"
-$PYTHON -m robo_trader.runner_async --symbols "$SYMBOLS" > "$SCRIPT_DIR/runner_stdout.log" 2>&1 200>&- &
+PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" -m robo_trader.runner_async --symbols "$SYMBOLS" \
+    > "$SCRIPT_DIR/runner_stdout.log" 2>&1 200>&- &
 TRADER_PID=$!
 
 echo "   ✓ Trading system started (PID: $TRADER_PID)"

@@ -349,8 +349,8 @@ def test_authoritative_launcher_quiesces_runner_before_gateway_and_preflight():
     zombie_check = source.index("ZOMBIES=$(check_zombies)", gateway_checks)
     preflight_gate = source.index('case "$PREFLIGHT_RC" in')
     monitoring_stop = source.index('stop_processes_gracefully "dashboard"')
-    dashboard_start = source.index("$PYTHON app.py >")
-    runner_start = source.index("$PYTHON -m robo_trader.runner_async")
+    dashboard_start = source.index('"$PYTHON" "$SCRIPT_DIR/app.py" >')
+    runner_start = source.index('"$PYTHON" -m robo_trader.runner_async')
     dependency_functions = source.index("python_environment_ready() {")
     dependency_setup_source = source[dependency_functions:safety_replay]
 
@@ -386,6 +386,69 @@ def test_authoritative_launcher_preserves_monitoring_on_preflight_block():
     assert "./scripts/start_gateway.sh" not in source
     assert "scripts/preflight_check.py --force" not in preflight_case_source
     assert './START_TRADER.sh --force=\\"<reason>\\"' in source
+
+
+def test_launcher_uses_absolute_project_paths_after_gateway_start():
+    """IBC may change cwd; later safety/runtime paths must remain project-bound."""
+
+    source = (ROOT / "START_TRADER.sh").read_text()
+
+    assert 'cd "$IBC_PATH"\n    # Long-lived descendants' not in source
+    assert '(\n        cd "$IBC_PATH" || exit 1\n        exec ./gatewaystartmacos.sh' in source
+    assert '"$PYTHON" "$SCRIPT_DIR/scripts/preflight_check.py"' in source
+    assert '"$PYTHON" "$SCRIPT_DIR/app.py" >' in source
+    assert 'PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"' in source
+    assert '"$PYTHON" -m robo_trader.runner_async' in source
+
+
+def test_launcher_never_interprets_exit_two_as_force_without_force_reason():
+    """A Python usage/file error must not become an unaudited startup bypass."""
+
+    source = (ROOT / "START_TRADER.sh").read_text()
+    preflight_case = source.index('case "$PREFLIGHT_RC" in')
+    preflight_case_source = source[preflight_case : source.index("esac", preflight_case)]
+
+    assert 'if [ -z "$PREFLIGHT_FORCE_REASON" ]; then' in preflight_case_source
+    assert "refusing unaudited bypass" in preflight_case_source
+
+
+@pytest.mark.parametrize(
+    ("force_reason", "expected_returncode", "expects_bypass"),
+    [
+        ("", 3, False),
+        ("operator reviewed this exact safety block", 0, True),
+    ],
+)
+def test_launcher_accepts_preflight_exit_two_only_for_explicit_force(
+    tmp_path,
+    force_reason,
+    expected_returncode,
+    expects_bypass,
+):
+    source = (ROOT / "START_TRADER.sh").read_text()
+    preflight_start = source.index("PREFLIGHT_RC=0")
+    preflight_end = source.index("esac", preflight_start) + len("esac")
+    preflight_source = source[preflight_start:preflight_end]
+    fake_python = tmp_path / "python3"
+    fake_python.write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+    fake_python.chmod(0o700)
+
+    result = subprocess.run(
+        ["bash", "-c", preflight_source],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PREFLIGHT_FORCE_REASON": force_reason,
+            "PYTHON": str(fake_python),
+            "SCRIPT_DIR": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == expected_returncode, result.stdout + result.stderr
+    assert ("PREFLIGHT BYPASSED VIA --force" in result.stdout) is expects_bypass
+    assert ("refusing unaudited bypass" in result.stderr) is (not expects_bypass)
 
 
 def test_launcher_stop_helper_uses_bounded_term_then_kill_fallback():
