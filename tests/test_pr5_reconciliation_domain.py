@@ -384,6 +384,10 @@ def test_schema_version_rejects_boolean_true_everywhere(record) -> None:
             "account_alias",
         ),
         (
+            lambda: replace(_account(), account_alias="DUN123456"),
+            "account_alias",
+        ),
+        (
             lambda: replace(_account(), account_scope="acct_v1_" + "a" * 64),
             "placeholder",
         ),
@@ -640,13 +644,14 @@ def test_difference_rejects_downgraded_materiality() -> None:
         )
 
 
-def test_difference_rejects_raw_account_identity() -> None:
+@pytest.mark.parametrize("subject", ["DU123456", "DUN123456"])
+def test_difference_rejects_raw_account_identity(subject: str) -> None:
     with pytest.raises(ReconciliationDomainError, match="raw account identity"):
         ReconciliationDifference(
             kind=DifferenceKind.UNKNOWN,
             materiality=DifferenceMateriality.UNKNOWN,
             reason_code="UNEXPECTED_ACCOUNT",
-            subject="DU123456",
+            subject=subject,
         )
 
 

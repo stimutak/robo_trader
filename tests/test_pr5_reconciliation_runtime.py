@@ -988,6 +988,26 @@ async def test_operator_resolution_appends_without_replacing_quarantine(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_operator_resolution_rejects_dun_account_fragments(tmp_path) -> None:
+    service, _, persistence = await _service(
+        tmp_path,
+        comparison=_comparison((_difference(DifferenceKind.UNKNOWN),)),
+    )
+    outcome = await service.reconcile_startup()
+    difference_id = outcome.persisted.difference_ids[0]
+
+    with pytest.raises(ReconciliationPersistenceError, match="raw account identity"):
+        await persistence.append_operator_resolution(
+            run_id=outcome.persisted.run_id,
+            difference_id=difference_id,
+            resolution_kind=OperatorResolutionKind.INVESTIGATION_NOTE,
+            operator_id="operator@example.com",
+            reason="Reviewed DUN1234567 during the broker investigation.",
+            created_at=NOW + timedelta(seconds=1),
+        )
+
+
+@pytest.mark.asyncio
 async def test_service_failure_clears_prior_entry_eligibility(tmp_path) -> None:
     service, source, _ = await _service(tmp_path)
     await service.reconcile_startup()

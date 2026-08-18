@@ -14,8 +14,8 @@ from .errors import BrokerEvidenceError
 _SYMBOL = re.compile(r"^[A-Z]{1,5}(?:\.[A-Z]{1,2})?$")
 _TEXT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _PORTFOLIO_ID = re.compile(r"^[a-z0-9_-]{1,64}$")
-_ACCOUNT_SHAPED = re.compile(r"^(?:DU|U)\d+$", re.IGNORECASE)
-_ACCOUNT_FRAGMENT = re.compile(r"(?:DU|U)\d{4,}", re.IGNORECASE)
+_ACCOUNT_SHAPED = re.compile(r"^(?:DUN?|U)\d+$", re.IGNORECASE)
+_ACCOUNT_FRAGMENT = re.compile(r"(?:DUN?|U)\d{4,}", re.IGNORECASE)
 
 
 def _safe_text(value: object, field_name: str, *, max_length: int = 128) -> str:

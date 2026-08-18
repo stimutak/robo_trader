@@ -270,11 +270,13 @@ def test_reader_rejects_missing_schema_and_unknown_portfolio(tmp_path):
 def test_portfolio_identity_rejects_account_shaped_selected_and_stored_values(tmp_path):
     with pytest.raises(LedgerSafetyError, match="portfolio IDs are invalid"):
         validate_portfolio_ids(["du1234567"])
+    with pytest.raises(LedgerSafetyError, match="portfolio IDs are invalid"):
+        validate_portfolio_ids(["dun1234567"])
 
     database = tmp_path / "ledger.db"
     _create_ledger(database)
     connection = sqlite3.connect(database)
-    connection.execute("INSERT INTO account VALUES ('desk-du1234567', 1000, 1000)")
+    connection.execute("INSERT INTO account VALUES ('desk-dun1234567', 1000, 1000)")
     connection.commit()
     connection.close()
 

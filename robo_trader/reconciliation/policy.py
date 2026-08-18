@@ -29,7 +29,7 @@ _EVIDENCE_ID = re.compile(
 _SNAPSHOT_ID = re.compile(r"^broker-reconciliation-v1-[0-9a-f]{64}$")
 _BROKER_EVENT_ID = re.compile(r"^broker-event-v1-[0-9a-f]{64}$")
 _TIMING_PROOF_ID = re.compile(r"^timing-proof-v1-[0-9a-f]{64}$")
-_ACCOUNT_FRAGMENT = re.compile(r"(?:DU|U)\d{4,}", re.IGNORECASE)
+_ACCOUNT_FRAGMENT = re.compile(r"(?:DUN?|U)\d{4,}", re.IGNORECASE)
 MAX_EXPECTED_TIMING_LAG_SECONDS = 120
 _ELIGIBLE_TIMING_LAG_REASONS = frozenset(
     {

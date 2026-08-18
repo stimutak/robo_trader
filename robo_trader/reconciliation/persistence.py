@@ -35,7 +35,7 @@ from .runtime_evidence import VerifiedRuntimeReconciliationEvidence
 
 _OPERATOR_ID = re.compile(r"^[A-Za-z0-9._@:-]{1,64}$")
 _EVIDENCE_REFERENCE = re.compile(r"^[A-Za-z0-9._:/-]{1,256}$")
-_ACCOUNT_FRAGMENT = re.compile(r"(?:DU|U)\d{4,}", re.IGNORECASE)
+_ACCOUNT_FRAGMENT = re.compile(r"(?:DUN?|U)\d{4,}", re.IGNORECASE)
 
 
 class ReconciliationPersistenceError(ReconciliationDomainError):
