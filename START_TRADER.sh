@@ -346,14 +346,12 @@ start_gateway() {
     GATEWAY_LAUNCH_LOG="$LOG_PATH/gateway_launcher_stdout.log"
     rotate_log "$GATEWAY_LAUNCH_LOG"
 
-    # Launch Gateway inline without changing the launcher's working directory.
-    # Detach it from this terminal so an expected preflight BLOCK cannot send
-    # SIGHUP to IBC/Gateway when this supervised launcher exits.
-    (
-        cd "$IBC_PATH" || exit 1
-        exec /usr/bin/nohup ./gatewaystartmacos.sh -inline </dev/null \
-            >"$GATEWAY_LAUNCH_LOG" 2>&1
-    ) 200>&- &
+    # Launch Gateway in a new process session. nohup alone does not detach the
+    # Java descendant from a macOS controlling PTY, so preflight's expected
+    # launcher exit could still terminate an authenticated paper Gateway.
+    exec /usr/bin/nohup "$PYTHON" "$SCRIPT_DIR/scripts/launch_detached.py" \
+        "$IBC_PATH" "$IBC_PATH/gatewaystartmacos.sh" -inline </dev/null \
+        >"$GATEWAY_LAUNCH_LOG" 2>&1 200>&- &
     IBC_PID=$!
 
     # Wait for Gateway to start and API port to open
