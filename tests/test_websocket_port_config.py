@@ -116,7 +116,7 @@ def test_only_werkzeug_serving_child_starts_websocket_with_reloader():
 def test_authoritative_launcher_disables_werkzeug_reloader():
     launcher = (Path(__file__).resolve().parents[1] / "START_TRADER.sh").read_text()
     production_export = launcher.index("export FLASK_ENV=production")
-    dashboard_launch = launcher.index("$PYTHON app.py")
+    dashboard_launch = launcher.index('"$PYTHON" "$SCRIPT_DIR/app.py"')
 
     assert production_export < dashboard_launch
 
@@ -128,7 +128,7 @@ def test_authoritative_launcher_forces_producer_to_verified_local_port():
     )
     endpoint_export = launcher.index('export WEBSOCKET_URL="ws://localhost:$WEBSOCKET_PORT"')
     gateway_work = launcher.index('IBC_INI="${SCRIPT_DIR}/config/ibc/config.ini"')
-    dashboard_launch = launcher.index("$PYTHON app.py")
+    dashboard_launch = launcher.index('"$PYTHON" "$SCRIPT_DIR/app.py"')
 
     assert conflict_guard < endpoint_export < gateway_work < dashboard_launch
     assert '"ws://127.0.0.1:$WEBSOCKET_PORT"' in launcher
