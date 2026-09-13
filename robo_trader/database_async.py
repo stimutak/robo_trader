@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 import aiosqlite
 
@@ -2534,6 +2534,95 @@ class AsyncTradingDatabase:
                 "stored paper settlement receipt fingerprint does not match"
             )
         return receipt
+
+    async def iter_paper_terminal_receipts(
+        self, *, runtime_contract: object
+    ) -> AsyncIterator[PaperTerminalSettlementReceipt]:
+        """Stream the account's immutable terminal outbox from one read snapshot.
+
+        This is an account-wide recovery API, deliberately not exposed through
+        the portfolio proxy. Callers must keep entry admission closed until the
+        entire replay succeeds. An invalid later row invalidates the replay;
+        receiving a prefix is never evidence that recovery is complete.
+        """
+
+        expected_path, database_identity = self._expected_safety_database(
+            runtime_contract=runtime_contract
+        )
+        account_scope = getattr(runtime_contract, "safety_account_scope", None)
+        domain = getattr(runtime_contract, "safety_execution_domain_scope", None)
+        if (
+            getattr(runtime_contract, "execution_mode", None) != "paper"
+            or getattr(runtime_contract, "state_namespace", None) != "paper"
+            or domain != "paper-simulator-v1"
+            or not isinstance(account_scope, str)
+            or not account_scope
+        ):
+            raise PaperTerminalSettlementError("terminal replay requires a paper runtime scope")
+        async with self.get_connection() as conn:
+            binding: Optional[SQLitePathBinding] = None
+            try:
+                binding = SQLitePathBinding.open_readonly(self.db_path)
+                descriptor = await self._sqlite_descriptor_identity(conn)
+                binding = binding.bind_sqlite_connection(descriptor)
+                if (descriptor.device, descriptor.inode) != self._expected_database_file_identity:
+                    raise PaperTerminalSettlementError("terminal replay database identity changed")
+                await conn.execute("BEGIN")
+                try:
+                    await assert_paper_settlement_hot_schema(conn)
+                    cursor = await conn.execute("""
+                        SELECT settlement_id, request_fingerprint, request_payload_json,
+                               protective_quote_payload, trade_id, database_path,
+                               database_identity, database_device, database_inode,
+                               committed_at, receipt_fingerprint, schema_version,
+                               execution_domain_scope, account_scope, portfolio_id, symbol
+                        FROM main.paper_reduction_settlements ORDER BY rowid
+                        """)
+                    while rows := await cursor.fetchmany(128):
+                        for row in rows:
+                            receipt = self._paper_settlement_receipt_from_row(row[:12])
+                            request = receipt.request
+                            if (
+                                row[12:]
+                                != (domain, account_scope, request.portfolio_id, request.symbol)
+                                or request.execution_domain_scope != domain
+                                or request.account_scope != account_scope
+                            ):
+                                raise PaperTerminalSettlementError(
+                                    "terminal replay scope mismatched"
+                                )
+                            if (
+                                receipt.database_path != str(expected_path)
+                                or receipt.database_identity != database_identity
+                                or (receipt.database_device, receipt.database_inode)
+                                != (descriptor.device, descriptor.inode)
+                            ):
+                                raise PaperTerminalSettlementError(
+                                    "terminal replay receipt database provenance changed"
+                                )
+                            binding.assert_connection_identity(
+                                await self._sqlite_descriptor_identity(conn)
+                            )
+                            yield receipt
+                    current = await self._sqlite_descriptor_identity(conn)
+                    binding.assert_connection_identity(current)
+                    if (current.device, current.inode) != (descriptor.device, descriptor.inode):
+                        raise PaperTerminalSettlementError(
+                            "terminal replay database identity changed"
+                        )
+                except GeneratorExit:
+                    # A consumer closing a read iterator is not a database fault.
+                    # Finish rollback before returning the connection to its pool.
+                    return
+                finally:
+                    await conn.rollback()
+            except SQLiteIdentityError as exc:
+                raise PaperTerminalSettlementError(
+                    "terminal replay database identity changed"
+                ) from exc
+            finally:
+                if binding is not None:
+                    binding.close()
 
     async def commit_paper_reduction_outcome(
         self,

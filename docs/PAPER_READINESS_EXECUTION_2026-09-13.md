@@ -88,3 +88,39 @@ The user identified `/Volumes/oliver/Projects/robo_trader`. The mount is an SMB 
 - `blackm5mbp.local` lacks a known-host entry; existing trusted alias `blackm5mbp` verifies but rejects available SSH authentication for user `oliver`. User was asked for the configured SSH username/alias. No host-key check was bypassed and no remote command ran.
 
 The June handoff documents historical accounting and data-quality incidents already motivating the canonical remediation plan. It is historical context, not current pricing or launch evidence. Current work continues from the newer isolated integration branch; the mounted runtime remains unchanged.
+
+## Terminal fill replay integration (September 13)
+
+Added an account-wide read-only terminal outbox iterator and a dormant paper-fill
+accounting adapter. Replay validates producer-owned persisted receipts, exact
+paper/account/database scope, and the opened SQLite inode before every yielded
+receipt. Normal iterator abandonment rolls back its snapshot without poisoning
+the connection pool. Replaced paths and malformed outbox rows fail closed.
+
+The adapter projects fills into the independently authenticated daily-notional
+ledger using a separate simulator account namespace. All portfolio scopes must
+share one database and anchor so execution-ID deduplication remains account-wide.
+Repeated replay after a lost response does not duplicate notional. Cancellation
+drains an in-progress durable append before propagating. No runtime admission is
+wired or enabled by this adapter; complete replay remains a prerequisite for
+future entry integration.
+
+Independent review identified stale pooled inode acceptance and split-ledger
+deduplication gaps; both have regression tests and fixes. Final review found no
+additional actionable defect. Focused tests: 10 passed. Full suite: 3501 passed,
+4 skipped, 19 warnings in 141.31 seconds. Black, changed-file Flake8, and diff
+whitespace checks pass. Full log: workspace work/paper-replay-full.log.
+
+### Remote access update
+
+The user confirmed SSH username `oliver`. A native Terminal login established a
+connection through the existing trusted `blackm5mbp` host entry. Read-only checks
+observed the watchdog and Java listening on paper API port 4002, but no runner.
+A subsequent log-summary request timed out connecting to port 22; current broker
+login and remote health remain unverified. No runtime was restarted or changed.
+
+The supplied `robo6trader` value appears to be a login name; an actual approved
+DU/DUN paper account identifier is still needed. Independent monotonic-verifier
+configuration, reviewed bootstrap/reconciliation, operational restore evidence,
+and remaining entry-risk integration are still open. No launch is authorized by
+these development test results.

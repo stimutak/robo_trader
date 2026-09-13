@@ -1729,3 +1729,12 @@ The launch approver must answer all of the following with evidence:
 10. Is the live canary restricted to the approved account, symbols, position count, notional, and expiry?
 
 If any answer is no, unknown, stale, or based only on documentation rather than observed evidence, live trading remains disabled.
+
+### September 13 isolated integration evidence
+
+Local development integration includes PRs #122, #124, #116, and #121 plus
+reviewed upgrade-binding fixes and a dormant terminal-fill replay adapter. The
+combined suite passes 3501 tests (4 skipped). Detailed inputs, limitations,
+restore drill, and remote-host observations are recorded in
+`docs/PAPER_READINESS_EXECUTION_2026-09-13.md`. This is development evidence;
+Gate A remains closed and no operational startup or bootstrap is approved.

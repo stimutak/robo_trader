@@ -978,6 +978,12 @@ class DailyFilledNotional:
         return self._anchor_path
 
     @property
+    def accounting_scope(self) -> tuple[str, str, str]:
+        """Return the immutable account, portfolio, and currency binding."""
+
+        return self._account_id, self._portfolio_id, self._currency
+
+    @property
     def restored_trading_date(self) -> date:
         return self._restored_trading_date
 
