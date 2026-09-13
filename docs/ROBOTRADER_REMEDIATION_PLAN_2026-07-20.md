@@ -1778,3 +1778,16 @@ legacy sizing or implement reservations, full entry evidence, final database/
 reconciliation checks, replay startup, or BUY settlement. Gate A remains closed.
 Broader post-change safety/security/risk/entry-contract/runner-event-time
 verification: 1117 passed, 4 existing skips; details in the execution record.
+
+September 13 daily-risk integration follow-up: the gateway can prepare a supplied
+exact daily-accounting adapter by validating complete bootstrap scope, replaying
+all terminal receipts and authenticating each scope, including empty ones.
+Configured terminal fills are ingested before journal release inside drained
+completion; failures preserve outbox/reservation evidence and quarantine.
+Task-owned daily reads revalidate valuation after awaiting independent authority.
+Related regressions: 83 passed. Production verifier construction and runner
+injection remain open, as do exact sizing, reservations and BUY settlement.
+No entry authority or paper readiness gate was enabled.
+Broader post-change safety/security/risk/runner/gateway verification: 1216 passed,
+4 existing skips. Independent final failure/binding review found no actionable
+defect; formatting, changed-file lint and whitespace checks pass.

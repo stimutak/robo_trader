@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import aclosing
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Mapping
 
 from robo_trader.config import RuntimeContract
@@ -65,7 +66,49 @@ class PaperFillAccounting:
         ):
             raise PaperFillAccountingError("paper scopes must share one account-wide risk ledger")
 
+        first = next(iter(self._ledgers.values()))
+        self._ledger_binding = (first.database_path, first.anchor_path)
+
+    def assert_runtime_coverage(
+        self, runtime: RuntimeContract, portfolios: tuple[str, ...]
+    ) -> None:
+        """Require every bootstrapped account portfolio, including inactive scopes."""
+        if type(runtime) is not RuntimeContract or runtime != self._runtime:
+            raise PaperFillAccountingError("paper accounting runtime binding differs")
+        if type(portfolios) is not tuple or not portfolios or set(portfolios) != set(self._ledgers):
+            raise PaperFillAccountingError("paper accounting portfolio coverage is incomplete")
+        for portfolio, ledger in self._ledgers.items():
+            if (
+                type(ledger) is not DailyFilledNotional
+                or ledger.accounting_scope != (self._account, portfolio, "USD")
+                or (ledger.database_path, ledger.anchor_path) != self._ledger_binding
+            ):
+                raise PaperFillAccountingError("paper accounting ledger binding differs")
+
+    async def current_total(self, portfolio_id: str) -> Decimal:
+        """Read an independently authenticated daily total without blocking asyncio."""
+        self.assert_runtime_coverage(self._runtime, tuple(self._ledgers))
+        ledger = self._ledgers.get(portfolio_id)
+        if ledger is None:
+            raise PaperFillAccountingError("paper daily total has no matching scope")
+        return await self._run_owned(ledger.current_gross_filled_notional)
+
+    @staticmethod
+    async def _run_owned(function, *args):
+        task = asyncio.create_task(asyncio.to_thread(function, *args))
+        cancellation = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+        result = task.result()
+        if cancellation is not None:
+            raise cancellation
+        return result
+
     def _record(self, receipt: PaperTerminalSettlementReceipt) -> bool:
+        self.assert_runtime_coverage(self._runtime, tuple(self._ledgers))
         assert_producer_owned_paper_terminal_settlement_receipt(receipt)
         request = receipt.request
         if (
@@ -106,17 +149,7 @@ class PaperFillAccounting:
         deduplication in the independently authenticated ledger.
         """
 
-        task = asyncio.create_task(asyncio.to_thread(self._record, receipt))
-        cancellation = None
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError as exc:
-                cancellation = exc
-        result = task.result()
-        if cancellation is not None:
-            raise cancellation
-        return result
+        return await self._run_owned(self._record, receipt)
 
     async def replay(self, database: AsyncTradingDatabase) -> PaperFillReplayResult:
         """Replay one complete outbox snapshot; never return success for a prefix."""

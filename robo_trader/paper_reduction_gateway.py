@@ -50,6 +50,7 @@ from .reconciliation.identity import (
     RuntimeSafetyContext,
     assert_validated_runtime_safety_context,
 )
+from .risk.paper_fill_accounting import PaperFillAccounting, PaperFillReplayResult
 from .risk.entry_contract import _exact_multiply, _exact_subtract
 from .risk.paper_ledger_snapshot import (
     PaperRiskLedgerSnapshot,
@@ -127,6 +128,7 @@ class PaperReductionGateway:
         database: AsyncTradingDatabase,
         *,
         diagnostic_provider: IBKRDiagnosticSnapshotProvider | None = None,
+        fill_accounting: PaperFillAccounting | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -173,6 +175,10 @@ class PaperReductionGateway:
                 "shared safety database does not match the runtime ledger path"
             )
         self._database = database
+        if fill_accounting is not None and type(fill_accounting) is not PaperFillAccounting:
+            raise PaperReductionGatewayError("exact paper fill accounting is required")
+        self._fill_accounting = fill_accounting
+        self._entry_accounting_ready = False
         self._diagnostic_provider = diagnostic_provider
         self._owns_diagnostic_client = diagnostic_provider is None
         if diagnostic_provider is None:
@@ -253,6 +259,8 @@ class PaperReductionGateway:
             context = assert_validated_runtime_safety_context(self._runtime_context)
             connection = context.diagnostic_connection
             try:
+                if getattr(self, "_fill_accounting", None) is not None:
+                    await self._prepare_entry_accounting_locked(self._fill_accounting)
                 if getattr(self, "_owns_diagnostic_client", True):
                     await self._client.start()
                     connected = await self._client.connect(
@@ -280,6 +288,56 @@ class PaperReductionGateway:
                 await self._stop_client_owned(error)
                 raise
             self._started = True
+
+    async def prepare_entry_accounting(
+        self, accounting: PaperFillAccounting
+    ) -> PaperFillReplayResult:
+        """Complete startup/recovery replay before daily entry evidence is usable."""
+        async with self._account_order_gate:
+            return await self._prepare_entry_accounting_locked(accounting)
+
+    async def _prepare_entry_accounting_locked(
+        self, accounting: PaperFillAccounting
+    ) -> PaperFillReplayResult:
+        self._entry_accounting_ready = False
+        if getattr(self, "_terminal_quarantine_reason", None) is not None:
+            raise PaperReductionGatewayError("quarantined gateway cannot prepare entry accounting")
+        if type(accounting) is not PaperFillAccounting:
+            raise PaperReductionGatewayError("exact paper fill accounting is required")
+        runtime = self._runtime_context.runtime_contract
+        snapshot = await collect_paper_risk_ledger_snapshot(self._database, runtime)
+        portfolios = tuple(p for p, _ in snapshot.portfolio_cash)
+        accounting.assert_runtime_coverage(runtime, portfolios)
+        self._fill_accounting = accounting
+        result = await accounting.replay(self._database)
+        # Empty scopes still require a fresh successful independent-authority
+        # read; an empty outbox must not skip authority validation.
+        for portfolio in portfolios:
+            await accounting.current_total(portfolio)
+        self._entry_accounting_ready = True
+        return result
+
+    async def entry_daily_notional(self, *, portfolio_id: str) -> Decimal:
+        """Read a fresh authenticated total within the task-owned entry context."""
+        self.entry_valuation(portfolio_id=portfolio_id)
+        accounting = getattr(self, "_fill_accounting", None)
+        if (
+            type(accounting) is not PaperFillAccounting
+            or getattr(self, "_entry_accounting_ready", False) is not True
+        ):
+            raise PaperReductionGatewayError("entry accounting replay is unavailable")
+        context = self._entry_market_context
+        accounting.assert_runtime_coverage(
+            self._runtime_context.runtime_contract,
+            tuple(p for p, _ in context.ledger.portfolio_cash),
+        )
+        try:
+            total = await accounting.current_total(portfolio_id)
+        except BaseException:
+            self._entry_accounting_ready = False
+            raise
+        self.entry_valuation(portfolio_id=portfolio_id)
+        return total
 
     async def _stop_client_owned(
         self,
@@ -1397,6 +1455,14 @@ class PaperReductionGateway:
             runtime_contract=runtime_contract,
         )
         await binding.settlement_participant.apply_and_verify(receipt)
+        accounting = getattr(self, "_fill_accounting", None)
+        if accounting is not None:
+            was_ready = getattr(self, "_entry_accounting_ready", False) is True
+            self._entry_accounting_ready = False
+            if type(accounting) is not PaperFillAccounting:
+                raise PaperReductionGatewayError("terminal paper accounting binding is invalid")
+            await accounting.ingest(receipt)
+            self._entry_accounting_ready = was_ready
 
         post_snapshot = await self._database.get_safety_allocation_snapshot(
             final_contract.symbol,

@@ -234,3 +234,74 @@ async def test_entry_ledger_age_cannot_be_hidden_by_wall_clock_shift(ledger, mon
         clock[0] += 6.0
         with pytest.raises(PaperReductionGatewayError, match="ledger evidence is stale"):
             gateway.entry_valuation(portfolio_id="default")
+
+
+@pytest.mark.asyncio
+async def test_gateway_prepares_replay_before_entry_daily_notional(ledger, monkeypatch):
+    from datetime import datetime, timezone
+    from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
+    from tests.risk.test_daily_filled_notional import MutableClock, _service
+    from tests.risk.test_paper_ledger_snapshot import _settle
+
+    gateway, _, _, _ = _gateway(ledger, monkeypatch)
+    await _settle(ledger)
+    runtime = ledger[1]
+    risk = _service(
+        ledger[0].db_path.parent / "risk.db",
+        account_id="paper-simulator-v1:" + runtime.safety_account_scope,
+        clock=MutableClock(datetime.now(timezone.utc)),
+    )
+    accounting = PaperFillAccounting(runtime, {"default": risk})
+    replay = await gateway.prepare_entry_accounting(accounting)
+    assert replay.receipts_seen == replay.fills_recorded == 1
+    async with gateway.serialize_entry("AAPL", portfolio_id="default"):
+        assert await gateway.entry_daily_notional(portfolio_id="default") == Decimal("660")
+    replay = await gateway.prepare_entry_accounting(accounting)
+    assert replay.fills_recorded == 0
+
+
+@pytest.mark.asyncio
+async def test_entry_daily_notional_requires_completed_replay(ledger, monkeypatch):
+    gateway, _, _, _ = _gateway(ledger, monkeypatch)
+    async with gateway.serialize_entry("AAPL", portfolio_id="default"):
+        with pytest.raises(PaperReductionGatewayError, match="accounting"):
+            await gateway.entry_daily_notional(portfolio_id="default")
+
+
+@pytest.mark.asyncio
+async def test_empty_replay_still_requires_independent_authority(ledger, monkeypatch):
+    from robo_trader.risk.filled_notional import FilledNotionalUnavailable
+    from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
+    from tests.risk.test_daily_filled_notional import _service
+
+    gateway, _, _, _ = _gateway(ledger, monkeypatch)
+    runtime = ledger[1]
+    risk = _service(
+        ledger[0].db_path.parent / "risk.db",
+        account_id="paper-simulator-v1:" + runtime.safety_account_scope,
+    )
+    accounting = PaperFillAccounting(runtime, {"default": risk})
+    risk._monotonic_verifier = lambda _: False
+    with pytest.raises(FilledNotionalUnavailable, match="monotonic"):
+        await gateway.prepare_entry_accounting(accounting)
+    assert gateway._entry_accounting_ready is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_replay_cannot_leave_accounting_ready(ledger, monkeypatch):
+    from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
+    from tests.risk.test_daily_filled_notional import _service
+
+    gateway, _, _, _ = _gateway(ledger, monkeypatch)
+    runtime = ledger[1]
+    risk = _service(
+        ledger[0].db_path.parent / "risk.db",
+        account_id="paper-simulator-v1:" + runtime.safety_account_scope,
+    )
+    accounting = PaperFillAccounting(runtime, {"default": risk})
+    await gateway.prepare_entry_accounting(accounting)
+    monkeypatch.setattr(accounting, "replay", AsyncMock(side_effect=asyncio.CancelledError))
+    with pytest.raises(asyncio.CancelledError):
+        await gateway.prepare_entry_accounting(accounting)
+    assert gateway._entry_accounting_ready is False
+    assert not gateway._account_order_gate.locked()

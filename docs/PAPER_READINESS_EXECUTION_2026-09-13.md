@@ -287,3 +287,42 @@ verification: 1117 passed, 4 existing skips, 1 warning in 25.46 seconds
 (work/paper-entry-valuation-safety.log). The skips are two unavailable Docker
 Compose checks and two pre-existing conditional/incomplete integration checks;
 they are not evidence of operational launch readiness.
+
+## Gateway durable daily accounting integration
+
+The gateway now accepts an exact PaperFillAccounting dependency. When supplied
+at construction, startup validates complete authenticated bootstrap portfolio
+coverage, replays the terminal outbox under the shared account order lock, and
+performs independently authenticated reads for every scope before accounting
+is ready. Empty outboxes do not skip authority validation. Explicit preparation
+supports the same replay boundary. Cancelled or failed preparation leaves
+entry accounting unavailable.
+
+Task-owned entry contexts can request a fresh exact daily total, with portfolio
+coverage checked and valuation/quote freshness revalidated after the awaited
+read. Configured terminal accounting ingests each committed settlement receipt
+before the safety journal releases the order, inside the existing cancellation-
+drained completion task. Ingestion failure leaves accounting unavailable and
+triggers existing gateway quarantine, preserving the committed outbox and the
+unreleased journal reservation. Replay can recover the risk projection exactly
+once; it does not clear gateway quarantine or authorize restart.
+
+The adapter revalidates the constructor-bound risk database and anchor paths
+for both reads and terminal ingestion. A regression reproduced redirection to
+a different otherwise-valid risk ledger after initialization; the binding check
+now rejects it. All tests use synthetic data and the existing test-only
+monotonic authority. No test authority was installed in production.
+
+Related accounting, valuation, gateway and failure-injection suites: 83 passed,
+1 warning in 7.06 seconds. Tests include cancelled replay, independently denied
+empty-state reads, terminal failure, cancellation drain, and idempotent recovery.
+The gateway integration still requires production verifier/configuration
+construction and runner injection. Reduction-only operation can omit the
+adapter, but then no daily entry evidence is available. Baseline BUY remains
+denied and paper readiness remains false. No services were started.
+
+Broader post-change verification: 1216 passed, 4 existing skips, 1 warning in
+28.10 seconds (work/paper-gateway-accounting-safety.log). Independent review
+passed the initial 59-test set and 5 final targeted failure/binding tests with
+no remaining actionable defect. Black, changed-file Flake8 and whitespace
+checks pass.
