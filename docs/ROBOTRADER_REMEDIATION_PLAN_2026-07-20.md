@@ -1791,3 +1791,15 @@ No entry authority or paper readiness gate was enabled.
 Broader post-change safety/security/risk/runner/gateway verification: 1216 passed,
 4 existing skips. Independent final failure/binding review found no actionable
 defect; formatting, changed-file lint and whitespace checks pass.
+
+September 13 history-completeness correction: successful terminal replay does
+not prove pre-bootstrap daily gross executions. Owned snapshots now seal each
+portfolio's authenticated bootstrap timestamp; entry daily totals require a
+later New York date, one explicit read timestamp, and unchanged date after the
+await. Bootstrap-day support would need authenticated historical execution
+completeness evidence; none is inferred from cash or legacy float trades.
+Related regressions: 111 passed; independent history review: 9 passed. Gate A
+remains closed, with configuration/reservations/full admission and BUY settlement
+still unimplemented.
+Broader post-change verification: 1224 passed, 4 existing skips. Formatting,
+changed-file lint and whitespace checks pass; operational readiness remains closed.

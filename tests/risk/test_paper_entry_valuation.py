@@ -212,6 +212,7 @@ async def test_inactive_cash_and_short_positions_remain_in_account_valuation(led
     # independent bootstrap receipt construction tests. No runtime bypass.
     values = {field.name: getattr(original, field.name) for field in fields(original)}
     values["portfolio_cash"] += (("retired", Decimal("1000")),)
+    values["bootstrap_effective_at"] += (("retired", original.bootstrap_effective_at[0][1]),)
     values["positions"] += (PaperRiskPosition("retired", "NVDA", 123, Decimal("-3")),)
     snapshot = _issue_snapshot(**values)
     monkeypatch.setattr(
@@ -254,8 +255,10 @@ async def test_gateway_prepares_replay_before_entry_daily_notional(ledger, monke
     accounting = PaperFillAccounting(runtime, {"default": risk})
     replay = await gateway.prepare_entry_accounting(accounting)
     assert replay.receipts_seen == replay.fills_recorded == 1
+    assert await accounting.current_total("default") == Decimal("660")
     async with gateway.serialize_entry("AAPL", portfolio_id="default"):
-        assert await gateway.entry_daily_notional(portfolio_id="default") == Decimal("660")
+        with pytest.raises(PaperReductionGatewayError, match="daily history"):
+            await gateway.entry_daily_notional(portfolio_id="default")
     replay = await gateway.prepare_entry_accounting(accounting)
     assert replay.fills_recorded == 0
 
@@ -305,3 +308,59 @@ async def test_cancelled_replay_cannot_leave_accounting_ready(ledger, monkeypatc
         await gateway.prepare_entry_accounting(accounting)
     assert gateway._entry_accounting_ready is False
     assert not gateway._account_order_gate.locked()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_day_replay_does_not_prove_complete_daily_history(ledger, monkeypatch):
+    from datetime import datetime, timezone
+    from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
+    from tests.risk.test_daily_filled_notional import MutableClock, _service
+
+    gateway, _, _, _ = _gateway(ledger, monkeypatch)
+    runtime = ledger[1]
+    risk = _service(
+        ledger[0].db_path.parent / "risk.db",
+        account_id="paper-simulator-v1:" + runtime.safety_account_scope,
+        clock=MutableClock(datetime.now(timezone.utc)),
+    )
+    await gateway.prepare_entry_accounting(PaperFillAccounting(runtime, {"default": risk}))
+    async with gateway.serialize_entry("AAPL", portfolio_id="default"):
+        with pytest.raises(PaperReductionGatewayError, match="daily history"):
+            await gateway.entry_daily_notional(portfolio_id="default")
+
+
+@pytest.mark.asyncio
+async def test_complete_day_total_is_bound_to_gateway_read_time(ledger, monkeypatch):
+    from dataclasses import fields
+    from datetime import datetime, timedelta, timezone
+    import robo_trader.paper_reduction_gateway as module
+    from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
+    from robo_trader.risk.paper_ledger_snapshot import (
+        _issue_snapshot,
+        collect_paper_risk_ledger_snapshot,
+    )
+    from tests.risk.test_daily_filled_notional import MutableClock, _service
+    from tests.risk.test_paper_ledger_snapshot import _settle
+
+    gateway, _, _, _ = _gateway(ledger, monkeypatch)
+    await _settle(ledger)
+    original = await collect_paper_risk_ledger_snapshot(ledger[0], ledger[1])
+    values = {field.name: getattr(original, field.name) for field in fields(original)}
+    # Test-only issuer supplies a prior-day history boundary; actual collection
+    # gets this field only from the authenticated bootstrap candidate.
+    values["bootstrap_effective_at"] = (("default", original.observed_at - timedelta(days=2)),)
+    snapshot = _issue_snapshot(**values)
+    monkeypatch.setattr(
+        module, "collect_paper_risk_ledger_snapshot", AsyncMock(return_value=snapshot)
+    )
+    risk = _service(
+        ledger[0].db_path.parent / "risk.db",
+        account_id="paper-simulator-v1:" + ledger[1].safety_account_scope,
+        clock=MutableClock(datetime.now(timezone.utc)),
+    )
+    await gateway.prepare_entry_accounting(PaperFillAccounting(ledger[1], {"default": risk}))
+    # A different ledger default date must not silently change the entry day's
+    # total. Gateway selects one explicit timestamp, then rechecks its date.
+    risk._clock = lambda: datetime.now(timezone.utc) - timedelta(days=1)
+    async with gateway.serialize_entry("AAPL", portfolio_id="default"):
+        assert await gateway.entry_daily_notional(portfolio_id="default") == Decimal("660")

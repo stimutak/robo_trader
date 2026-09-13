@@ -15,6 +15,7 @@ import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from robo_trader.accounting.fifo import FifoLedger
 from robo_trader.config import RuntimeContract
@@ -56,6 +57,7 @@ class PaperRiskLedgerSnapshot:
     database_inode: int
     observed_at: datetime
     portfolio_cash: tuple[tuple[str, Decimal], ...]
+    bootstrap_effective_at: tuple[tuple[str, datetime], ...]
     positions: tuple[PaperRiskPosition, ...]
     fills: tuple[PaperRiskFill, ...]
 
@@ -90,7 +92,12 @@ def _snapshot_state(snapshot):
         raise PaperRiskLedgerSnapshotError("snapshot type is malformed")
     if any(
         type(value) is not tuple
-        for value in (snapshot.portfolio_cash, snapshot.positions, snapshot.fills)
+        for value in (
+            snapshot.portfolio_cash,
+            snapshot.bootstrap_effective_at,
+            snapshot.positions,
+            snapshot.fills,
+        )
     ):
         raise PaperRiskLedgerSnapshotError("snapshot collections must be immutable tuples")
     cash = []
@@ -101,6 +108,16 @@ def _snapshot_state(snapshot):
     portfolios = tuple(p for p, _ in cash)
     if not portfolios or portfolios != tuple(sorted(set(portfolios))):
         raise PaperRiskLedgerSnapshotError("snapshot portfolios must be unique and sorted")
+    observed = timestamp(snapshot.observed_at)
+    history = []
+    for row in snapshot.bootstrap_effective_at:
+        if type(row) is not tuple or len(row) != 2:
+            raise PaperRiskLedgerSnapshotError("snapshot bootstrap history is malformed")
+        history.append((text(row[0]), timestamp(row[1])))
+        if row[1] > snapshot.observed_at:
+            raise PaperRiskLedgerSnapshotError("snapshot bootstrap history starts in the future")
+    if tuple(p for p, _ in history) != portfolios:
+        raise PaperRiskLedgerSnapshotError("snapshot bootstrap history coverage is incomplete")
     positions = []
     for position in snapshot.positions:
         if type(position) is not PaperRiskPosition:
@@ -130,15 +147,16 @@ def _snapshot_state(snapshot):
         if type(value) is not int or value < 0:
             raise PaperRiskLedgerSnapshotError("snapshot database inode is malformed")
     return (
-        "paper-risk-ledger-v1",
+        "paper-risk-ledger-v2",
         text(snapshot.account_scope),
         text(snapshot.execution_domain_scope),
         text(snapshot.database_path),
         text(snapshot.database_identity),
         snapshot.database_device,
         snapshot.database_inode,
-        timestamp(snapshot.observed_at),
+        observed,
         cash,
+        history,
         positions,
         fills,
     )
@@ -433,6 +451,9 @@ async def collect_paper_risk_ledger_snapshot(
                     database_inode=descriptor.inode,
                     observed_at=observed_at,
                     portfolio_cash=tuple(sorted(cash.items())),
+                    bootstrap_effective_at=tuple(
+                        (p, c.effective_at) for p, c in sorted(candidates.items())
+                    ),
                     positions=tuple(
                         PaperRiskPosition(p, s, c, q)
                         for (p, s), (c, q) in sorted(quantities.items())
@@ -451,3 +472,32 @@ async def collect_paper_risk_ledger_snapshot(
     finally:
         if binding is not None:
             binding.close()
+
+
+def assert_complete_paper_daily_history(
+    snapshot: PaperRiskLedgerSnapshot, *, portfolio_id: str, as_of: datetime
+) -> None:
+    """Post-bootstrap receipts prove complete days only after bootstrap's NY date.
+
+    Cash/positions do not prove pre-bootstrap gross executions. Until an
+    authenticated historical execution import exists, the bootstrap day is
+    unknown even when the local terminal outbox is empty.
+    """
+    assert_owned_paper_risk_ledger_snapshot(snapshot)
+    if (
+        type(as_of) is not datetime
+        or as_of.tzinfo is None
+        or as_of.utcoffset() != timezone.utc.utcoffset(as_of)
+    ):
+        raise PaperRiskLedgerSnapshotError("daily history requires exact UTC time")
+    origins = dict(snapshot.bootstrap_effective_at)
+    if portfolio_id not in origins:
+        raise PaperRiskLedgerSnapshotError("daily history has no portfolio coverage")
+    zone = ZoneInfo("America/New_York")
+    if (
+        as_of < snapshot.observed_at
+        or as_of.astimezone(zone).date() <= origins[portfolio_id].astimezone(zone).date()
+    ):
+        raise PaperRiskLedgerSnapshotError(
+            "daily history is incomplete for the bootstrap trading date"
+        )

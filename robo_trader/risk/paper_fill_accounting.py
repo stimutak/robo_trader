@@ -11,6 +11,7 @@ import asyncio
 from contextlib import aclosing
 from dataclasses import dataclass
 from decimal import Decimal
+from datetime import datetime
 from typing import Mapping
 
 from robo_trader.config import RuntimeContract
@@ -85,17 +86,17 @@ class PaperFillAccounting:
             ):
                 raise PaperFillAccountingError("paper accounting ledger binding differs")
 
-    async def current_total(self, portfolio_id: str) -> Decimal:
+    async def current_total(self, portfolio_id: str, *, as_of: datetime | None = None) -> Decimal:
         """Read an independently authenticated daily total without blocking asyncio."""
         self.assert_runtime_coverage(self._runtime, tuple(self._ledgers))
         ledger = self._ledgers.get(portfolio_id)
         if ledger is None:
             raise PaperFillAccountingError("paper daily total has no matching scope")
-        return await self._run_owned(ledger.current_gross_filled_notional)
+        return await self._run_owned(ledger.current_gross_filled_notional, as_of=as_of)
 
     @staticmethod
-    async def _run_owned(function, *args):
-        task = asyncio.create_task(asyncio.to_thread(function, *args))
+    async def _run_owned(function, *args, **kwargs):
+        task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
         cancellation = None
         while not task.done():
             try:

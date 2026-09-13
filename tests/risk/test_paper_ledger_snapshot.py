@@ -366,3 +366,50 @@ async def test_snapshot_cannot_hide_unbootstrapped_portfolio_with_temporary_shad
         await connection.commit()
     with pytest.raises(PaperRiskLedgerSnapshotError, match="bootstrap"):
         await collect_paper_risk_ledger_snapshot(database, runtime)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_preserves_authenticated_history_start(ledger):
+    database, runtime, candidate = ledger
+    snapshot = await collect_paper_risk_ledger_snapshot(database, runtime)
+    assert snapshot.bootstrap_effective_at == (("default", candidate.effective_at),)
+    object.__setattr__(snapshot, "bootstrap_effective_at", ())
+    with pytest.raises(PaperRiskLedgerSnapshotError):
+        assert_owned_paper_risk_ledger_snapshot(snapshot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "origin,as_of,complete",
+    [
+        ("2026-07-28T23:00:00+00:00", "2026-07-29T00:30:00+00:00", False),
+        ("2026-07-29T03:59:59+00:00", "2026-07-29T04:00:00+00:00", True),
+        ("2026-03-08T05:00:00+00:00", "2026-03-09T04:00:00+00:00", True),
+        ("2026-11-01T04:00:00+00:00", "2026-11-02T04:30:00+00:00", False),
+        ("2026-11-01T04:00:00+00:00", "2026-11-02T05:00:00+00:00", True),
+    ],
+)
+async def test_daily_history_uses_new_york_date_including_dst(ledger, origin, as_of, complete):
+    from dataclasses import fields
+    from datetime import datetime
+    from robo_trader.risk.paper_ledger_snapshot import (
+        _issue_snapshot,
+        assert_complete_paper_daily_history,
+    )
+
+    original = await collect_paper_risk_ledger_snapshot(ledger[0], ledger[1])
+    values = {field.name: getattr(original, field.name) for field in fields(original)}
+    # Test-only producer issuance isolates calendar boundaries from bootstrap
+    # receipt expiry and system clocks. Production collection uses signed dates.
+    values["observed_at"] = datetime.fromisoformat(as_of)
+    values["bootstrap_effective_at"] = (("default", datetime.fromisoformat(origin)),)
+    snapshot = _issue_snapshot(**values)
+    if complete:
+        assert_complete_paper_daily_history(
+            snapshot, portfolio_id="default", as_of=values["observed_at"]
+        )
+    else:
+        with pytest.raises(PaperRiskLedgerSnapshotError, match="daily history"):
+            assert_complete_paper_daily_history(
+                snapshot, portfolio_id="default", as_of=values["observed_at"]
+            )

@@ -45,6 +45,17 @@ cooldown blocks while the evaluation time precedes its expiry; equality permits
 evaluation of the remaining limits. Snapshot freshness and all existing quote,
 contract, transport, portfolio, and symbol checks still apply.
 
+## Daily history boundary
+
+Successful terminal replay proves post-bootstrap fills. Bootstrap cash and
+positions do not prove gross executions earlier on that date. Entry daily
+accounting therefore requires a date later than the portfolio's authenticated
+bootstrap date in America/New_York, plus complete replay and a fresh independent
+ledger read. Unknown bootstrap-day history is never treated as zero. Supporting
+that date requires additional authenticated historical-execution completeness
+evidence. The gateway pins each read to one timestamp and rejects a date change
+during the read.
+
 ## Remaining runtime work
 
 Authoritative account-wide snapshots and reservations, configuration binding,

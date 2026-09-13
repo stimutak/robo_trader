@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
 from .broker_safety_evidence import BrokerContractSafetySnapshot
@@ -54,6 +55,8 @@ from .risk.paper_fill_accounting import PaperFillAccounting, PaperFillReplayResu
 from .risk.entry_contract import _exact_multiply, _exact_subtract
 from .risk.paper_ledger_snapshot import (
     PaperRiskLedgerSnapshot,
+    PaperRiskLedgerSnapshotError,
+    assert_complete_paper_daily_history,
     assert_owned_paper_risk_ledger_snapshot,
     collect_paper_risk_ledger_snapshot,
 )
@@ -331,12 +334,22 @@ class PaperReductionGateway:
             self._runtime_context.runtime_contract,
             tuple(p for p, _ in context.ledger.portfolio_cash),
         )
+        as_of = datetime.now(timezone.utc)
         try:
-            total = await accounting.current_total(portfolio_id)
+            assert_complete_paper_daily_history(
+                context.ledger, portfolio_id=portfolio_id, as_of=as_of
+            )
+        except PaperRiskLedgerSnapshotError as exc:
+            raise PaperReductionGatewayError("entry daily history is incomplete") from exc
+        try:
+            total = await accounting.current_total(portfolio_id, as_of=as_of)
         except BaseException:
             self._entry_accounting_ready = False
             raise
         self.entry_valuation(portfolio_id=portfolio_id)
+        zone = ZoneInfo("America/New_York")
+        if datetime.now(timezone.utc).astimezone(zone).date() != as_of.astimezone(zone).date():
+            raise PaperReductionGatewayError("entry daily history changed trading date during read")
         return total
 
     async def _stop_client_owned(

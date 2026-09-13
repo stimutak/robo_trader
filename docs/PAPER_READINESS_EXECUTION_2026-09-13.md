@@ -326,3 +326,42 @@ Broader post-change verification: 1216 passed, 4 existing skips, 1 warning in
 passed the initial 59-test set and 5 final targeted failure/binding tests with
 no remaining actionable defect. Black, changed-file Flake8 and whitespace
 checks pass.
+
+## Bootstrap-day daily-history completeness
+
+Runtime integration review exposed a distinction between successful outbox
+replay and complete daily execution history. Authenticated bootstrap cash and
+positions do not establish gross executions earlier on the bootstrap date.
+Previously, an empty post-bootstrap outbox could yield zero daily notional for
+that date. A regression reproduced this before the correction.
+
+Owned ledger snapshots now carry each portfolio's authenticated bootstrap
+effective timestamp, with exact scope coverage and mutation/future-time checks.
+Entry daily accounting refuses the bootstrap's New York calendar date and any
+earlier date. Later complete dates can use replayed terminal history. The daily
+read is pinned to one explicit gateway UTC timestamp and its New York date is
+checked again after the await. No legacy float trade rows are converted into
+authoritative executions and no historical fill identifiers are invented.
+
+This means a newly bootstrapped portfolio cannot use entry daily evidence until
+a later New York date. Supporting its bootstrap date would require a separate
+authenticated historical-execution import/completeness proof, which is not
+implemented. Operator readiness must account for this boundary; successful
+replay alone does not waive it.
+
+Related snapshot, valuation, accounting, gateway and failure-injection suites:
+111 passed, 1 warning in 17.02 seconds. Calendar tests cover UTC-midnight false
+rollover, actual New York midnight, and spring/fall DST boundaries. A positive
+entry read verifies that the gateway timestamp selects the intended day even
+if the ledger's default clock differs. Independent review: 9 history-focused
+tests passed, no actionable defect. Logs: work/paper-history-boundary-red.log,
+work/paper-history-boundary-regressions.log and broader verification log.
+
+Exact entry configuration binding, pending reservations, full evidence assembly,
+production verifier construction/injection and baseline BUY settlement remain
+open. No services or real-money execution were enabled.
+
+Broader post-change safety/security/risk/runner/gateway verification: 1224 passed,
+4 existing skips, 1 warning in 22.30 seconds
+(work/paper-history-boundary-safety.log). Black, changed-file Flake8 and whitespace
+checks pass. This is development evidence; paper readiness remains false.
