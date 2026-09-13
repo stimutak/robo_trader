@@ -76,15 +76,20 @@ policy unavailable and does not authorize entries. Optional
 `ENTRY_MAX_QUOTE_AGE_SECONDS` and `ENTRY_MAX_ACCOUNT_EVIDENCE_AGE_SECONDS` default
 to five seconds and may only tighten that bound, with exact microsecond precision.
 
-This is Config-level binding. Runtime consumption must first resolve portfolio
-and runner-instance overrides, then construct fresh limits at the serialized
-submission boundary. No returned configuration object grants entry authority.
+`AsyncRunner._current_entry_risk_limits()` resolves one active portfolio from
+its loaded configuration. Missing, duplicate or inactive portfolio selection
+fails closed. Portfolio position/slot overrides and runner order/daily caps are
+applied to an isolated copy; None inherits the configured value, while zero or
+invalid overrides are rejected. Runner correlation may tighten the configured
+threshold. Each call rebuilds from current values without changing shared
+configuration. Final admission must invoke this resolution under serialization
+and consume the resulting limits; no returned object grants entry authority.
 
 ## Remaining runtime work
 
 Owned account-wide snapshots, durable cooldown evidence, daily-risk replay and
 ingestion, and Config-level policy binding now exist. Pending reservations,
-complete market/account evidence, runner override resolution, production verifier
+complete market/account evidence, production verifier
 construction, final contract consumption, and baseline BUY settlement remain
 open. These components must be integrated and verified before entry authority is
 enabled; component tests do not prove complete operational enforcement.

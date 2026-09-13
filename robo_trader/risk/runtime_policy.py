@@ -84,3 +84,45 @@ def build_runtime_entry_risk_limits(config: Config, settings: Mapping[str, str])
         max_quote_age=_age(values, ENTRY_POLICY_KEYS[3]),
         max_account_evidence_age=_age(values, ENTRY_POLICY_KEYS[4]),
     )
+
+
+def build_portfolio_entry_risk_limits(
+    config: Config,
+    portfolio_id: str,
+    *,
+    max_order_notional=None,
+    max_daily_notional=None,
+    max_correlation=None,
+) -> EntryRiskLimits:
+    """Resolve one active portfolio and current runner overrides, without caching."""
+    if type(config) is not Config:
+        raise ValueError("exact Config is required for entry policy")
+    if type(portfolio_id) is not str or not portfolio_id or portfolio_id != portfolio_id.strip():
+        raise ValueError("entry portfolio identifier is invalid")
+    portfolios = config.portfolio_configs
+    if type(portfolios) is not list or any(type(item) is not dict for item in portfolios):
+        raise ValueError("entry portfolio configuration is invalid")
+    matches = [item for item in portfolios if item.get("id") == portfolio_id]
+    if len(matches) != 1 or matches[0].get("active", True) is not True:
+        raise ValueError("entry portfolio must uniquely identify an active configuration")
+    selected = matches[0]
+    resolved = config.model_copy(deep=True)
+    for field in ("max_position_pct", "max_open_positions"):
+        value = selected.get(field)
+        if value is not None:
+            setattr(resolved.risk, field, value)
+    for field, value in (
+        ("max_order_notional", max_order_notional),
+        ("max_daily_notional", max_daily_notional),
+    ):
+        if value is not None:
+            setattr(resolved.risk, field, _configured_decimal(value, field))
+    if max_correlation is not None:
+        correlation = _configured_decimal(max_correlation, "runner max_correlation")
+        if not 0 <= correlation <= 1:
+            raise ValueError("runner max_correlation must be between zero and one")
+        resolved.correlation.max_correlation = min(
+            correlation,
+            _configured_decimal(resolved.correlation.max_correlation, "max_correlation"),
+        )
+    return resolved.build_entry_risk_limits()

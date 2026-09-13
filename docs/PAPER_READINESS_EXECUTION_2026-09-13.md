@@ -417,3 +417,24 @@ verifier injection and baseline BUY settlement remain open. A fresh read-only SS
 attempt to blackm5mbp again timed out on port 22; no remote changes were made.
 The actual approved paper-account identifier remains outstanding. Paper readiness
 is false and profitability remains unverified.
+
+## Runner and portfolio policy resolution
+
+The runner now has a current-limit resolver selecting exactly one active
+portfolio from loaded configuration. It applies position/slot overrides and
+runner order/daily caps to an isolated copy, retains the stricter runner/config
+correlation threshold, and validates the result through the exact contract.
+None inherits; zero, booleans, nonfinite values and invalid portfolio limits
+fail closed. Missing/duplicate/inactive portfolio selection is rejected.
+Rebuilding observes current overrides without mutating shared configuration.
+
+Focused runner/config/contract regressions: 328 passed, 1 warning in 8.71 seconds.
+Independent review: all 14 new tests passed, no actionable defect. Initial red
+run confirmed the missing resolver. No admission capability is granted: final
+submission still needs reservations, complete evidence and atomic BUY settlement.
+Logs: work/runner-entry-policy-red.log and
+work/runner-entry-policy-regressions.log. Operational gates remain unchanged.
+
+Broader risk/security/entry/gateway/routing/settlement verification: 1026 passed,
+4 existing skips, 4 warnings in 49.92 seconds (work/runner-entry-policy-safety.log).
+Black, changed-file Flake8 and whitespace checks pass. Paper readiness remains false.

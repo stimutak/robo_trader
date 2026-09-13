@@ -951,6 +951,18 @@ class AsyncRunner:
             fill_price=None,
         )
 
+    def _current_entry_risk_limits(self):
+        """Resolve this runner's current limits; this does not authorize an entry."""
+        from .risk.runtime_policy import build_portfolio_entry_risk_limits
+
+        return build_portfolio_entry_risk_limits(
+            self.cfg,
+            self.portfolio_id,
+            max_order_notional=self.max_order_notional,
+            max_daily_notional=self.max_daily_notional,
+            max_correlation=self.max_correlation,
+        )
+
     @staticmethod
     def _exact_entry_fill_price(result: object) -> Decimal:
         """Return the executor's actual opening fill without quote fallback."""

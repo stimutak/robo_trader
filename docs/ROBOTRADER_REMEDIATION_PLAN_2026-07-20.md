@@ -1823,3 +1823,15 @@ risk/security/entry/gateway/routing/settlement verification: 1012 passed,
 4 existing skips. Formatting, changed-file lint and whitespace checks pass.
 Runner overrides, reservations, final evidence/contract consumption, production
 verifier injection and BUY settlement remain open. Gate A remains closed.
+
+September 13 runner-policy follow-up: current exact limits now resolve a unique
+active portfolio, its position/slot overrides, runner order/daily caps and the
+stricter correlation setting without changing shared configuration. Missing or
+invalid selection/overrides fail closed. Focused regressions: 328 passed;
+independent review: 14 passed. Final serialized admission must consume this
+resolver; pending reservations, full evidence and BUY settlement remain open.
+Gate A remains closed.
+
+Broader risk/security/entry/gateway/routing/settlement verification: 1026 passed,
+4 existing skips, 4 warnings in 49.92 seconds (work/runner-entry-policy-safety.log).
+Black, changed-file Flake8 and whitespace checks pass. Paper readiness remains false.
