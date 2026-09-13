@@ -1738,3 +1738,13 @@ combined suite passes 3501 tests (4 skipped). Detailed inputs, limitations,
 restore drill, and remote-host observations are recorded in
 `docs/PAPER_READINESS_EXECUTION_2026-09-13.md`. This is development evidence;
 Gate A remains closed and no operational startup or bootstrap is approved.
+
+September 13 follow-up: the dormant exact entry contract now enforces explicit
+optional order notional policy, maximum occupied/pending account position slots,
+duplicate-symbol rejection, and durable cooldown boundaries. Unknown admission
+state fails closed, and new evidence is sealed and revalidated. Focused tests:
+208 passed. Independent review: no actionable defect. Full rerun: 3536 passed,
+4 skipped; a preceding migration-test outer subprocess timeout and successful
+isolated rerun are retained in the execution record. Runtime evidence production,
+account leverage/pending exposure, BUY settlement, and operational Gate A remain
+open. No entry authority or startup gate was enabled.

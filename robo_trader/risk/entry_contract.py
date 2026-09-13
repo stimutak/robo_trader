@@ -246,6 +246,10 @@ class RiskReason(str, Enum):
     LIQUIDITY_LIMIT = "liquidity_limit"
     ML_CORROBORATION_REQUIRED = "ml_corroboration_required"
     NO_CAPACITY = "no_capacity"
+    MISSING_ADMISSION_STATE = "missing_admission_state"
+    OPEN_POSITION_LIMIT = "open_position_limit"
+    DUPLICATE_ENTRY = "duplicate_entry"
+    CHURN_LIMIT = "churn_limit"
 
 
 class LimitingCapacity(str, Enum):
@@ -257,6 +261,7 @@ class LimitingCapacity(str, Enum):
     CASH = "cash"
     BUYING_POWER = "buying_power"
     DAILY_NOTIONAL = "daily_notional"
+    ORDER_NOTIONAL = "order_notional"
 
 
 def _identifier(value: object, field_name: str) -> str:
@@ -960,6 +965,9 @@ class EntryRiskEvidence(_SealedCapability):
     current_sector_gross_notional_usd: Optional[Decimal] = None
     portfolio_gross_notional_usd: Optional[Decimal] = None
     daily_executed_notional_usd: Optional[Decimal] = None
+    account_occupied_position_slots: Optional[int] = None
+    symbol_has_position_or_pending_entry: Optional[bool] = None
+    symbol_entry_allowed_at: Optional[datetime] = None
     _seal: InitVar[object] = None
 
     def __post_init__(self, _seal: object) -> None:
@@ -977,6 +985,21 @@ class EntryRiskEvidence(_SealedCapability):
                 self,
                 "observed_at",
                 _timestamp(self.observed_at, "risk evidence observed_at"),
+            )
+        if self.account_occupied_position_slots is not None and (
+            type(self.account_occupied_position_slots) is not int
+            or self.account_occupied_position_slots < 0
+        ):
+            raise EntryRiskContractError(
+                "account_occupied_position_slots must be nonnegative integer"
+            )
+        if self.symbol_has_position_or_pending_entry is not None:
+            _flag(self.symbol_has_position_or_pending_entry, "symbol_has_position_or_pending_entry")
+        if self.symbol_entry_allowed_at is not None:
+            object.__setattr__(
+                self,
+                "symbol_entry_allowed_at",
+                _timestamp(self.symbol_entry_allowed_at, "symbol_entry_allowed_at"),
             )
         if self.quote is not None:
             if type(self.quote) is not RefreshedQuoteEvidence:
@@ -1036,8 +1059,19 @@ def build_entry_risk_evidence(
     current_sector_gross_notional_usd: Optional[Decimal] = None,
     portfolio_gross_notional_usd: Optional[Decimal] = None,
     daily_executed_notional_usd: Optional[Decimal] = None,
+    account_occupied_position_slots: Optional[int] = None,
+    symbol_has_position_or_pending_entry: Optional[bool] = None,
+    symbol_entry_allowed_at: Optional[datetime] = None,
 ) -> EntryRiskEvidence:
-    """Transfer exact component evidence into one single-use risk snapshot."""
+    """Transfer exact component evidence into one single-use risk snapshot.
+
+    The runtime producer must collect admission state under the account-wide
+    order lock. Occupied slots include all held symbols and reserved new symbols;
+    duplicate state includes current positions and pending entries for this
+    symbol across portfolios. The allowed-at timestamp is the durable latest
+    entry cooldown boundary from recent buys/sells, never a default for missing
+    history. This pure contract does not collect or reserve that state itself.
+    """
 
     if quote is not None:
         quote = _consume_capability(quote, RefreshedQuoteEvidence)
@@ -1068,6 +1102,9 @@ def build_entry_risk_evidence(
             "current_sector_gross_notional_usd": current_sector_gross_notional_usd,
             "portfolio_gross_notional_usd": portfolio_gross_notional_usd,
             "daily_executed_notional_usd": daily_executed_notional_usd,
+            "account_occupied_position_slots": account_occupied_position_slots,
+            "symbol_has_position_or_pending_entry": symbol_has_position_or_pending_entry,
+            "symbol_entry_allowed_at": symbol_entry_allowed_at,
         },
     )
 
@@ -1081,10 +1118,14 @@ class EntryRiskLimits:
     minimum_average_daily_dollar_volume_usd: Decimal
     max_order_fraction_of_daily_dollar_volume: Decimal
     max_daily_notional_usd: Decimal
+    max_order_notional_usd: Optional[Decimal]
+    max_open_positions: int
     max_quote_age: timedelta
     max_account_evidence_age: timedelta
 
     def __post_init__(self) -> None:
+        if type(self.max_open_positions) is not int or self.max_open_positions <= 0:
+            raise EntryRiskContractError("max_open_positions must be a positive integer")
         position = _fraction(
             self.max_position_fraction,
             "max_position_fraction",
@@ -1135,6 +1176,12 @@ class EntryRiskLimits:
             "max_daily_notional_usd",
             _decimal(self.max_daily_notional_usd, "max_daily_notional_usd", positive=True),
         )
+        if self.max_order_notional_usd is not None:
+            object.__setattr__(
+                self,
+                "max_order_notional_usd",
+                _decimal(self.max_order_notional_usd, "max_order_notional_usd", positive=True),
+            )
         for field_name in ("max_quote_age", "max_account_evidence_age"):
             value = getattr(self, field_name)
             if type(value) is not timedelta or value <= timedelta(0):
@@ -1531,6 +1578,9 @@ def _capability_state(capability: object) -> tuple[object, ...]:
             _optional_decimal_state(evidence.current_sector_gross_notional_usd),
             _optional_decimal_state(evidence.portfolio_gross_notional_usd),
             _optional_decimal_state(evidence.daily_executed_notional_usd),
+            evidence.account_occupied_position_slots,
+            evidence.symbol_has_position_or_pending_entry,
+            _optional_time_state(evidence.symbol_entry_allowed_at),
         )
     if type(capability) is RiskDecision:
         decision = cast(RiskDecision, capability)
@@ -1795,6 +1845,20 @@ def evaluate_entry_intent(
     elif evidence.portfolio_id != intent.portfolio_id or evidence.symbol != intent.symbol:
         reasons.append(RiskReason.EVIDENCE_SCOPE_MISMATCH)
 
+    if (
+        evidence.account_occupied_position_slots is None
+        or evidence.symbol_has_position_or_pending_entry is None
+        or evidence.symbol_entry_allowed_at is None
+    ):
+        reasons.append(RiskReason.MISSING_ADMISSION_STATE)
+    else:
+        if evidence.account_occupied_position_slots >= limits.max_open_positions:
+            reasons.append(RiskReason.OPEN_POSITION_LIMIT)
+        if evidence.symbol_has_position_or_pending_entry:
+            reasons.append(RiskReason.DUPLICATE_ENTRY)
+        if now < evidence.symbol_entry_allowed_at:
+            reasons.append(RiskReason.CHURN_LIMIT)
+
     required_money = (
         ("portfolio_equity_usd", RiskReason.MISSING_PORTFOLIO_EQUITY),
         ("cash_available_usd", RiskReason.MISSING_CASH),
@@ -1991,6 +2055,10 @@ def evaluate_entry_intent(
             ),
         ),
     )
+    # None represents an explicitly disabled optional config cap. There is no
+    # constructor default: every producer must deliberately supply this policy.
+    if limits.max_order_notional_usd is not None:
+        capacities += ((LimitingCapacity.ORDER_NOTIONAL, limits.max_order_notional_usd),)
     limiting_capacity, capacity_usd = _minimum_capacity(capacities)
     if capacity_usd <= 0:
         return _rejected(intent, now, [RiskReason.NO_CAPACITY], quote)

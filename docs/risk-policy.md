@@ -1,30 +1,47 @@
-## Risk Policy
+# Paper entry risk policy
 
-Robo Trader prioritizes capital preservation. All orders are validated against strict limits before execution.
+The canonical operating requirements are in
+`ROBOTRADER_REMEDIATION_PLAN_2026-07-20.md`, Gate A. Paper startup remains gated;
+IBKR must stay read-only. The pure contract in
+`robo_trader/risk/entry_contract.py` does not grant submission authority.
 
-### Controls
-- **Daily Loss Cap**: Stop trading if daily PnL <= `-MAX_DAILY_LOSS`.
-- **Per-Symbol Exposure Cap**: New order notional ≤ `MAX_SYMBOL_EXPOSURE_PCT * equity`.
-- **Leverage Limit**: `(sum notionals) / equity` ≤ `MAX_LEVERAGE` after the new order.
+## Exact sizing contract
 
-### Position Sizing
-Given `cash_available` and `entry_price`:
-```
-notional_per_position = cash_available * MAX_POSITION_RISK_PCT
-shares = floor(notional_per_position / entry_price)
-```
-Shares are deterministic and non-negative.
+The contract floors whole-share quantity at the minimum remaining capacity:
+requested allocation, symbol exposure, sector exposure, portfolio gross exposure,
+liquidity, available cash, buying power, daily gross filled notional, and any
+explicitly configured per-order notional cap. Calculations use exact Decimal
+arithmetic and verify the result against every capacity. The Gate-A symbol
+position cap cannot exceed 2% of portfolio equity.
 
-### Boundary Behavior
-- At exactly the symbol exposure cap: allowed.
-- At exactly the leverage cap: allowed.
-- Invalid inputs (≤0 price, ≤0 quantity): rejected.
+`max_order_notional_usd` must be explicitly supplied. A positive Decimal enables
+that optional cap; explicit None corresponds to disabling the optional
+`RiskConfig.max_order_notional` setting. Missing required risk evidence never
+means zero exposure or unlimited capacity.
 
-### Examples
-- Equity 100,000; `MAX_SYMBOL_EXPOSURE_PCT=0.2` → per-symbol max notional = 20,000.
-- Existing notional 50,000; `MAX_LEVERAGE=2.0` → max total after order = 200,000; new order passes if total ≤ 200,000.
+For example, a $1,000 per-order cap at a $333 share price permits at most three
+shares ($999), provided all other limits allow them. A cap below one share's
+price rejects the entry.
 
-### Testing
-Unit tests cover sizing, exposure, and leverage checks, including edge cases at the limits.
+## Admission state
 
+A valid snapshot must contain an exact nonnegative account-wide count of held
+and reserved position slots, an explicit indication of whether the symbol already
+has a position or pending entry, and the durable timestamp at which a new entry
+is allowed. The runtime producer must collect these under the account-wide order
+lock and revalidate immediately before submission. Unknown state rejects entry.
 
+A new symbol is rejected at the configured maximum number of open positions.
+Any existing position or pending entry in the symbol rejects a duplicate. A
+cooldown blocks while the evaluation time precedes its expiry; equality permits
+evaluation of the remaining limits. Snapshot freshness and all existing quote,
+contract, transport, portfolio, and symbol checks still apply.
+
+## Remaining runtime work
+
+Account-level leverage and pending exposure, configuration binding, durable
+cooldown production, daily-risk replay/ingestion, and the baseline BUY settlement
+path must be integrated and verified before entry authority is enabled. Current
+contract tests prove pure decisions, not complete operational enforcement.
+Incomplete strategies, shorts, smart execution, AI/ML discovery, and take-profit
+remain disabled for Gate A. Reductions retain their separate safety policy.

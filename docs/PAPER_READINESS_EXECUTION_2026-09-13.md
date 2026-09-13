@@ -124,3 +124,69 @@ DU/DUN paper account identifier is still needed. Independent monotonic-verifier
 configuration, reviewed bootstrap/reconciliation, operational restore evidence,
 and remaining entry-risk integration are still open. No launch is authorized by
 these development test results.
+
+## Entry admission limits and next integration boundary
+
+The exact entry contract now requires explicit per-order notional policy and an
+exact positive maximum-open-position count. A specified order cap participates
+in exact flooring and the all-capacity postcondition; explicit None retains the
+existing optional configuration semantics. Admission evidence must include held
+plus pending account position slots, account-wide symbol duplicate state, and a
+durable cooldown boundary. Missing evidence fails closed. Every added evidence
+field participates in the sealed capability state and boundary revalidation.
+
+Regression tests cover exact share-price boundaries, malformed configuration,
+hostile Decimal context, occupied and pending slots at the limit, duplicate
+entries, exact cooldown expiry, absent evidence, and post-seal mutation. Mutation
+tests exposed the initial missing seal fields before they were fixed. Independent
+review found no actionable defect in the final changes (186 tests for the order
+cap; 22 targeted tests for admission evidence).
+
+The contract still grants no runtime execution authority. Remaining work is a
+connected implementation, in this order:
+
+1. Implement a runtime evidence producer using the existing account-wide gateway
+   lock, canonical broker-bound quote source, current signed allocations, and
+   independently authenticated daily-risk ledger. Count held and reserved
+   symbols across portfolios, derive cooldowns from durable recent terminal
+   fills, and map explicit configured limits. Include account-level leverage and
+   pending cash/exposure in addition to current portfolio/symbol/sector values.
+2. Bind startup to complete terminal replay and fail closed if any portfolio
+   accounting scope or independent monotonic authority is unavailable. Feed every
+   new terminal receipt to accounting before admission can reopen.
+3. Implement a separately authorized baseline BUY terminal path with atomic
+   exact FIFO/account/cash persistence, producer-owned outcome evidence, and
+   crash recovery. The current PaperTerminalSettlementRequest accepts only SELL
+   and BUY_TO_COVER; removing that reduction restriction alone is not an entry
+   implementation.
+4. Connect one-shot baseline intents and risk decisions to the gateway. Recheck
+   signed state, quotes, price ceiling, all capacities, reconciliation, and
+   reservations at submission; keep the lock through settlement and risk ingestion.
+   Verify simultaneous portfolios, cancellation, restart, uncertain fills, and
+   price changes before enabling the terminal readiness constant.
+5. Finish the operator-dependent paper account, monotonic authority, reviewed
+   bootstrap/reconciliation, and operational restore requirements. Run the
+   canonical pre-start consent and START_TRADER.sh flow only after Gate A passes.
+
+Open GitHub PRs were checked again: no separate entry-runtime implementation is
+available among the open PRs. Integrated PRs remain open remotely. The latest
+bounded SSH retry timed out; no remote changes were attempted.
+
+
+Validation note: all 208 focused entry-contract tests pass. The first full run
+completed with 3535 passed, 4 skipped, and one migration-test subprocess timeout
+(the outer 10-second test guard, before a report was returned). That unchanged
+migration test passes in isolation in 3.85 seconds and verifies SQLite progress
+interruption and rollback. No timeout was relaxed. The full rerun passed: 3536 passed, 4 skipped, 19 warnings in 333.22 seconds.
+It is retained separately as work/paper-entry-limits-full-rerun.log; the first run remains in
+work/paper-entry-limits-full.log for audit.
+
+
+Performance observation during validation: the existing hyperparameter-tuning
+test requests the complete random-forest search grid. ModelTrainer configures
+both estimators and GridSearchCV with n_jobs=-1; the full rerun visibly spent
+minutes in joblib worker processes during that stage. Resource-budgeting and
+representative tuning benchmarks remain follow-up work; this observation does
+not establish a trading latency or profitability improvement.
+
+Black, changed-file Flake8, and diff whitespace checks pass. Entry authority remains disabled.
