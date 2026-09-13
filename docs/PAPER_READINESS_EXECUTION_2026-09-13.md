@@ -365,3 +365,31 @@ Broader post-change safety/security/risk/runner/gateway verification: 1224 passe
 4 existing skips, 1 warning in 22.30 seconds
 (work/paper-history-boundary-safety.log). Black, changed-file Flake8 and whitespace
 checks pass. This is development evidence; paper readiness remains false.
+
+## Durable symbol exposure and cooldown evidence
+
+The task-owned gateway entry context now retains the requested symbol. Its
+fresh valuation includes that symbol's absolute gross exposure across all
+account portfolios, explicit held-position presence, and a durable allowed-at
+cooldown timestamp. Long and short holdings never cancel in gross exposure;
+inactive portfolios remain included. These are held-state values, not proof of
+absent pending reservations.
+
+The existing runtime's ten-minute BUY/SELL churn policy is derived from verified
+nonzero terminal fill times across portfolios. The latest authenticated account
+bootstrap provides a conservative lower bound when earlier symbol history is
+unknown. Rejected/zero-fill outcomes do not extend this fill-based cooldown.
+The risk contract must still combine this evidence with pending reservations
+and enforce the resulting decision at final submission; BUY remains disabled.
+
+Focused snapshot, valuation, accounting and exact entry-contract regressions:
+351 passed, 1 warning in 10.96 seconds. Tests cover current holdings, real
+committed fill history, rejected outcomes, a fill in an inactive portfolio, and
+opposing signed holdings. Independent review: 4 targeted tests passed, no
+actionable defect. The open PR list was refreshed; no separate pending entry
+integration was available. No remote branch was merged or pushed.
+
+Broader post-change safety/security/risk/runner/gateway verification: 1228 passed,
+4 existing skips, 1 warning in 34.83 seconds (work/paper-entry-history-safety.log).
+Black, changed-file Flake8 and whitespace checks pass. Operational launch and
+profitability remain unverified; the paper readiness constant remains false.

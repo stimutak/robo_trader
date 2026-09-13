@@ -1803,3 +1803,13 @@ remains closed, with configuration/reservations/full admission and BUY settlemen
 still unimplemented.
 Broader post-change verification: 1224 passed, 4 existing skips. Formatting,
 changed-file lint and whitespace checks pass; operational readiness remains closed.
+
+September 13 admission-history follow-up: gateway valuation now provides exact
+account-wide symbol gross, explicit held-symbol presence and durable ten-minute
+cooldown evidence from verified terminal fills, bounded conservatively by the
+latest account bootstrap. Zero fills do not extend cooldown and signed holdings
+do not net away gross. Related regressions: 351 passed; independent review:
+4 targeted tests passed. Pending reservation evidence and final risk-contract
+consumption remain open; no entry authority was enabled.
+Broader post-change verification: 1228 passed, 4 existing skips; formatting,
+changed-file lint and whitespace checks pass. Gate A remains closed.

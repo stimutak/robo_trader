@@ -80,11 +80,16 @@ class PaperReductionGatewayError(RuntimeError):
 
 
 _REFERENCE_PRICE_TICK = Decimal("0.0001")
+_ENTRY_COOLDOWN = timedelta(minutes=10)
 
 
 @dataclass(frozen=True, slots=True)
 class PaperEntryValuation:
-    """Exact current ledger valuation, not an order authorization."""
+    """Exact held exposure and history, not an order authorization.
+
+    Symbol gross and held-position presence cover all account portfolios.
+    Pending reservations are a separate required admission input.
+    """
 
     portfolio_cash_usd: Decimal
     portfolio_equity_usd: Decimal
@@ -93,12 +98,17 @@ class PaperEntryValuation:
     account_gross_notional_usd: Decimal
     account_occupied_position_slots: int
     observed_at: datetime
+    symbol: str
+    current_symbol_gross_notional_usd: Decimal
+    symbol_has_position: bool
+    symbol_entry_allowed_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
 class _EntryMarketContext:
     owner: asyncio.Task
     portfolio_id: str
+    symbol: str
     ledger: PaperRiskLedgerSnapshot
     quotes: tuple[BrokerProtectiveQuote, ...]
     started_monotonic: float
@@ -990,7 +1000,12 @@ class PaperReductionGateway:
             try:
                 if entry_ledger is not None:
                     self._entry_market_context = _EntryMarketContext(
-                        asyncio.current_task(), portfolio_id, entry_ledger, quotes, entry_started
+                        asyncio.current_task(),
+                        portfolio_id,
+                        symbol,
+                        entry_ledger,
+                        quotes,
+                        entry_started,
                     )
                     self.entry_valuation(portfolio_id=portfolio_id)
                 yield current_quote
@@ -1073,6 +1088,7 @@ class PaperReductionGateway:
         def add(a, b):
             return _exact_subtract(a, b.copy_negate(), "entry valuation")
 
+        symbol_gross = Decimal("0")
         for position in ledger.positions:
             value = _exact_multiply(
                 position.quantity, quotes[position.symbol].price, "entry valuation"
@@ -1080,12 +1096,23 @@ class PaperReductionGateway:
             scope = position.portfolio_id
             equities[scope] = add(equities[scope], value)
             grosses[scope] = add(grosses[scope], value.copy_abs())
+            if position.symbol == context.symbol:
+                symbol_gross = add(symbol_gross, value.copy_abs())
         total_equity = total_gross = Decimal("0")
         for scope in equities:
             if equities[scope] <= 0:
                 raise PaperReductionGatewayError("entry portfolio equity must be positive")
             total_equity = add(total_equity, equities[scope])
             total_gross = add(total_gross, grosses[scope])
+        # The legacy runtime's 600-second BUY/SELL churn rule becomes durable
+        # account-wide evidence. Prior bootstrap history is unknown, so its
+        # latest boundary conservatively establishes the earliest cooldown.
+        history_boundary = max(at for _, at in ledger.bootstrap_effective_at)
+        last_activity = max(
+            (fill.occurred_at for fill in ledger.fills if fill.symbol == context.symbol),
+            default=history_boundary,
+        )
+        allowed_at = max(history_boundary, last_activity) + _ENTRY_COOLDOWN
         return PaperEntryValuation(
             dict(ledger.portfolio_cash)[portfolio_id],
             equities[portfolio_id],
@@ -1094,6 +1121,10 @@ class PaperReductionGateway:
             total_gross,
             len({p.symbol for p in ledger.positions}),
             ledger.observed_at,
+            context.symbol,
+            symbol_gross,
+            symbol_gross > 0,
+            allowed_at,
         )
 
     def submit_baseline_entry(

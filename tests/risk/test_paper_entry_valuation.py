@@ -364,3 +364,85 @@ async def test_complete_day_total_is_bound_to_gateway_read_time(ledger, monkeypa
     risk._clock = lambda: datetime.now(timezone.utc) - timedelta(days=1)
     async with gateway.serialize_entry("AAPL", portfolio_id="default"):
         assert await gateway.entry_daily_notional(portfolio_id="default") == Decimal("660")
+
+
+@pytest.mark.asyncio
+async def test_entry_admission_history_comes_from_verified_account_snapshot(ledger, monkeypatch):
+    from datetime import timedelta
+
+    gateway, _, _, _ = _gateway(ledger, monkeypatch)
+    async with gateway.serialize_entry("AAPL", portfolio_id="default"):
+        state = gateway.entry_valuation(portfolio_id="default")
+        assert state.symbol == "AAPL"
+        assert state.current_symbol_gross_notional_usd == Decimal("0")
+        assert state.symbol_has_position is False
+        assert state.symbol_entry_allowed_at == ledger[2].effective_at + timedelta(minutes=10)
+    async with gateway.serialize_entry("NVDA", portfolio_id="default"):
+        state = gateway.entry_valuation(portfolio_id="default")
+        assert state.symbol == "NVDA"
+        assert state.current_symbol_gross_notional_usd == Decimal("2970")
+        assert state.symbol_has_position is True
+
+
+@pytest.mark.asyncio
+async def test_nonzero_terminal_fill_extends_symbol_cooldown(ledger, monkeypatch):
+    from datetime import timedelta
+    from tests.risk.test_paper_ledger_snapshot import _settle
+
+    gateway, _, _, _ = _gateway(ledger, monkeypatch)
+    receipt = await _settle(ledger)
+    async with gateway.serialize_entry("NVDA", portfolio_id="default"):
+        state = gateway.entry_valuation(portfolio_id="default")
+        assert state.current_symbol_gross_notional_usd == Decimal("2310")
+        assert state.symbol_entry_allowed_at == receipt.request.outcome_at + timedelta(minutes=10)
+
+
+@pytest.mark.asyncio
+async def test_rejected_zero_fill_does_not_extend_cooldown(ledger, monkeypatch):
+    from datetime import timedelta
+    from tests.risk.test_paper_ledger_snapshot import _settle
+
+    gateway, _, _, _ = _gateway(ledger, monkeypatch)
+    await _settle(ledger, filled=False)
+    async with gateway.serialize_entry("NVDA", portfolio_id="default"):
+        state = gateway.entry_valuation(portfolio_id="default")
+        assert state.symbol_entry_allowed_at == ledger[2].effective_at + timedelta(minutes=10)
+        assert state.current_symbol_gross_notional_usd == Decimal("2970")
+
+
+@pytest.mark.asyncio
+async def test_symbol_exposure_and_cooldown_include_other_portfolios(ledger, monkeypatch):
+    from dataclasses import fields
+    from datetime import timedelta
+    import robo_trader.paper_reduction_gateway as module
+    from robo_trader.risk.paper_ledger_snapshot import (
+        PaperRiskFill,
+        PaperRiskPosition,
+        _issue_snapshot,
+        collect_paper_risk_ledger_snapshot,
+    )
+
+    gateway, _, _, _ = _gateway(ledger, monkeypatch)
+    original = await collect_paper_risk_ledger_snapshot(ledger[0], ledger[1])
+    values = {field.name: getattr(original, field.name) for field in fields(original)}
+    older = original.observed_at - timedelta(minutes=20)
+    latest = original.observed_at - timedelta(minutes=1)
+    # Test-only owned account evidence: the retired portfolio remains part of
+    # duplicate/exposure/cooldown state even without an active runtime binding.
+    values["portfolio_cash"] += (("retired", Decimal("1000")),)
+    values["bootstrap_effective_at"] = (("default", older), ("retired", older))
+    values["positions"] += (PaperRiskPosition("retired", "NVDA", 123, Decimal("-3")),)
+    values["fills"] = (PaperRiskFill("retired", "NVDA", "lpfill-" + "1" * 32, latest),)
+    snapshot = _issue_snapshot(**values)
+    monkeypatch.setattr(
+        module, "collect_paper_risk_ledger_snapshot", AsyncMock(return_value=snapshot)
+    )
+    async with gateway.serialize_entry("NVDA", portfolio_id="default"):
+        state = gateway.entry_valuation(portfolio_id="default")
+        assert state.symbol_has_position is True
+        assert state.current_symbol_gross_notional_usd == Decimal("3960")
+        assert state.symbol_entry_allowed_at == latest + timedelta(minutes=10)
+    async with gateway.serialize_entry("AAPL", portfolio_id="default"):
+        state = gateway.entry_valuation(portfolio_id="default")
+        assert state.symbol_has_position is False
+        assert state.symbol_entry_allowed_at == older + timedelta(minutes=10)
