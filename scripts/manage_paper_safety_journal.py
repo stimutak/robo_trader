@@ -1293,6 +1293,8 @@ def recover_exact_local_paper_settlement(
             expected_execution_domain_scope=contract.safety_execution_domain_scope,
             expected_account_scope=contract.safety_account_scope,
         )
+        if state.pending_entry_events:
+            raise RuntimeError("offline reduction recovery cannot resolve entry capacity")
         unresolved = state.active_reservations
         if len(unresolved) != 1:
             raise RuntimeError("offline recovery requires exactly one unresolved paper reservation")
@@ -1419,6 +1421,29 @@ def paper_safety_status(environ: Mapping[str, str]) -> dict[str, Any]:
                 "symbol": reservation.symbol,
             }
         )
+    has_reduction_reservations = bool(reservations)
+    for event in state.pending_entry_events:
+        payload = json.loads(event.payload_json)
+        reservations.append(
+            {
+                "age_seconds": round(
+                    max(0.0, (observed_at - event.occurred_at).total_seconds()), 6
+                ),
+                "claim_id_sha256": None,
+                "exact_local_settlement_exists": False,
+                "local_settlement_status": "NOT_CHECKED",
+                "order_ref_sha256": None,
+                "outcome_unknown": False,
+                "phase": "ENTRY_CAPACITY_RESERVED",
+                "portfolio_id": event.portfolio_id,
+                "quarantined": True,
+                "reason_codes": ["UNRESOLVED_ENTRY_CAPACITY"],
+                "reservation_id_sha256": _redacted_identifier(
+                    "entry_capacity", event.idempotency_key
+                ),
+                "symbol": payload["symbol"],
+            }
+        )
     reservations.sort(
         key=lambda item: (
             item["portfolio_id"],
@@ -1428,7 +1453,10 @@ def paper_safety_status(environ: Mapping[str, str]) -> dict[str, Any]:
     )
     return {
         "journal_identity": contract.safety_journal_identity,
-        "reason_codes": (["UNRESOLVED_PAPER_SUBMISSION_AUTHORITY"] if reservations else []),
+        "reason_codes": (
+            (["UNRESOLVED_PAPER_SUBMISSION_AUTHORITY"] if has_reduction_reservations else [])
+            + (["UNRESOLVED_ENTRY_CAPACITY"] if state.pending_entry_events else [])
+        ),
         "schema_version": _STATUS_SCHEMA_VERSION,
         "status": "BLOCKED" if reservations else "CLEAN",
         "unresolved_count": len(reservations),

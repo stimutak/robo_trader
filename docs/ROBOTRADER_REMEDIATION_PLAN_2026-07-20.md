@@ -1835,3 +1835,20 @@ Gate A remains closed.
 Broader risk/security/entry/gateway/routing/settlement verification: 1026 passed,
 4 existing skips, 4 warnings in 49.92 seconds (work/runner-entry-policy-safety.log).
 Black, changed-file Flake8 and whitespace checks pass. Paper readiness remains false.
+
+September 13 durable-capacity follow-up: a dormant risk adapter now consumes an
+approved decision into a separate reservation-only journal event after a bound,
+unchanged-head transaction check. It issues no permit. Replay retains capacity
+through expiry/restart and verifies semantic payloads. Startup/bootstrap block
+pending entries; operator status reports them; reduction-only recovery cannot
+release them. Related verification: 590 passed; independent review: 19 reservation
+and 4 dormancy tests passed. Pending aggregation, full head-bound evidence and
+authenticated terminal release/BUY settlement remain open. Old readers reject the
+new event type: retain compatible readers and preserve journal history. Gate A
+remains closed.
+
+Full post-change repository suite: 3729 passed, 4 existing skips, 19 warnings in
+303.96 seconds. Formatting, changed-file lint and whitespace checks pass. Final
+containment inspection confirms readiness false, BUY rejection, and no production
+adapter invocation. Operational launch remains unverified and blocked by the
+outstanding gate evidence; no remote services or data were changed.

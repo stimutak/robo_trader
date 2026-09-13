@@ -94,6 +94,7 @@ class RiskEffect(str, Enum):
 
 
 class JournalEventType(str, Enum):
+    ENTRY_CAPACITY_RESERVED = "ENTRY_CAPACITY_RESERVED"
     SAFETY_DECISION = "SAFETY_DECISION"
     RESERVATION_ACQUIRED = "RESERVATION_ACQUIRED"
     SUBMISSION_STARTED = "SUBMISSION_STARTED"
@@ -1281,6 +1282,7 @@ class ReplayState:
     active_reservations: Tuple[ReplayReservation, ...]
     quarantined_reservations: Tuple[ReplayReservation, ...]
     schema_version: int = MODEL_VERSION
+    pending_entry_events: Tuple[JournalEvent, ...] = ()
 
     def __post_init__(self) -> None:
         _strict_version(self.schema_version)
@@ -1289,6 +1291,7 @@ class ReplayState:
         _strict_hash(self.last_chain_hash, "last_chain_hash")
         for field, values, value_type in (
             ("events", self.events, JournalEvent),
+            ("pending_entry_events", self.pending_entry_events, JournalEvent),
             ("reservations", self.reservations, ReplayReservation),
             ("active_reservations", self.active_reservations, ReplayReservation),
             (
@@ -1310,6 +1313,12 @@ class ReplayState:
                 raise ValidationError("last chain hash does not match replay state")
         elif self.last_chain_hash != "0" * 64:
             raise ValidationError("empty replay state must use the zero chain hash")
+        if any(
+            event.event_type is not JournalEventType.ENTRY_CAPACITY_RESERVED
+            or event not in self.events
+            for event in self.pending_entry_events
+        ):
+            raise ValidationError("pending entry event is not part of the replay")
         reservation_ids = {item.reservation_id for item in self.reservations}
         if len(reservation_ids) != len(self.reservations):
             raise ValidationError("reservations contain duplicate identifiers")

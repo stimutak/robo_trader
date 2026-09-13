@@ -85,10 +85,40 @@ threshold. Each call rebuilds from current values without changing shared
 configuration. Final admission must invoke this resolution under serialization
 and consume the resulting limits; no returned object grants entry authority.
 
+## Durable entry capacity reservations
+
+The dormant risk adapter `risk.entry_reservations.reserve_entry_capacity`
+consumes an owned approved BUY decision inside the journal write transaction,
+after verifying the bound journal identity and expected sequence/hash head.
+It persists an `ENTRY_CAPACITY_RESERVED` event, never a submission claim or
+permit. A changed head rejects the reservation. A prior entry in the same symbol
+or contract, or an unresolved reduction in the same contract, conflicts. The
+reverse conflict also prevents reduction authority while that contract has
+unresolved entry capacity. Distinct contracts can retain separate reservations.
+
+Replay validates the versioned payload, exact positive quantity/notional,
+contract, decision lifetime at reservation time, identity and hash chain.
+Reservation expiry does not release capacity. Startup and bootstrap reject
+unresolved entries; read-only operator status reports them as blocked. The
+reduction-only offline recovery path cannot release them. No entry release API
+exists yet, and the production gateway does not invoke the adapter.
+
+This adds an event to the existing journal schema. Older readers fail closed
+when encountering it; code rollback must retain a compatible journal reader,
+and must never discard journal history. Core payload validation is a persisted
+format contract and must remain compatible when the risk model evolves. The
+existing journal hash chain is not an independent rollback anchor.
+
+Before activation, bind account/portfolio identity, sector, pending totals and
+all decision evidence to the journal head under account serialization. Add the
+pending-capacity read model, authenticated atomic terminal release/recovery,
+and final execution-capacity rechecks. The reservation record alone proves
+neither complete risk evaluation nor permission to submit an order.
+
 ## Remaining runtime work
 
 Owned account-wide snapshots, durable cooldown evidence, daily-risk replay and
-ingestion, and Config-level policy binding now exist. Pending reservations,
+ingestion, and Config-level policy binding now exist. Pending-capacity aggregation and terminal release,
 complete market/account evidence, production verifier
 construction, final contract consumption, and baseline BUY settlement remain
 open. These components must be integrated and verified before entry authority is

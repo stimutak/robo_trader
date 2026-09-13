@@ -438,3 +438,41 @@ work/runner-entry-policy-regressions.log. Operational gates remain unchanged.
 Broader risk/security/entry/gateway/routing/settlement verification: 1026 passed,
 4 existing skips, 4 warnings in 49.92 seconds (work/runner-entry-policy-safety.log).
 Black, changed-file Flake8 and whitespace checks pass. Paper readiness remains false.
+
+## Durable entry-capacity journal foundation
+
+Added a separate reservation-only event family and risk-side adapter. The adapter
+consumes an owned approved BUY decision after journal transaction/replay/head and
+binding checks. Core persistence/replay remains standard-library-only. Records
+include exact notional/quantity, contract, sector, quote/generation and lifetime;
+an opaque intent-derived key retains durable duplicate detection. Same-symbol
+entry conflicts and both directions of same-contract reduction conflicts block.
+A failed commit rolls back the event and leaves the decision consumed.
+
+Reservations survive expiry and restart. Coordinator startup rejects them.
+Tests exposed bootstrap ignoring them and operator status returning CLEAN; both
+consumers now block/report unresolved capacity. Offline reduction recovery also
+refuses to treat an entry reservation as recoverable reduction authority. Existing
+empty-journal migration already rejects any history. Older journal readers reject
+this new event; rollback must preserve history and use a compatible reader.
+
+Related journal/runtime/bootstrap/status/risk regressions: 590 passed in
+13.15 seconds. Independent review: 19 reservation and 4 dormancy tests passed.
+Coverage includes concurrent expected-head races, rollback, both conflict
+directions, restart, expiry, read-only status and semantic-invalid persisted
+payloads whose hash chains are valid. Black, changed-file Flake8 and whitespace
+checks pass. Logs: work/entry-capacity-full-regressions.log and focused red/green
+logs. Full repository verification is recorded below.
+
+This is a durable reservation foundation, not entry admission. Pending aggregation,
+head-bound complete account/sector/market evidence, authenticated terminal release
+and recovery, verifier injection, and BUY settlement remain open. No submission
+permit, production adapter invocation, service start or user-data mutation was
+introduced. Paper readiness remains false.
+
+Full repository verification completed: 3729 passed, 4 existing skips,
+19 warnings in 303.96 seconds (work/entry-capacity-repository.log). No tests were
+skipped or timeouts relaxed for this change. Final containment inspection confirms
+PAPER_TERMINAL_SETTLEMENT_READY=False, baseline BUY rejection, and no production
+call site for the new adapter. A fresh read-only SSH probe still timed out on
+blackm5mbp port 22; no remote changes occurred.

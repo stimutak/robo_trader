@@ -489,6 +489,8 @@ def _crosslink_safety_journal_orders(
     database_device: int,
     database_inode: int,
 ) -> tuple[bool, bool, int, int]:
+    if getattr(replay_state, "pending_entry_events", ()):
+        raise BootstrapReconciliationBlocked("safety journal has unresolved entry capacity")
     reservations = tuple(getattr(replay_state, "reservations", ()))
     active = tuple(getattr(replay_state, "active_reservations", ()))
     quarantined = tuple(getattr(replay_state, "quarantined_reservations", ()))

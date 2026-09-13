@@ -601,6 +601,12 @@ class SafetyJournal:
                 + ", ".join(sorted(unexpected))
             )
 
+    def _reserve_entry_capacity(self, produce_payload, *, expected_head):
+        """Persist dormant entry capacity without issuing submission authority."""
+        from .entry_capacity import reserve_entry_capacity
+
+        return reserve_entry_capacity(self, produce_payload, expected_head=expected_head)
+
     def authorize_submission(
         self,
         idempotency_key: str,
@@ -648,6 +654,8 @@ class SafetyJournal:
         def operation(connection: sqlite3.Connection):
             at = self._event_time()
             state = self._replay_connection(connection)
+            if any(item.con_id == intent.con_id for item in state.pending_entry_events):
+                raise ReservationConflict("unresolved entry capacity conflicts with reduction")
             binding = self._decision_binding(state.events, key)
             existing = self._find_reservation(state.reservations, key)
             if binding is not None:
@@ -1971,6 +1979,14 @@ class SafetyJournal:
             raise StateTransitionError("journal event time cannot move backward")
         sequence = 1 if previous is None else previous.sequence + 1
         previous_hash = _ZERO_HASH if previous is None else previous.chain_hash
+        if (
+            event_type is not JournalEventType.ENTRY_CAPACITY_RESERVED
+            and connection.execute(
+                "SELECT 1 FROM safety_journal_events WHERE idempotency_key = ? AND event_type = ?",
+                (idempotency_key, JournalEventType.ENTRY_CAPACITY_RESERVED.value),
+            ).fetchone()
+        ):
+            raise IdempotencyConflict("idempotency key belongs to entry capacity")
         payload_json = canonical_json(payload)
         payload_hash = sha256_text(payload_json)
         occurred_text = utc_to_text(occurred_at)
@@ -2089,6 +2105,7 @@ class SafetyJournal:
 
         bound_identity = self._bound_runtime_identity(connection)
         events = []
+        pending_entry_events = []
         reservations: Dict[str, ReplayReservation] = {}
         decisions: Dict[str, dict] = {}
         dispatch_times: Dict[str, datetime] = {}
@@ -2135,13 +2152,32 @@ class SafetyJournal:
                 raise JournalIntegrityError("payload is not valid JSON") from exc
             if not isinstance(payload, dict) or canonical_json(payload) != event.payload_json:
                 raise JournalIntegrityError("payload is not canonical JSON")
-            self._apply_event(
-                reservations,
-                decisions,
-                dispatch_times,
-                event,
-                payload,
-            )
+            if event.event_type is JournalEventType.ENTRY_CAPACITY_RESERVED:
+                from .entry_capacity import validate_entry_capacity_event
+
+                validate_entry_capacity_event(event, payload)
+                if any(prior.idempotency_key == event.idempotency_key for prior in events):
+                    raise JournalIntegrityError("duplicate entry capacity intent")
+                if any(
+                    prior.con_id == event.con_id
+                    or json.loads(prior.payload_json)["symbol"] == payload["symbol"]
+                    for prior in pending_entry_events
+                ) or any(
+                    not item.released and item.con_id == event.con_id
+                    for item in reservations.values()
+                ):
+                    raise JournalIntegrityError("conflicting entry capacity scope")
+                pending_entry_events.append(event)
+            else:
+                if any(
+                    prior.idempotency_key == event.idempotency_key for prior in pending_entry_events
+                ):
+                    raise JournalIntegrityError("entry capacity key reused")
+                if event.event_type is JournalEventType.RESERVATION_ACQUIRED and any(
+                    prior.con_id == event.con_id for prior in pending_entry_events
+                ):
+                    raise JournalIntegrityError("reduction conflicts with entry capacity")
+                self._apply_event(reservations, decisions, dispatch_times, event, payload)
             events.append(event)
             previous_hash = event.chain_hash
 
@@ -2166,6 +2202,7 @@ class SafetyJournal:
             reservations=ordered,
             active_reservations=active,
             quarantined_reservations=quarantined,
+            pending_entry_events=tuple(pending_entry_events),
         )
 
     @staticmethod

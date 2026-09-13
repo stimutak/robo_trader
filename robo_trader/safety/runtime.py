@@ -1198,6 +1198,8 @@ class SafetyRuntimeCoordinator:
                 expected_account_scope=self._identity.account_scope,
             )
             reasons = []
+            if state.pending_entry_events:
+                reasons.append("UNRESOLVED_ENTRY_CAPACITY_AT_STARTUP")
             if state.active_reservations:
                 reasons.append("ACTIVE_RESERVATION_AT_STARTUP")
             if state.quarantined_reservations:
