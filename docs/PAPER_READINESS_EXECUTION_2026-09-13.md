@@ -59,3 +59,11 @@ Independent review reproduced two upgrade blockers in PR124:
 2. `_status_owner_binding` includes the same build-dependent fingerprint. A status file published by one build is rejected as belonging to another owner by the next build. Repair requires a durable ownership identity or explicit authenticated ownership transfer; arbitrary replacement remains prohibited.
 
 Operational inspection checked configuration presence only, without printing secrets or opening historical trading databases. The original Mac checkout's `.env` lacks explicit paper account, approved account list, account type, namespace, model artifact set, and build identity. Intended trading host and independent monotonic authority are pending user clarification. No launcher or broker session was started.
+
+### Status ownership upgrade fix
+
+The second review finding is repaired with v2 status ownership bound to stable environment, mode, execution source, account/domain, database namespace, safety journal, and status path. Build/model updates and signing-key rotation do not change artifact ownership. Fresh reconciliation evidence still binds the full current runtime fingerprint. Different durable identities remain separate; all file identity and replacement protections remain enforced.
+
+The real status publication regression failed before the fix and passes afterward. The focused module passes 43 tests, the related reconciliation/adapter/web suite passes 220 tests, and independent review found no actionable defect. Black, Flake8, and whitespace checks pass.
+
+For any pre-release installation that wrote a v1 status artifact, preserve that file and set `RT_RECONCILIATION_STATUS_PATH` to a new absolute path before adopting v2. There is no automatic adoption, deletion, or overwrite of v1 evidence. This changes diagnostic artifact ownership only; it does not authorize startup or resolve historical bootstrap fingerprint compatibility.

@@ -362,8 +362,26 @@ def _assert_status_path_is_unprotected(
 
 
 def _status_owner_binding(runtime: RuntimeContract, status_path: Path) -> str:
-    payload = (
-        "robotrader-reconciliation-status-v1\0" + runtime.fingerprint + "\0" + str(status_path)
+    # Ownership outlives a process/build. Current reconciliation evidence still
+    # binds the full runtime fingerprint; the diagnostic artifact's owner must
+    # not change merely because code, models, or signing keys are updated.
+    # Version-one artifacts are intentionally not adopted: preserve them and
+    # configure a new status path when upgrading a pre-release installation.
+    payload = json.dumps(
+        {
+            "version": "robotrader-reconciliation-status-v2",
+            "environment": runtime.environment,
+            "execution_mode": runtime.execution_mode,
+            "execution_source": runtime.execution_source,
+            "account_scope": runtime.safety_account_scope,
+            "execution_domain_scope": runtime.safety_execution_domain_scope,
+            "database_identity": runtime.database_identity,
+            "state_namespace": runtime.state_namespace,
+            "safety_journal_identity": runtime.safety_journal_identity,
+            "status_path": str(status_path),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

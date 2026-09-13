@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,6 +47,54 @@ def _runtime(database: Path) -> RuntimeContract:
         safety_account_scope=ACCOUNT_SCOPE,
         safety_execution_domain_scope="paper-simulator-v1",
         safety_journal_path=str(database.with_name("safety-journal.db")),
+    )
+
+
+def test_status_owner_survives_build_and_model_updates(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path / "ledger.db")
+    status = tmp_path / "status.json"
+    upgraded = replace(runtime, build_id="next-build", model_artifact_set="next-models")
+    assert runtime.fingerprint != upgraded.fingerprint
+    owner = integration._status_owner_binding(runtime, status)
+    payload = {
+        "schema_version": 1,
+        "owner_binding": owner,
+        "state": "closed",
+        "trigger": None,
+        "completed_at": None,
+        "eligible_until": None,
+        "entry_eligible": False,
+        "quarantined": True,
+        "run_id": None,
+        "snapshot_id": None,
+    }
+    integration._write_status(status, payload, owner_binding=owner)
+    new_owner = integration._status_owner_binding(upgraded, status)
+    integration._write_status(
+        status, {**payload, "owner_binding": new_owner}, owner_binding=new_owner
+    )
+    assert json.loads(status.read_text())["entry_eligible"] is False
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"safety_account_scope": "acct_v1_" + "a" * 64},
+        {"safety_execution_domain_scope": "another-domain"},
+        {"database_path": "/another/ledger.db"},
+        {"state_namespace": "another-namespace"},
+        {"environment": "production"},
+        {"safety_journal_path": "/another/journal.db"},
+    ],
+)
+def test_status_owner_separates_durable_runtime_identities(tmp_path: Path, change: dict) -> None:
+    runtime = _runtime(tmp_path / "ledger.db")
+    status = tmp_path / "status.json"
+    assert integration._status_owner_binding(runtime, status) != integration._status_owner_binding(
+        replace(runtime, **change), status
+    )
+    assert integration._status_owner_binding(runtime, status) != integration._status_owner_binding(
+        runtime, tmp_path / "other-status.json"
     )
 
 
