@@ -527,6 +527,11 @@ def _produce(
     with (
         patch.object(producer_module, "_system_clock", clock or (lambda: NOW)),
         patch.object(producer_module, "_consume_verified_broker_evidence", authority.consume),
+        patch.object(
+            producer_module,
+            "_handoff_verified_broker_evidence_to_runtime",
+            lambda value: value,
+        ),
     ):
         delivery: producer_module.BootstrapReconciliationDelivery[object] = (
             produce_bootstrap_reconciliation(
@@ -547,6 +552,7 @@ def test_clean_stage_collects_ledger_and_binds_non_authorizing_result(database: 
     result = receiver.results[0]
     assert delivery.receiver_result is result
     assert delivery.local_position_identities == (("default", "AAPL"), ("default", "MSFT"))
+    assert delivery.verified_broker_evidence is envelope
     assert result.status == BOOTSTRAP_RECONCILIATION_STATUS
     assert result.bundle_id == BUNDLE_ID
     assert result.binding_dict()["bundle_id"] == BUNDLE_ID

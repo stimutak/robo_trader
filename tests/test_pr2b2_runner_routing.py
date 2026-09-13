@@ -34,6 +34,7 @@ from robo_trader.protective_quote_evidence import (
     ProtectiveQuoteSource,
     _produce_protective_quote,
 )
+from robo_trader.reconciliation.runtime_integration import RuntimeReconciliationController
 from robo_trader.runner_async import AsyncRunner
 from robo_trader.stop_loss_monitor import StopLossMonitor
 
@@ -118,6 +119,9 @@ def _runner(
     runner._order_admitted_tasks = set()
     runner._kill_switch_log_last = {}
     runner._kill_switch_log_throttle_seconds = 60.0
+    reconciliation = object.__new__(RuntimeReconciliationController)
+    reconciliation.entry_eligible = lambda: True
+    runner.reconciliation_controller = reconciliation
 
     probe = getattr(getattr(gateway, "serialize_entry", None), "return_value", None)
     now = (
@@ -349,6 +353,34 @@ async def test_entries_remain_blocked_before_gateway_or_executor(
     gateway.serialize_entry.assert_not_called()
     runner.executor.place_order.assert_not_called()
     runner.rate_limiter.acquire.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_quarantine_blocks_entries_before_executor() -> None:
+    gateway, _ = _exact_gateway()
+    runner = _runner(gateway)
+    runner.reconciliation_controller.entry_eligible = lambda: False
+
+    result = await _place(runner, _order("BUY"))
+
+    assert result.ok is False
+    assert result.message == (
+        "Trading blocked: Runtime reconciliation is unavailable, stale, or quarantined"
+    )
+    gateway.submit_reduction.assert_not_awaited()
+    runner.executor.place_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_quarantine_does_not_block_semantic_reduction() -> None:
+    gateway, _ = _exact_gateway()
+    runner = _runner(gateway)
+    runner.reconciliation_controller.entry_eligible = lambda: False
+
+    result = await _place(runner, _order("SELL"))
+
+    assert result.ok is True
+    gateway.submit_reduction.assert_awaited_once()
 
 
 @pytest.mark.asyncio

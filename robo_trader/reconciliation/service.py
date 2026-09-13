@@ -58,6 +58,7 @@ class ReconciliationServiceOutcome:
     state: ReconciliationServiceState
     entry_eligible: bool
     eligible_until: datetime
+    completed_at: datetime
 
 
 class VerifiedEvidenceSource(Protocol):
@@ -347,6 +348,7 @@ class ReconciliationService:
             state=state,
             entry_eligible=persisted.entry_eligible,
             eligible_until=eligible_until,
+            completed_at=completed_at,
         )
         self._state = state
         self._latest_outcome = outcome

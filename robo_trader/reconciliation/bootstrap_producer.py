@@ -1269,6 +1269,7 @@ class BootstrapReconciliationDelivery(Generic[ReceiverResult]):
 
     receiver_result: ReceiverResult
     local_position_identities: tuple[tuple[str, str], ...]
+    verified_broker_evidence: VerifiedBrokerEvidenceEnvelope = field(repr=False)
 
 
 def _validate_runtime(runtime: object) -> RuntimeContract:
@@ -1319,6 +1320,27 @@ def _consume_verified_broker_evidence(
         return assert_and_consume_verified_broker_evidence(envelope)
     except Exception as exc:
         raise BootstrapReconciliationBlocked("broker evidence is not verifier-owned") from exc
+
+
+def _handoff_verified_broker_evidence_to_runtime(
+    envelope: VerifiedBrokerEvidenceEnvelope,
+) -> VerifiedBrokerEvidenceEnvelope:
+    """Move one consumed broker envelope into the runtime binder registry."""
+
+    try:
+        from robo_trader.bootstrap_evidence_receivers import (
+            _handoff_consumed_verified_broker_evidence_to_runtime,
+        )
+    except (ImportError, AttributeError) as exc:
+        raise BootstrapReconciliationBlocked(
+            "runtime broker evidence handoff is unavailable"
+        ) from exc
+    try:
+        return _handoff_consumed_verified_broker_evidence_to_runtime(envelope)
+    except Exception as exc:
+        raise BootstrapReconciliationBlocked(
+            "runtime broker evidence handoff failed closed"
+        ) from exc
 
 
 def _assert_core_reconciliation_receiver_capability(
@@ -1491,9 +1513,11 @@ def produce_bootstrap_reconciliation(
             collection.assert_unchanged_after_receiver_claim()
             receiver_result = receiver.commit_staged_bootstrap_reconciliation(stage)
             committed = True
+            runtime_broker_evidence = _handoff_verified_broker_evidence_to_runtime(envelope)
             return BootstrapReconciliationDelivery(
                 receiver_result=receiver_result,
                 local_position_identities=position_identities,
+                verified_broker_evidence=runtime_broker_evidence,
             )
     except BaseException:
         if stage is not _NO_RECEIVER_STAGE and not committed:

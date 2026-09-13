@@ -53,6 +53,10 @@ def _cfg(tmp_path: Path):
     return SimpleNamespace(runtime_contract=_runtime_contract(tmp_path))
 
 
+def _reconciliation_resource():
+    return SimpleNamespace(reconcile_periodic_if_due=AsyncMock(return_value=None))
+
+
 def test_startup_replays_existing_journal_without_initializing_it(tmp_path):
     cfg = _cfg(tmp_path)
     journal_path = Path(cfg.runtime_contract.safety_journal_path)
@@ -347,6 +351,9 @@ async def test_shared_runtime_startup_database_cleanup_drains_repeated_cancellat
     database.close = AsyncMock(side_effect=blocking_close)
     gateway = MagicMock()
     gateway.start = AsyncMock(side_effect=RuntimeError("gateway startup failed"))
+    gateway.close = AsyncMock()
+    reconciliation = MagicMock()
+    reconciliation.close = AsyncMock()
 
     with (
         patch.object(
@@ -360,6 +367,11 @@ async def test_shared_runtime_startup_database_cleanup_drains_repeated_cancellat
         ),
         patch.object(runner_module, "SafetyRuntimeCoordinator", ExactSafetyRuntime),
         patch.object(runner_module, "AsyncTradingDatabase", return_value=database),
+        patch.object(
+            runner_module,
+            "build_runtime_reconciliation_controller",
+            new=AsyncMock(return_value=(reconciliation, object())),
+        ),
         patch.object(runner_module, "PaperReductionGateway", return_value=gateway),
     ):
         owner = asyncio.create_task(_start_paper_order_runtime(context, ExactSafetyRuntime()))
@@ -377,6 +389,8 @@ async def test_shared_runtime_startup_database_cleanup_drains_repeated_cancellat
 
     assert close_finished.is_set()
     database.close.assert_awaited_once()
+    gateway.close.assert_awaited_once()
+    reconciliation.close.assert_awaited_once()
 
 
 def _install_minimal_cleanup_state(runner: AsyncRunner) -> None:
@@ -647,7 +661,9 @@ async def test_run_once_retains_started_coordinator_for_runner(tmp_path):
     )
     coordinator = _start_paper_safety_runtime(cfg)
     runtime_context = object()
-    resources = SimpleNamespace(database=object(), gateway=object())
+    resources = SimpleNamespace(
+        database=object(), gateway=object(), reconciliation=_reconciliation_resource()
+    )
     runner = MagicMock()
     runner.run = AsyncMock()
     runner.cleanup = AsyncMock()
@@ -693,7 +709,9 @@ async def test_run_once_closes_shared_runtime_after_runner_cleanup_failure(
         account_scope=cfg.runtime_contract.safety_account_scope,
     )
     coordinator = _start_paper_safety_runtime(cfg)
-    resources = SimpleNamespace(database=object(), gateway=object())
+    resources = SimpleNamespace(
+        database=object(), gateway=object(), reconciliation=_reconciliation_resource()
+    )
     runner = MagicMock()
     runner.run = AsyncMock()
     runner.cleanup = AsyncMock(side_effect=cleanup_error)
@@ -729,7 +747,9 @@ async def test_run_once_preserves_run_error_after_all_cleanup_attempts(tmp_path)
         account_scope=cfg.runtime_contract.safety_account_scope,
     )
     coordinator = _start_paper_safety_runtime(cfg)
-    resources = SimpleNamespace(database=object(), gateway=object())
+    resources = SimpleNamespace(
+        database=object(), gateway=object(), reconciliation=_reconciliation_resource()
+    )
     runner = MagicMock()
     runner.run = AsyncMock(side_effect=ValueError("primary run failure"))
     runner.cleanup = AsyncMock(side_effect=RuntimeError("secondary cleanup failure"))
@@ -769,7 +789,9 @@ async def test_run_once_drains_runner_cleanup_through_repeated_cancellation(
         account_scope=cfg.runtime_contract.safety_account_scope,
     )
     coordinator = _start_paper_safety_runtime(cfg)
-    resources = SimpleNamespace(database=object(), gateway=object())
+    resources = SimpleNamespace(
+        database=object(), gateway=object(), reconciliation=_reconciliation_resource()
+    )
     cleanup_entered = asyncio.Event()
     release_cleanup = asyncio.Event()
     cleanup_finished = asyncio.Event()
@@ -821,7 +843,9 @@ async def test_run_once_drains_runner_cleanup_through_repeated_cancellation(
 
 @pytest.mark.asyncio
 async def test_shared_runtime_close_survives_repeated_outer_cancellation() -> None:
-    resources = SimpleNamespace(database=object(), gateway=object())
+    resources = SimpleNamespace(
+        database=object(), gateway=object(), reconciliation=_reconciliation_resource()
+    )
     close_entered = asyncio.Event()
     release_close = asyncio.Event()
     close_finished = asyncio.Event()
@@ -860,7 +884,9 @@ async def test_continuous_reuses_one_account_coordinator_for_portfolio_runners(t
     )
     coordinator = _start_paper_safety_runtime(cfg)
     runtime_context = object()
-    resources = SimpleNamespace(database=object(), gateway=object())
+    resources = SimpleNamespace(
+        database=object(), gateway=object(), reconciliation=_reconciliation_resource()
+    )
     runner = MagicMock()
     runner.recovery_in_progress = False
     runner._recovery_exhausted = False
@@ -920,6 +946,72 @@ async def test_continuous_reuses_one_account_coordinator_for_portfolio_runners(t
 
 
 @pytest.mark.asyncio
+async def test_periodic_reconciliation_failure_keeps_reduce_only_cycle_running(tmp_path):
+    cfg = _cfg(tmp_path)
+    SafetyJournal(Path(cfg.runtime_contract.safety_journal_path)).initialize(
+        execution_domain_scope=cfg.runtime_contract.safety_execution_domain_scope,
+        account_scope=cfg.runtime_contract.safety_account_scope,
+    )
+    coordinator = _start_paper_safety_runtime(cfg)
+    reconciliation = _reconciliation_resource()
+    reconciliation.reconcile_periodic_if_due.side_effect = RuntimeError(
+        "status artifact unavailable"
+    )
+    resources = SimpleNamespace(database=object(), gateway=object(), reconciliation=reconciliation)
+    runner = MagicMock()
+    runner.recovery_in_progress = False
+    runner._recovery_exhausted = False
+    runner.health = None
+    runner.run = AsyncMock()
+    runner.cleanup = AsyncMock()
+    portfolio = SimpleNamespace(
+        id="default",
+        name="Default",
+        starting_cash=100000,
+        symbols=["AAPL"],
+        active=True,
+    )
+
+    with (
+        patch("signal.signal"),
+        patch("robo_trader.runner_async.RuntimeSafetyContext", object),
+        patch(
+            "robo_trader.runner_async._start_paper_order_runtime",
+            new_callable=AsyncMock,
+            return_value=resources,
+        ),
+        patch(
+            "robo_trader.runner_async._close_paper_order_runtime",
+            new_callable=AsyncMock,
+        ),
+        patch("robo_trader.runner_async.AsyncRunner", return_value=runner),
+        patch("robo_trader.runner_async._setup_continuous_runner", new_callable=AsyncMock),
+        patch("robo_trader.runner_async.is_trading_allowed", return_value=True),
+        patch(
+            "robo_trader.multiuser.portfolio_config.load_portfolio_configs",
+            return_value=[portfolio],
+        ),
+        patch(
+            "robo_trader.runner_async.sleep_unless_shutdown",
+            new_callable=AsyncMock,
+            side_effect=asyncio.CancelledError,
+        ),
+        patch("robo_trader.runner_async._write_exit_audit"),
+        patch("robo_trader.runner_async._fire_runner_exit_alert"),
+    ):
+        await run_continuous(
+            symbols=["AAPL"],
+            interval_seconds=1,
+            safety_runtime=coordinator,
+            runtime_context=object(),
+        )
+
+    reconciliation.reconcile_periodic_if_due.assert_awaited_once_with()
+    runner.run.assert_awaited_once_with(["AAPL"])
+    runner.cleanup.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_continuous_closes_shared_runtime_after_runner_cleanup_cancellation(
     tmp_path,
 ) -> None:
@@ -929,7 +1021,9 @@ async def test_continuous_closes_shared_runtime_after_runner_cleanup_cancellatio
         account_scope=cfg.runtime_contract.safety_account_scope,
     )
     coordinator = _start_paper_safety_runtime(cfg)
-    resources = SimpleNamespace(database=object(), gateway=object())
+    resources = SimpleNamespace(
+        database=object(), gateway=object(), reconciliation=_reconciliation_resource()
+    )
     runner = MagicMock()
     runner.recovery_in_progress = False
     runner._recovery_exhausted = False
@@ -997,7 +1091,9 @@ async def test_continuous_drains_every_runner_cleanup_through_repeated_cancellat
         account_scope=cfg.runtime_contract.safety_account_scope,
     )
     coordinator = _start_paper_safety_runtime(cfg)
-    resources = SimpleNamespace(database=object(), gateway=object())
+    resources = SimpleNamespace(
+        database=object(), gateway=object(), reconciliation=_reconciliation_resource()
+    )
     first_cleanup_entered = asyncio.Event()
     release_first_cleanup = asyncio.Event()
     first_cleanup_finished = asyncio.Event()
