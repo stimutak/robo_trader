@@ -32,6 +32,14 @@ from .utils.secure_config import ConfigValidationError, SecureConfig
 
 logger = get_logger(__name__)
 
+ENTRY_POLICY_KEYS = (
+    "ENTRY_MAX_PORTFOLIO_GROSS_FRACTION",
+    "ENTRY_MINIMUM_AVERAGE_DAILY_DOLLAR_VOLUME_USD",
+    "ENTRY_MAX_ORDER_FRACTION_OF_DAILY_DOLLAR_VOLUME",
+    "ENTRY_MAX_QUOTE_AGE_SECONDS",
+    "ENTRY_MAX_ACCOUNT_EVIDENCE_AGE_SECONDS",
+)
+
 
 PAPER_PORTS = frozenset({4002})
 LIVE_PORTS = frozenset({7496, 4001})
@@ -847,6 +855,17 @@ class Config(BaseModel):
     correlation: CorrelationConfig = Field(default_factory=CorrelationConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
 
+    entry_risk_policy: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Explicit additional exact entry limits; empty means unavailable",
+    )
+
+    def build_entry_risk_limits(self):
+        """Build exact limits from this current portfolio configuration snapshot."""
+        from .risk.runtime_policy import build_runtime_entry_risk_limits
+
+        return build_runtime_entry_risk_limits(self, self.entry_risk_policy)
+
     # Runtime configuration
     symbols: List[str] = Field(default=["AAPL", "MSFT", "SPY"], description="Trading symbols")
     default_cash: float = Field(
@@ -1078,6 +1097,14 @@ def load_config_from_env() -> Config:
         )
 
     config = Config(**config_dict)
+    config.entry_risk_policy = {
+        key: os.environ[key] for key in ENTRY_POLICY_KEYS if key in os.environ
+    }
+    if config.entry_risk_policy:
+        try:
+            config.build_entry_risk_limits()
+        except ValueError as exc:
+            raise ConfigValidationError(f"Invalid explicit entry risk policy: {exc}") from exc
 
     # Load multi-portfolio configurations
     from .multiuser.portfolio_config import load_portfolio_configs

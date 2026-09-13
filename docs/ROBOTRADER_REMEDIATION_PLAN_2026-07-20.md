@@ -1813,3 +1813,13 @@ do not net away gross. Related regressions: 351 passed; independent review:
 consumption remain open; no entry authority was enabled.
 Broader post-change verification: 1228 passed, 4 existing skips; formatting,
 changed-file lint and whitespace checks pass. Gate A remains closed.
+
+September 13 configuration follow-up: Config now builds exact non-authorizing
+entry limits using existing risk settings and three explicit additional
+portfolio/liquidity settings. Partial/invalid explicit policies fail loading;
+missing policy grants no authority. Freshness cannot exceed five seconds.
+Focused verification: 349 passed; independent review: 18 passed. Broader
+risk/security/entry/gateway/routing/settlement verification: 1012 passed,
+4 existing skips. Formatting, changed-file lint and whitespace checks pass.
+Runner overrides, reservations, final evidence/contract consumption, production
+verifier injection and BUY settlement remain open. Gate A remains closed.

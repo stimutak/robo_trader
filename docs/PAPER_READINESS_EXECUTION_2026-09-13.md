@@ -393,3 +393,27 @@ Broader post-change safety/security/risk/runner/gateway verification: 1228 passe
 4 existing skips, 1 warning in 34.83 seconds (work/paper-entry-history-safety.log).
 Black, changed-file Flake8 and whitespace checks pass. Operational launch and
 profitability remain unverified; the paper readiness constant remains false.
+
+## Explicit entry policy configuration
+
+Added non-authorizing Config-level binding to the exact entry contract. Existing
+position, sector, correlation, leverage, order, daily and slot limits map into
+validated limits. The stricter correlation threshold applies. Three additional
+portfolio/liquidity settings require explicit fixed-decimal values; freshness
+settings default to five seconds and may only tighten that bound. Partial or
+invalid explicit policy fails configuration load. Missing policy remains
+unavailable. No operational thresholds were chosen or user environment edited.
+
+Focused configuration and contract verification: 349 passed, 1 warning in
+3.80 seconds. Independent review: all 18 new tests passed, no actionable defect.
+Broader risk/security/entry/gateway/routing/settlement verification: 1012 passed,
+4 existing skips, 4 warnings in 26.18 seconds. Black, changed-file Flake8 and
+whitespace checks pass. Logs: work/entry-runtime-policy-regressions.log and
+work/entry-runtime-policy-safety.log.
+
+This slice does not consume runner-instance overrides or grant submission
+authority. Override resolution, reservations, full evidence assembly, production
+verifier injection and baseline BUY settlement remain open. A fresh read-only SSH
+attempt to blackm5mbp again timed out on port 22; no remote changes were made.
+The actual approved paper-account identifier remains outstanding. Paper readiness
+is false and profitability remains unverified.

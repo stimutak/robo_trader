@@ -56,11 +56,37 @@ that date requires additional authenticated historical-execution completeness
 evidence. The gateway pins each read to one timestamp and rejects a date change
 during the read.
 
+## Explicit configuration binding
+
+`Config.build_entry_risk_limits()` builds non-authorizing exact limits from the
+current configuration. It maps existing position, sector, correlation, leverage,
+order, daily-notional and position-count limits. The stricter of the risk and
+correlation configuration thresholds applies. A disabled daily cap is rejected;
+an explicitly absent optional per-order cap is preserved. Legacy numeric policy
+scalars use their decimal spelling; this conversion is not for market or ledger
+evidence.
+
+Three additional fixed-decimal environment settings have no inferred defaults:
+`ENTRY_MAX_PORTFOLIO_GROSS_FRACTION`,
+`ENTRY_MINIMUM_AVERAGE_DAILY_DOLLAR_VOLUME_USD`, and
+`ENTRY_MAX_ORDER_FRACTION_OF_DAILY_DOLLAR_VOLUME`. Fraction settings are positive
+and at most one; dollar volume is positive USD. Any explicit entry-policy setting
+requires a complete valid policy at configuration load. No settings leaves entry
+policy unavailable and does not authorize entries. Optional
+`ENTRY_MAX_QUOTE_AGE_SECONDS` and `ENTRY_MAX_ACCOUNT_EVIDENCE_AGE_SECONDS` default
+to five seconds and may only tighten that bound, with exact microsecond precision.
+
+This is Config-level binding. Runtime consumption must first resolve portfolio
+and runner-instance overrides, then construct fresh limits at the serialized
+submission boundary. No returned configuration object grants entry authority.
+
 ## Remaining runtime work
 
-Authoritative account-wide snapshots and reservations, configuration binding,
-durable cooldown production, daily-risk replay/ingestion, and the baseline BUY settlement
-path must be integrated and verified before entry authority is enabled. Current
-contract tests prove pure decisions, not complete operational enforcement.
+Owned account-wide snapshots, durable cooldown evidence, daily-risk replay and
+ingestion, and Config-level policy binding now exist. Pending reservations,
+complete market/account evidence, runner override resolution, production verifier
+construction, final contract consumption, and baseline BUY settlement remain
+open. These components must be integrated and verified before entry authority is
+enabled; component tests do not prove complete operational enforcement.
 Incomplete strategies, shorts, smart execution, AI/ML discovery, and take-profit
 remain disabled for Gate A. Reductions retain their separate safety policy.
