@@ -9,7 +9,7 @@ IBKR must stay read-only. The pure contract in
 
 The contract floors whole-share quantity at the minimum remaining capacity:
 requested allocation, symbol exposure, sector exposure, portfolio gross exposure,
-liquidity, available cash, buying power, daily gross filled notional, and any
+liquidity, available cash, buying power, daily gross filled notional, account leverage, and any
 explicitly configured per-order notional cap. Calculations use exact Decimal
 arithmetic and verify the result against every capacity. The Gate-A symbol
 position cap cannot exceed 2% of portfolio equity.
@@ -22,6 +22,14 @@ means zero exposure or unlimited capacity.
 For example, a $1,000 per-order cap at a $333 share price permits at most three
 shares ($999), provided all other limits allow them. A cap below one share's
 price rejects the entry.
+
+Account leverage uses total account equity multiplied by the configured exact
+leverage ratio (1 through 4), minus gross holdings across all portfolios and
+pending account exposure. Long and short gross notionals must not cancel each
+other. Every relevant capacity separately subtracts its pending symbol, sector,
+portfolio, cash, buying-power, or daily-notional commitments. Balances must be
+provided before reservation deductions so commitments are counted exactly once.
+Missing account or pending amounts block entry; zero must be explicit evidence.
 
 ## Admission state
 
@@ -39,8 +47,8 @@ contract, transport, portfolio, and symbol checks still apply.
 
 ## Remaining runtime work
 
-Account-level leverage and pending exposure, configuration binding, durable
-cooldown production, daily-risk replay/ingestion, and the baseline BUY settlement
+Authoritative account-wide snapshots and reservations, configuration binding,
+durable cooldown production, daily-risk replay/ingestion, and the baseline BUY settlement
 path must be integrated and verified before entry authority is enabled. Current
 contract tests prove pure decisions, not complete operational enforcement.
 Incomplete strategies, shorts, smart execution, AI/ML discovery, and take-profit

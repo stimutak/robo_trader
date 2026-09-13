@@ -1748,3 +1748,10 @@ state fails closed, and new evidence is sealed and revalidated. Focused tests:
 isolated rerun are retained in the execution record. Runtime evidence production,
 account leverage/pending exposure, BUY settlement, and operational Gate A remain
 open. No entry authority or startup gate was enabled.
+
+September 13 account-risk follow-up: dormant entry sizing now includes exact
+account leverage and explicit pending symbol/sector/portfolio/account/cash/
+buying-power/daily commitments. Unknown values fail closed and all added values
+are sealed. Combined contract and durable-risk suites: 408 passed. Independent
+review found no actionable defect. Coherent runtime snapshots and reservations
+remain unimplemented; Gate A remains closed.

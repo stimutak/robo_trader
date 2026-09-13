@@ -247,6 +247,8 @@ class RiskReason(str, Enum):
     ML_CORROBORATION_REQUIRED = "ml_corroboration_required"
     NO_CAPACITY = "no_capacity"
     MISSING_ADMISSION_STATE = "missing_admission_state"
+    MISSING_ACCOUNT_EXPOSURE = "missing_account_exposure"
+    MISSING_PENDING_EXPOSURE = "missing_pending_exposure"
     OPEN_POSITION_LIMIT = "open_position_limit"
     DUPLICATE_ENTRY = "duplicate_entry"
     CHURN_LIMIT = "churn_limit"
@@ -262,6 +264,7 @@ class LimitingCapacity(str, Enum):
     BUYING_POWER = "buying_power"
     DAILY_NOTIONAL = "daily_notional"
     ORDER_NOTIONAL = "order_notional"
+    ACCOUNT_LEVERAGE = "account_leverage"
 
 
 def _identifier(value: object, field_name: str) -> str:
@@ -959,6 +962,15 @@ class EntryRiskEvidence(_SealedCapability):
     liquidity: Optional[LiquidityEvidence] = None
     ml_corroboration: Optional[MLCorroborationEvidence] = None
     portfolio_equity_usd: Optional[Decimal] = None
+    account_equity_usd: Optional[Decimal] = None
+    account_gross_notional_usd: Optional[Decimal] = None
+    pending_symbol_notional_usd: Optional[Decimal] = None
+    pending_sector_notional_usd: Optional[Decimal] = None
+    pending_portfolio_notional_usd: Optional[Decimal] = None
+    pending_account_notional_usd: Optional[Decimal] = None
+    pending_cash_usd: Optional[Decimal] = None
+    pending_buying_power_usd: Optional[Decimal] = None
+    pending_daily_notional_usd: Optional[Decimal] = None
     cash_available_usd: Optional[Decimal] = None
     buying_power_usd: Optional[Decimal] = None
     current_symbol_gross_notional_usd: Optional[Decimal] = None
@@ -1021,6 +1033,15 @@ class EntryRiskEvidence(_SealedCapability):
             self.ml_corroboration.__post_init__(_seal)
         for field_name in (
             "portfolio_equity_usd",
+            "account_equity_usd",
+            "account_gross_notional_usd",
+            "pending_symbol_notional_usd",
+            "pending_sector_notional_usd",
+            "pending_portfolio_notional_usd",
+            "pending_account_notional_usd",
+            "pending_cash_usd",
+            "pending_buying_power_usd",
+            "pending_daily_notional_usd",
             "cash_available_usd",
             "buying_power_usd",
             "current_symbol_gross_notional_usd",
@@ -1036,8 +1057,9 @@ class EntryRiskEvidence(_SealedCapability):
                     _decimal(
                         value,
                         field_name,
-                        positive=field_name == "portfolio_equity_usd",
-                        nonnegative=field_name != "portfolio_equity_usd",
+                        positive=field_name in {"portfolio_equity_usd", "account_equity_usd"},
+                        nonnegative=field_name
+                        not in {"portfolio_equity_usd", "account_equity_usd"},
                     ),
                 )
 
@@ -1053,6 +1075,15 @@ def build_entry_risk_evidence(
     liquidity: Optional[LiquidityEvidence] = None,
     ml_corroboration: Optional[MLCorroborationEvidence] = None,
     portfolio_equity_usd: Optional[Decimal] = None,
+    account_equity_usd: Optional[Decimal] = None,
+    account_gross_notional_usd: Optional[Decimal] = None,
+    pending_symbol_notional_usd: Optional[Decimal] = None,
+    pending_sector_notional_usd: Optional[Decimal] = None,
+    pending_portfolio_notional_usd: Optional[Decimal] = None,
+    pending_account_notional_usd: Optional[Decimal] = None,
+    pending_cash_usd: Optional[Decimal] = None,
+    pending_buying_power_usd: Optional[Decimal] = None,
+    pending_daily_notional_usd: Optional[Decimal] = None,
     cash_available_usd: Optional[Decimal] = None,
     buying_power_usd: Optional[Decimal] = None,
     current_symbol_gross_notional_usd: Optional[Decimal] = None,
@@ -1070,7 +1101,12 @@ def build_entry_risk_evidence(
     duplicate state includes current positions and pending entries for this
     symbol across portfolios. The allowed-at timestamp is the durable latest
     entry cooldown boundary from recent buys/sells, never a default for missing
-    history. This pure contract does not collect or reserve that state itself.
+    history. Current balances/exposure must be supplied before subtracting
+    reservations: pending amounts are explicit, never inferred from a missing
+    field. Account gross exposure includes all portfolios and both long/short
+    absolute notionals. Pending cash and buying power include any required fees;
+    daily pending notional is scoped like the configured daily ledger limit.
+    This pure contract does not collect or reserve that state itself.
     """
 
     if quote is not None:
@@ -1096,6 +1132,15 @@ def build_entry_risk_evidence(
             "liquidity": liquidity,
             "ml_corroboration": ml_corroboration,
             "portfolio_equity_usd": portfolio_equity_usd,
+            "account_equity_usd": account_equity_usd,
+            "account_gross_notional_usd": account_gross_notional_usd,
+            "pending_symbol_notional_usd": pending_symbol_notional_usd,
+            "pending_sector_notional_usd": pending_sector_notional_usd,
+            "pending_portfolio_notional_usd": pending_portfolio_notional_usd,
+            "pending_account_notional_usd": pending_account_notional_usd,
+            "pending_cash_usd": pending_cash_usd,
+            "pending_buying_power_usd": pending_buying_power_usd,
+            "pending_daily_notional_usd": pending_daily_notional_usd,
             "cash_available_usd": cash_available_usd,
             "buying_power_usd": buying_power_usd,
             "current_symbol_gross_notional_usd": current_symbol_gross_notional_usd,
@@ -1120,10 +1165,15 @@ class EntryRiskLimits:
     max_daily_notional_usd: Decimal
     max_order_notional_usd: Optional[Decimal]
     max_open_positions: int
+    max_account_leverage: Decimal
     max_quote_age: timedelta
     max_account_evidence_age: timedelta
 
     def __post_init__(self) -> None:
+        leverage = _decimal(self.max_account_leverage, "max_account_leverage", positive=True)
+        if not Decimal("1") <= leverage <= Decimal("4"):
+            raise EntryRiskContractError("max_account_leverage must be between 1 and 4")
+        object.__setattr__(self, "max_account_leverage", leverage)
         if type(self.max_open_positions) is not int or self.max_open_positions <= 0:
             raise EntryRiskContractError("max_open_positions must be a positive integer")
         position = _fraction(
@@ -1572,6 +1622,15 @@ def _capability_state(capability: object) -> tuple[object, ...]:
                 else _capability_state(evidence.ml_corroboration)
             ),
             _optional_decimal_state(evidence.portfolio_equity_usd),
+            _optional_decimal_state(evidence.account_equity_usd),
+            _optional_decimal_state(evidence.account_gross_notional_usd),
+            _optional_decimal_state(evidence.pending_symbol_notional_usd),
+            _optional_decimal_state(evidence.pending_sector_notional_usd),
+            _optional_decimal_state(evidence.pending_portfolio_notional_usd),
+            _optional_decimal_state(evidence.pending_account_notional_usd),
+            _optional_decimal_state(evidence.pending_cash_usd),
+            _optional_decimal_state(evidence.pending_buying_power_usd),
+            _optional_decimal_state(evidence.pending_daily_notional_usd),
             _optional_decimal_state(evidence.cash_available_usd),
             _optional_decimal_state(evidence.buying_power_usd),
             _optional_decimal_state(evidence.current_symbol_gross_notional_usd),
@@ -1861,6 +1920,15 @@ def evaluate_entry_intent(
 
     required_money = (
         ("portfolio_equity_usd", RiskReason.MISSING_PORTFOLIO_EQUITY),
+        ("account_equity_usd", RiskReason.MISSING_ACCOUNT_EXPOSURE),
+        ("account_gross_notional_usd", RiskReason.MISSING_ACCOUNT_EXPOSURE),
+        ("pending_symbol_notional_usd", RiskReason.MISSING_PENDING_EXPOSURE),
+        ("pending_sector_notional_usd", RiskReason.MISSING_PENDING_EXPOSURE),
+        ("pending_portfolio_notional_usd", RiskReason.MISSING_PENDING_EXPOSURE),
+        ("pending_account_notional_usd", RiskReason.MISSING_PENDING_EXPOSURE),
+        ("pending_cash_usd", RiskReason.MISSING_PENDING_EXPOSURE),
+        ("pending_buying_power_usd", RiskReason.MISSING_PENDING_EXPOSURE),
+        ("pending_daily_notional_usd", RiskReason.MISSING_PENDING_EXPOSURE),
         ("cash_available_usd", RiskReason.MISSING_CASH),
         ("buying_power_usd", RiskReason.MISSING_BUYING_POWER),
         ("current_symbol_gross_notional_usd", RiskReason.MISSING_SYMBOL_EXPOSURE),
@@ -1973,6 +2041,15 @@ def evaluate_entry_intent(
         or evidence.correlation is None
         or evidence.liquidity is None
         or evidence.portfolio_equity_usd is None
+        or evidence.account_equity_usd is None
+        or evidence.account_gross_notional_usd is None
+        or evidence.pending_symbol_notional_usd is None
+        or evidence.pending_sector_notional_usd is None
+        or evidence.pending_portfolio_notional_usd is None
+        or evidence.pending_account_notional_usd is None
+        or evidence.pending_cash_usd is None
+        or evidence.pending_buying_power_usd is None
+        or evidence.pending_daily_notional_usd is None
         or evidence.cash_available_usd is None
         or evidence.buying_power_usd is None
         or evidence.current_symbol_gross_notional_usd is None
@@ -2055,6 +2132,43 @@ def evaluate_entry_intent(
             ),
         ),
     )
+    pending_by_capacity = {
+        LimitingCapacity.SYMBOL: evidence.pending_symbol_notional_usd,
+        LimitingCapacity.SECTOR: evidence.pending_sector_notional_usd,
+        LimitingCapacity.PORTFOLIO: evidence.pending_portfolio_notional_usd,
+        LimitingCapacity.CASH: evidence.pending_cash_usd,
+        LimitingCapacity.BUYING_POWER: evidence.pending_buying_power_usd,
+        LimitingCapacity.DAILY_NOTIONAL: evidence.pending_daily_notional_usd,
+    }
+    capacities = tuple(
+        (
+            capacity_name,
+            (
+                _exact_subtract(
+                    capacity,
+                    pending_by_capacity[capacity_name],
+                    f"{capacity_name.value} capacity after pending reservations",
+                )
+                if capacity_name in pending_by_capacity
+                else capacity
+            ),
+        )
+        for capacity_name, capacity in capacities
+    )
+    account_capacity = _exact_subtract(
+        _exact_subtract(
+            _exact_multiply(
+                evidence.account_equity_usd,
+                limits.max_account_leverage,
+                "account leverage capacity",
+            ),
+            evidence.account_gross_notional_usd,
+            "remaining account leverage capacity",
+        ),
+        evidence.pending_account_notional_usd,
+        "account leverage capacity after reservations",
+    )
+    capacities += ((LimitingCapacity.ACCOUNT_LEVERAGE, account_capacity),)
     # None represents an explicitly disabled optional config cap. There is no
     # constructor default: every producer must deliberately supply this policy.
     if limits.max_order_notional_usd is not None:

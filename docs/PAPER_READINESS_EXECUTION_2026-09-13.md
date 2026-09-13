@@ -190,3 +190,25 @@ representative tuning benchmarks remain follow-up work; this observation does
 not establish a trading latency or profitability improvement.
 
 Black, changed-file Flake8, and diff whitespace checks pass. Entry authority remains disabled.
+
+
+## Account leverage and pending capacity
+
+The dormant exact risk contract now requires explicit account equity/gross
+exposure and pending commitments for symbol, sector, portfolio, account, cash,
+buying power, and daily notional. Account leverage is constrained to the same
+1-through-4 range as RiskConfig. Each reservation reduces its relevant capacity
+using isolated exact arithmetic before quantity flooring and the shared
+postcondition. Absent or malformed values fail closed; new fields participate
+in the sealed capability snapshot and consumption-time revalidation.
+
+Focused contract suite: 296 passed. Independent review: no actionable defect,
+95 targeted tests passed. Regression tests cover other portfolios exhausting
+account capacity, every pending capacity, missing evidence, malformed decimals,
+seal mutation, and fractional boundary arithmetic under a hostile Decimal context.
+This is a necessary contract extension, not a runtime snapshot or reservation
+implementation. Runtime must still collect coherent values under the account
+order lock, supply balances before reservation deductions, and revalidate them
+before submission. Paper readiness remains false.
+
+Combined entry-contract and durable-risk suites: 408 passed, 1 warning in 12.44 seconds. Black, changed-file Flake8, and whitespace checks pass.
