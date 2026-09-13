@@ -1755,3 +1755,13 @@ buying-power/daily commitments. Unknown values fail closed and all added values
 are sealed. Combined contract and durable-risk suites: 408 passed. Independent
 review found no actionable defect. Coherent runtime snapshots and reservations
 remain unimplemented; Gate A remains closed.
+
+September 13 ledger-evidence follow-up: added a dormant coherent read-only
+account snapshot reconstructed from authenticated bootstraps and terminal
+receipts, with FIFO/commission/link and mutable-state verification in one read
+transaction. Persistent portfolio reads cannot be redirected by temporary
+SQLite tables. Related regressions: 166 passed; broader safety/security/risk
+run before final schema qualification: 1003 passed, 4 existing skips.
+This partially implements the runtime evidence producer; quote valuation,
+reservations, startup replay, baseline BUY settlement, and gateway wiring
+remain open. Gate A and paper entry authority remain closed.

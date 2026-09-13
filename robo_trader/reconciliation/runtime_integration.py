@@ -473,6 +473,155 @@ def _publish_status_exclusive(parent_descriptor: int, source: str, target: str) 
         ) from OSError(error_number, os.strerror(error_number), target)
 
 
+async def _read_validated_bootstrap_candidates(
+    connection: aiosqlite.Connection, contract: RuntimeContract, binding: SQLitePathBinding
+) -> dict[str, ExactStateBootstrapCandidate]:
+    """Verify historical bootstrap lineage inside the caller's read transaction.
+
+    The caller owns schema and SQLite descriptor/path validation. Keeping these
+    reads on the same transaction lets entry evidence share this bootstrap
+    authentication boundary with current cash, quantities, and terminal fills.
+    """
+    if not connection.in_transaction:
+        raise RuntimeReconciliationIntegrationError("bootstrap read requires a transaction")
+    cursor = await connection.execute("""
+        SELECT p.id, b.bootstrap_id, b.execution_domain_scope, b.account_scope,
+               b.database_path, b.database_identity, b.database_device,
+               b.database_inode, a.origin_bootstrap_id,
+               b.candidate_payload_json, b.broker_snapshot_hash,
+               b.reconciliation_report_hash
+        FROM main.portfolios AS p
+        LEFT JOIN main.paper_state_bootstraps AS b ON b.portfolio_id = p.id
+        LEFT JOIN main.paper_account_settlement_state AS a ON a.portfolio_id = p.id
+        ORDER BY p.id
+        """)
+    portfolio_rows = await cursor.fetchall()
+    if not portfolio_rows:
+        raise RuntimeReconciliationIntegrationError("runtime portfolio state is unavailable")
+    candidates: dict[str, ExactStateBootstrapCandidate] = {}
+    bootstrap_ids: dict[str, str] = {}
+    expected_receipts: dict[str, dict[str, list[str]]] = {}
+    for row in portfolio_rows:
+        portfolio_id, bootstrap_id = row[0], row[1]
+        if (
+            not isinstance(portfolio_id, str)
+            or not isinstance(bootstrap_id, str)
+            or row[2] != contract.safety_execution_domain_scope
+            or row[3] != contract.safety_account_scope
+            or row[4] != contract.database_path
+            or row[5] != contract.database_identity
+            or (row[6], row[7]) != (binding.device, binding.inode)
+            or row[8] != bootstrap_id
+        ):
+            raise RuntimeReconciliationIntegrationError(
+                "exact bootstrap lineage is missing or mismatched"
+            )
+        bootstrap_ids[portfolio_id] = bootstrap_id
+        try:
+            candidate_raw = json.loads(row[9])
+            candidate = ExactStateBootstrapCandidate.from_mapping(candidate_raw)
+        except Exception as exc:
+            raise RuntimeReconciliationIntegrationError(
+                "exact bootstrap candidate is missing or malformed"
+            ) from exc
+        if (
+            candidate.bootstrap_id != bootstrap_id
+            or candidate.portfolio_id != portfolio_id
+            or candidate.database_path != contract.database_path
+            or candidate.database_identity != contract.database_identity
+        ):
+            raise RuntimeReconciliationIntegrationError(
+                "exact bootstrap candidate lineage is mismatched"
+            )
+        candidates[portfolio_id] = candidate
+        expected_receipts[bootstrap_id] = {
+            "broker_snapshot": [str(row[10])],
+            "reconciliation_report": [str(row[11])],
+            "protective_mark": [
+                position.mark_evidence_fingerprint for position in candidate.positions
+            ],
+        }
+
+    cursor = await connection.execute("""
+        SELECT p.portfolio_id, p.symbol, s.cost_basis_text, s.mark_price_text,
+               s.origin_bootstrap_id
+        FROM main.positions AS p
+        LEFT JOIN main.paper_position_settlement_state AS s
+          ON s.portfolio_id = p.portfolio_id AND s.symbol = p.symbol
+        WHERE p.quantity <> 0
+        ORDER BY p.portfolio_id, p.symbol
+        """)
+    position_rows = await cursor.fetchall()
+    for row in position_rows:
+        if (
+            row[0] not in bootstrap_ids
+            or not isinstance(row[2], str)
+            or not row[2]
+            or not isinstance(row[3], str)
+            or not row[3]
+            or row[4] != bootstrap_ids[row[0]]
+        ):
+            raise RuntimeReconciliationIntegrationError(
+                "exact position bootstrap state is missing or partial"
+            )
+
+    cursor = await connection.execute("""
+        SELECT bootstrap_id, artifact_kind, artifact_sha256,
+               runtime_fingerprint, account_scope
+        FROM main.exact_bootstrap_evidence_consumptions
+        ORDER BY bootstrap_id, artifact_kind, receipt_id
+        """)
+    receipt_rows = await cursor.fetchall()
+    observed_receipts: dict[str, dict[str, list[str]]] = {
+        bootstrap_id: {
+            "broker_snapshot": [],
+            "reconciliation_report": [],
+            "protective_mark": [],
+        }
+        for bootstrap_id in bootstrap_ids.values()
+    }
+    # These append-only receipts record authentication at the original
+    # bootstrap boundary. A software/model/key update changes the current
+    # runtime fingerprint, not the sealed accounting epoch. Keep each
+    # epoch bound to one well-formed original producer runtime; the stable
+    # account/domain/database/inode checks above bind it to this runtime.
+    # Current reconciliation independently authenticates current evidence.
+    origin_fingerprints: dict[str, str] = {}
+    for (
+        bootstrap_id,
+        artifact_kind,
+        artifact_hash,
+        runtime_fingerprint,
+        account_scope,
+    ) in receipt_rows:
+        if (
+            bootstrap_id not in observed_receipts
+            or artifact_kind not in observed_receipts[bootstrap_id]
+            or type(runtime_fingerprint) is not str
+            or len(runtime_fingerprint) != 16
+            or any(character not in "0123456789abcdef" for character in runtime_fingerprint)
+            or account_scope != contract.safety_account_scope
+        ):
+            raise RuntimeReconciliationIntegrationError(
+                "exact bootstrap authentication receipt lineage is mismatched"
+            )
+        original = origin_fingerprints.setdefault(bootstrap_id, runtime_fingerprint)
+        if runtime_fingerprint != original:
+            raise RuntimeReconciliationIntegrationError(
+                "exact bootstrap authentication receipts have mixed runtime origins"
+            )
+        observed_receipts[bootstrap_id][artifact_kind].append(artifact_hash)
+    if any(
+        {kind: sorted(hashes) for kind, hashes in observed_receipts[bootstrap_id].items()}
+        != {kind: sorted(hashes) for kind, hashes in expected_receipts[bootstrap_id].items()}
+        for bootstrap_id in expected_receipts
+    ):
+        raise RuntimeReconciliationIntegrationError(
+            "exact bootstrap authentication receipts are incomplete"
+        )
+    return candidates
+
+
 async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) -> None:
     """Read-only proof that every portfolio has complete exact bootstrap lineage."""
 
@@ -489,143 +638,12 @@ async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) 
         connection = await aiosqlite.connect(uri, uri=True, isolation_level=None)
         await connection.execute("PRAGMA query_only = ON")
         await connection.execute("PRAGMA foreign_keys = ON")
+        await connection.execute("BEGIN")
         await assert_exact_state_schema(connection)
         await assert_reconciliation_schema(connection)
         binding.assert_path_identity()
 
-        cursor = await connection.execute("""
-            SELECT p.id, b.bootstrap_id, b.execution_domain_scope, b.account_scope,
-                   b.database_path, b.database_identity, b.database_device,
-                   b.database_inode, a.origin_bootstrap_id,
-                   b.candidate_payload_json, b.broker_snapshot_hash,
-                   b.reconciliation_report_hash
-            FROM portfolios AS p
-            LEFT JOIN paper_state_bootstraps AS b ON b.portfolio_id = p.id
-            LEFT JOIN paper_account_settlement_state AS a ON a.portfolio_id = p.id
-            ORDER BY p.id
-            """)
-        portfolio_rows = await cursor.fetchall()
-        if not portfolio_rows:
-            raise RuntimeReconciliationIntegrationError("runtime portfolio state is unavailable")
-        bootstrap_ids: dict[str, str] = {}
-        expected_receipts: dict[str, dict[str, list[str]]] = {}
-        for row in portfolio_rows:
-            portfolio_id, bootstrap_id = row[0], row[1]
-            if (
-                not isinstance(portfolio_id, str)
-                or not isinstance(bootstrap_id, str)
-                or row[2] != contract.safety_execution_domain_scope
-                or row[3] != contract.safety_account_scope
-                or row[4] != contract.database_path
-                or row[5] != contract.database_identity
-                or (row[6], row[7]) != (binding.device, binding.inode)
-                or row[8] != bootstrap_id
-            ):
-                raise RuntimeReconciliationIntegrationError(
-                    "exact bootstrap lineage is missing or mismatched"
-                )
-            bootstrap_ids[portfolio_id] = bootstrap_id
-            try:
-                candidate_raw = json.loads(row[9])
-                candidate = ExactStateBootstrapCandidate.from_mapping(candidate_raw)
-            except Exception as exc:
-                raise RuntimeReconciliationIntegrationError(
-                    "exact bootstrap candidate is missing or malformed"
-                ) from exc
-            if (
-                candidate.bootstrap_id != bootstrap_id
-                or candidate.portfolio_id != portfolio_id
-                or candidate.database_path != contract.database_path
-                or candidate.database_identity != contract.database_identity
-            ):
-                raise RuntimeReconciliationIntegrationError(
-                    "exact bootstrap candidate lineage is mismatched"
-                )
-            expected_receipts[bootstrap_id] = {
-                "broker_snapshot": [str(row[10])],
-                "reconciliation_report": [str(row[11])],
-                "protective_mark": [
-                    position.mark_evidence_fingerprint for position in candidate.positions
-                ],
-            }
-
-        cursor = await connection.execute("""
-            SELECT p.portfolio_id, p.symbol, s.cost_basis_text, s.mark_price_text,
-                   s.origin_bootstrap_id
-            FROM positions AS p
-            LEFT JOIN paper_position_settlement_state AS s
-              ON s.portfolio_id = p.portfolio_id AND s.symbol = p.symbol
-            WHERE p.quantity <> 0
-            ORDER BY p.portfolio_id, p.symbol
-            """)
-        position_rows = await cursor.fetchall()
-        for row in position_rows:
-            if (
-                row[0] not in bootstrap_ids
-                or not isinstance(row[2], str)
-                or not row[2]
-                or not isinstance(row[3], str)
-                or not row[3]
-                or row[4] != bootstrap_ids[row[0]]
-            ):
-                raise RuntimeReconciliationIntegrationError(
-                    "exact position bootstrap state is missing or partial"
-                )
-
-        cursor = await connection.execute("""
-            SELECT bootstrap_id, artifact_kind, artifact_sha256,
-                   runtime_fingerprint, account_scope
-            FROM exact_bootstrap_evidence_consumptions
-            ORDER BY bootstrap_id, artifact_kind, receipt_id
-            """)
-        receipt_rows = await cursor.fetchall()
-        observed_receipts: dict[str, dict[str, list[str]]] = {
-            bootstrap_id: {
-                "broker_snapshot": [],
-                "reconciliation_report": [],
-                "protective_mark": [],
-            }
-            for bootstrap_id in bootstrap_ids.values()
-        }
-        # These append-only receipts record authentication at the original
-        # bootstrap boundary. A software/model/key update changes the current
-        # runtime fingerprint, not the sealed accounting epoch. Keep each
-        # epoch bound to one well-formed original producer runtime; the stable
-        # account/domain/database/inode checks above bind it to this runtime.
-        # Current reconciliation independently authenticates current evidence.
-        origin_fingerprints: dict[str, str] = {}
-        for (
-            bootstrap_id,
-            artifact_kind,
-            artifact_hash,
-            runtime_fingerprint,
-            account_scope,
-        ) in receipt_rows:
-            if (
-                bootstrap_id not in observed_receipts
-                or artifact_kind not in observed_receipts[bootstrap_id]
-                or type(runtime_fingerprint) is not str
-                or len(runtime_fingerprint) != 16
-                or any(character not in "0123456789abcdef" for character in runtime_fingerprint)
-                or account_scope != contract.safety_account_scope
-            ):
-                raise RuntimeReconciliationIntegrationError(
-                    "exact bootstrap authentication receipt lineage is mismatched"
-                )
-            original = origin_fingerprints.setdefault(bootstrap_id, runtime_fingerprint)
-            if runtime_fingerprint != original:
-                raise RuntimeReconciliationIntegrationError(
-                    "exact bootstrap authentication receipts have mixed runtime origins"
-                )
-            observed_receipts[bootstrap_id][artifact_kind].append(artifact_hash)
-        if any(
-            {kind: sorted(hashes) for kind, hashes in observed_receipts[bootstrap_id].items()}
-            != {kind: sorted(hashes) for kind, hashes in expected_receipts[bootstrap_id].items()}
-            for bootstrap_id in expected_receipts
-        ):
-            raise RuntimeReconciliationIntegrationError(
-                "exact bootstrap authentication receipts are incomplete"
-            )
+        await _read_validated_bootstrap_candidates(connection, contract, binding)
         binding.assert_path_identity()
     except RuntimeReconciliationIntegrationError:
         raise

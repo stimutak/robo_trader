@@ -212,3 +212,36 @@ order lock, supply balances before reservation deductions, and revalidate them
 before submission. Paper readiness remains false.
 
 Combined entry-contract and durable-risk suites: 408 passed, 1 warning in 12.44 seconds. Black, changed-file Flake8, and whitespace checks pass.
+
+## Coherent paper ledger snapshot
+
+Added a dormant, read-only account snapshot collector. It reconstructs exact
+portfolio cash and contract quantities from authenticated bootstrap candidates
+and durable terminal receipts within one SQLite read transaction. It checks
+FIFO fills, commissions, settlement links, compatibility state, portfolio
+coverage, and database identity before issuing sealed in-process evidence.
+The shared bootstrap reader now supports the same transaction and explicitly
+queries the main schema so temporary tables cannot hide persistent portfolios.
+
+Regression tests exercise actual synthetic bootstrap and settlement history,
+filled and rejected outcomes, cash/quantity rewrites, incomplete lineage,
+concurrent writers, database replacement, cancellation and explicit pool
+recovery, freshness measured before validation, and nested type substitutions.
+A new test reproduced a temporary portfolios table hiding an unbootstrapped
+portfolio; main-schema qualification fixes it. No historical user database was
+modified. Snapshot collection itself makes no writes.
+
+Validation: 166 related bootstrap, reconciliation, settlement and snapshot tests
+passed (1 warning). The broader safety, security, risk and entry-contract run
+passed 1003 tests with 4 existing skips and 1 warning before the final
+main-schema qualification; the relevant 166-test run includes that correction.
+Black, changed-file Flake8 and whitespace checks pass. Independent review
+covered the snapshot and its mutation, FIFO link, freshness and cancellation
+boundaries. Logs: work/paper-risk-snapshot-regressions.log and
+work/paper-risk-snapshot-safety.log.
+
+This establishes cash/quantity evidence only. Current quotes and valuations,
+signed allocation evidence, pending reservations, daily-risk startup replay,
+baseline BUY settlement and final gateway admission remain unconnected. The
+paper readiness constant remains false; no trading process was started and no
+performance or profitability improvement is claimed from this correctness work.
