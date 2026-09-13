@@ -923,6 +923,43 @@ async def test_position_protective_receipt_exact_coverage_is_ready(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [None, "mixed-origin", "malformed-origin", "account", "database", "domain"],
+)
+async def test_bootstrap_history_survives_upgrade_with_exact_origin_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str | None
+) -> None:
+    database = tmp_path / "ledger.db"
+    original = _runtime(database)
+    _readiness_database(database, original, include_bootstrap=True, include_position=True)
+    upgraded = replace(original, build_id="upgraded-build", model_artifact_set="upgraded-models")
+    if mutation == "account":
+        upgraded = replace(upgraded, safety_account_scope="acct_v1_" + "f" * 64)
+    elif mutation == "domain":
+        upgraded = replace(upgraded, safety_execution_domain_scope="different-domain")
+    elif mutation == "database":
+        upgraded = replace(upgraded, state_namespace="different-namespace")
+    elif mutation in ("mixed-origin", "malformed-origin"):
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE exact_bootstrap_evidence_consumptions SET runtime_fingerprint=? "
+                "WHERE artifact_kind='protective_mark'",
+                ("f" * 16 if mutation == "mixed-origin" else "not-a-fingerprint",),
+            )
+    before = database.read_bytes()
+    monkeypatch.setattr(integration, "assert_validated_runtime_safety_context", lambda value: value)
+    monkeypatch.setattr(integration, "assert_exact_state_schema", AsyncMock())
+    monkeypatch.setattr(integration, "assert_reconciliation_schema", AsyncMock())
+    if mutation is None:
+        await assert_runtime_bootstrap_ready(SimpleNamespace(runtime_contract=upgraded))
+    else:
+        with pytest.raises(RuntimeReconciliationIntegrationError):
+            await assert_runtime_bootstrap_ready(SimpleNamespace(runtime_contract=upgraded))
+    assert database.read_bytes() == before
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("evolution", ["closed-bootstrap-position", "later-entry"])
 async def test_bootstrap_receipts_remain_ready_after_valid_position_evolution(
     tmp_path: Path,

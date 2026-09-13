@@ -587,6 +587,13 @@ async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) 
             }
             for bootstrap_id in bootstrap_ids.values()
         }
+        # These append-only receipts record authentication at the original
+        # bootstrap boundary. A software/model/key update changes the current
+        # runtime fingerprint, not the sealed accounting epoch. Keep each
+        # epoch bound to one well-formed original producer runtime; the stable
+        # account/domain/database/inode checks above bind it to this runtime.
+        # Current reconciliation independently authenticates current evidence.
+        origin_fingerprints: dict[str, str] = {}
         for (
             bootstrap_id,
             artifact_kind,
@@ -597,11 +604,18 @@ async def assert_runtime_bootstrap_ready(runtime_context: RuntimeSafetyContext) 
             if (
                 bootstrap_id not in observed_receipts
                 or artifact_kind not in observed_receipts[bootstrap_id]
-                or runtime_fingerprint != contract.fingerprint
+                or type(runtime_fingerprint) is not str
+                or len(runtime_fingerprint) != 16
+                or any(character not in "0123456789abcdef" for character in runtime_fingerprint)
                 or account_scope != contract.safety_account_scope
             ):
                 raise RuntimeReconciliationIntegrationError(
                     "exact bootstrap authentication receipt lineage is mismatched"
+                )
+            original = origin_fingerprints.setdefault(bootstrap_id, runtime_fingerprint)
+            if runtime_fingerprint != original:
+                raise RuntimeReconciliationIntegrationError(
+                    "exact bootstrap authentication receipts have mixed runtime origins"
                 )
             observed_receipts[bootstrap_id][artifact_kind].append(artifact_hash)
         if any(

@@ -67,3 +67,9 @@ The second review finding is repaired with v2 status ownership bound to stable e
 The real status publication regression failed before the fix and passes afterward. The focused module passes 43 tests, the related reconciliation/adapter/web suite passes 220 tests, and independent review found no actionable defect. Black, Flake8, and whitespace checks pass.
 
 For any pre-release installation that wrote a v1 status artifact, preserve that file and set `RT_RECONCILIATION_STATUS_PATH` to a new absolute path before adopting v2. There is no automatic adoption, deletion, or overwrite of v1 evidence. This changes diagnostic artifact ownership only; it does not authorize startup or resolve historical bootstrap fingerprint compatibility.
+
+### Historical bootstrap upgrade fix
+
+Historical receipts now require one well-formed original runtime fingerprint per bootstrap epoch rather than equality with the current build fingerprint. Bootstrap application already authenticates receipts against that original runtime before their atomic append-only persistence. Startup retains exact immutable schema, account/domain/database/path/inode checks and exact signed-artifact coverage. Current reconciliation still authenticates the current runtime independently. No historical rows are rewritten or newly blessed by this change.
+
+The upgrade regression failed before implementation. Tests prove valid build/model upgrades pass; mixed/malformed receipt origins and changed account/domain/database namespace fail without changing database bytes. Related bootstrap, receipt producer, and runtime tests: 165 passed. Independent review: no concrete regression, 49 focused tests passed. Full suite after both upgrade fixes: 3491 passed, 4 skipped, 19 warnings in 96.28 seconds. Black, Flake8, and diff whitespace checks pass. Both reproduced upgrade blockers are repaired; entry-risk integration and operational Gate A remain open.
