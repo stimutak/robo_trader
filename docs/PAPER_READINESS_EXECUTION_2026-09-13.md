@@ -245,3 +245,45 @@ signed allocation evidence, pending reservations, daily-risk startup replay,
 baseline BUY settlement and final gateway admission remain unconnected. The
 paper readiness constant remains false; no trading process was started and no
 performance or profitability improvement is claimed from this correctness work.
+
+## Gateway account valuation integration
+
+Portfolio-scoped entry serialization now collects the verified account ledger
+under the existing account order lock before requesting quotes. Quote coverage
+includes every held symbol, even when absent from the active stop list. The
+active entry monitor authenticates current broker marks; exact contract IDs,
+producer payloads, unique symbol records and current read-only transport
+generation are checked before yielding entry context.
+
+`entry_valuation` is accessible only to the task owning that context and
+revalidates ledger provenance, quotes, generation and freshness on every access.
+It derives portfolio and account equity from exact cash plus signed market
+values, gross exposure from absolute values, and distinct held-symbol counts.
+Arithmetic is independent of the ambient Decimal context. Ledger evidence has
+a conservative five-second wall-clock and monotonic age bound including its
+collection time. Context is cleared on normal exit, errors and cancellation.
+
+Independent review identified and corrected an initial assumption that every
+ledger portfolio has an executor registration: inactive cash and positions now
+remain included without requiring execution registration. A test-only owned
+multi-portfolio snapshot verifies inactive short valuation; the other tests use
+real synthetic bootstrap history and exact monitor-produced quotes. No user
+ledger or live runtime was modified.
+
+Related gateway, protective-feed, failure-injection, snapshot and valuation
+regressions: 121 passed, 1 warning in 10.24 seconds. Independent final review:
+12 valuation tests passed, no remaining actionable defect. Black, changed-file
+Flake8 and whitespace checks pass. Logs are retained in
+work/paper-entry-valuation-regressions.log and the red-test evidence logs.
+
+This connects ledger and quote collection to entry serialization, but does not
+replace the runner's legacy risk validator or authorize BUY. Final submission
+still needs fresh database/reconciliation revalidation, exact contract sizing,
+sector/correlation/liquidity evidence, reservations, daily-risk replay and BUY
+settlement. The readiness constant remains false and baseline BUY remains denied.
+
+Broader post-change safety/security/risk/entry-contract/runner-event-time
+verification: 1117 passed, 4 existing skips, 1 warning in 25.46 seconds
+(work/paper-entry-valuation-safety.log). The skips are two unavailable Docker
+Compose checks and two pre-existing conditional/incomplete integration checks;
+they are not evidence of operational launch readiness.

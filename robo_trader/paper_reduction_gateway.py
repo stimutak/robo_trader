@@ -11,11 +11,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import os
 import stat
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, Optional
@@ -48,6 +50,12 @@ from .reconciliation.identity import (
     RuntimeSafetyContext,
     assert_validated_runtime_safety_context,
 )
+from .risk.entry_contract import _exact_multiply, _exact_subtract
+from .risk.paper_ledger_snapshot import (
+    PaperRiskLedgerSnapshot,
+    assert_owned_paper_risk_ledger_snapshot,
+    collect_paper_risk_ledger_snapshot,
+)
 from .safety import (
     OrderSide,
     OrderType,
@@ -68,6 +76,28 @@ class PaperReductionGatewayError(RuntimeError):
 
 
 _REFERENCE_PRICE_TICK = Decimal("0.0001")
+
+
+@dataclass(frozen=True, slots=True)
+class PaperEntryValuation:
+    """Exact current ledger valuation, not an order authorization."""
+
+    portfolio_cash_usd: Decimal
+    portfolio_equity_usd: Decimal
+    portfolio_gross_notional_usd: Decimal
+    account_equity_usd: Decimal
+    account_gross_notional_usd: Decimal
+    account_occupied_position_slots: int
+    observed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryMarketContext:
+    owner: asyncio.Task
+    portfolio_id: str
+    ledger: PaperRiskLedgerSnapshot
+    quotes: tuple[BrokerProtectiveQuote, ...]
+    started_monotonic: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -823,9 +853,29 @@ class PaperReductionGateway:
                 raise PaperReductionGatewayError(
                     "diagnostic broker is unavailable for entry admission"
                 )
+            entry_ledger = None
+            entry_started = getattr(self, "_monotonic", time.monotonic)()
+            if portfolio_id is not None:
+                if (
+                    symbol is None
+                    or type(self._bindings.get(portfolio_id)) is not _PaperRuntimeBinding
+                ):
+                    raise PaperReductionGatewayError(
+                        "entry portfolio has no registered runtime binding"
+                    )
+                entry_ledger = await collect_paper_risk_ledger_snapshot(
+                    self._database, self._runtime_context.runtime_contract
+                )
+                if portfolio_id not in dict(entry_ledger.portfolio_cash):
+                    raise PaperReductionGatewayError("entry portfolio has no ledger coverage")
             current_quote: BrokerProtectiveQuote | None = None
             if symbol is not None:
-                effective_symbols = tuple(sorted(set((symbol,)).union(self._protected_symbols())))
+                held_symbols = (
+                    () if entry_ledger is None else tuple(p.symbol for p in entry_ledger.positions)
+                )
+                effective_symbols = tuple(
+                    sorted(set((symbol,)).union(self._protected_symbols(), held_symbols))
+                )
                 try:
                     quotes = await self._fetch_protective_quotes_locked(
                         effective_symbols,
@@ -866,7 +916,114 @@ class PaperReductionGateway:
                     )
                 if symbol is None or current_quote is None:
                     raise PaperReductionGatewayError("entry serialization scope is malformed")
-            yield current_quote
+            try:
+                if entry_ledger is not None:
+                    self._entry_market_context = _EntryMarketContext(
+                        asyncio.current_task(), portfolio_id, entry_ledger, quotes, entry_started
+                    )
+                    self.entry_valuation(portfolio_id=portfolio_id)
+                yield current_quote
+            finally:
+                self._entry_market_context = None
+
+    def entry_valuation(self, *, portfolio_id: str) -> PaperEntryValuation:
+        """Revalidate all held marks while the calling task owns entry serialization.
+
+        The caller must still revalidate database/reconciliation state at final
+        submission and apply exact entry limits and pending reservations. This
+        view grants no authority and must never replace those admission checks.
+        """
+        context = getattr(self, "_entry_market_context", None)
+        if (
+            type(context) is not _EntryMarketContext
+            or context.owner is not asyncio.current_task()
+            or context.portfolio_id != portfolio_id
+            or not self._account_order_gate.locked()
+        ):
+            raise PaperReductionGatewayError("valuation requires the owning entry context")
+        ledger = context.ledger
+        assert_owned_paper_risk_ledger_snapshot(ledger)
+        age = datetime.now(timezone.utc) - ledger.observed_at
+        monotonic_now = getattr(self, "_monotonic", time.monotonic)()
+        if (
+            type(monotonic_now) is not float
+            or not math.isfinite(monotonic_now)
+            or type(context.started_monotonic) is not float
+            or not math.isfinite(context.started_monotonic)
+            or not 0 <= monotonic_now - context.started_monotonic <= 5
+            or not timedelta(0) <= age <= timedelta(seconds=5)
+        ):
+            raise PaperReductionGatewayError("entry ledger evidence is stale")
+        generation = self._client.protective_quote_generation
+        quotes = {}
+        for quote in context.quotes:
+            if type(quote) is not BrokerProtectiveQuote or replace(quote) != quote:
+                raise PaperReductionGatewayError("entry quote is malformed")
+            if quote.symbol in quotes or quote.transport_generation != generation:
+                raise PaperReductionGatewayError("entry quote identity/generation is ambiguous")
+            quotes[quote.symbol] = quote
+        for position in ledger.positions:
+            quote = quotes.get(position.symbol)
+            if quote is None or quote.con_id != position.con_id:
+                raise PaperReductionGatewayError(
+                    "entry held contract quote is missing or mismatched"
+                )
+        # Market prices are account-wide. The active entry portfolio's exact
+        # monitor authenticates all marks; inactive portfolios need no executor
+        # or monitor registration to contribute their verified balances.
+        scopes = {(portfolio_id, q.symbol, q.con_id) for q in context.quotes}
+        for scope, symbol, con_id in scopes:
+            quote = quotes.get(symbol)
+            if quote is None or quote.con_id != con_id:
+                raise PaperReductionGatewayError(
+                    "entry held contract quote is missing or mismatched"
+                )
+            producer = self._protective_quote_producers.get(scope)
+            getter = getattr(producer, "get_protective_quote_evidence", None)
+            if not callable(getter):
+                raise PaperReductionGatewayError("entry portfolio quote producer is unavailable")
+            try:
+                evidence = assert_current_authoritative_protective_quote(
+                    getter(symbol),
+                    producer=producer,
+                    expected_portfolio_id=scope,
+                    expected_symbol=symbol,
+                    expected_con_id=con_id,
+                    expected_transport_generation=generation,
+                    expected_source_event_id=quote.source_event_id,
+                )
+            except Exception as exc:
+                raise PaperReductionGatewayError("entry quote authority is not current") from exc
+            if evidence.price != quote.price or evidence.source_timestamp != quote.source_timestamp:
+                raise PaperReductionGatewayError("entry quote differs from producer evidence")
+        equities = dict(ledger.portfolio_cash)
+        grosses = {p: Decimal("0") for p in equities}
+
+        def add(a, b):
+            return _exact_subtract(a, b.copy_negate(), "entry valuation")
+
+        for position in ledger.positions:
+            value = _exact_multiply(
+                position.quantity, quotes[position.symbol].price, "entry valuation"
+            )
+            scope = position.portfolio_id
+            equities[scope] = add(equities[scope], value)
+            grosses[scope] = add(grosses[scope], value.copy_abs())
+        total_equity = total_gross = Decimal("0")
+        for scope in equities:
+            if equities[scope] <= 0:
+                raise PaperReductionGatewayError("entry portfolio equity must be positive")
+            total_equity = add(total_equity, equities[scope])
+            total_gross = add(total_gross, grosses[scope])
+        return PaperEntryValuation(
+            dict(ledger.portfolio_cash)[portfolio_id],
+            equities[portfolio_id],
+            grosses[portfolio_id],
+            total_equity,
+            total_gross,
+            len({p.symbol for p in ledger.positions}),
+            ledger.observed_at,
+        )
 
     def submit_baseline_entry(
         self,

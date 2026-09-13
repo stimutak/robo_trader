@@ -1765,3 +1765,16 @@ run before final schema qualification: 1003 passed, 4 existing skips.
 This partially implements the runtime evidence producer; quote valuation,
 reservations, startup replay, baseline BUY settlement, and gateway wiring
 remain open. Gate A and paper entry authority remain closed.
+
+September 13 gateway valuation follow-up: portfolio entry serialization now
+collects coherent account ledger evidence under its shared order lock, requests
+marks for all held symbols, and validates task-owned exact equity/gross
+valuation before yielding. Inactive balances remain included independently of
+execution registration. Each valuation access rechecks producer quotes,
+contract/generation identity and wall/monotonic freshness. Related regressions:
+121 passed; independent final valuation review: 12 passed, no actionable defect.
+This connects part of the runtime evidence producer; it does not yet replace
+legacy sizing or implement reservations, full entry evidence, final database/
+reconciliation checks, replay startup, or BUY settlement. Gate A remains closed.
+Broader post-change safety/security/risk/entry-contract/runner-event-time
+verification: 1117 passed, 4 existing skips; details in the execution record.
