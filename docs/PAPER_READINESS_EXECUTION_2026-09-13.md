@@ -73,3 +73,18 @@ For any pre-release installation that wrote a v1 status artifact, preserve that 
 Historical receipts now require one well-formed original runtime fingerprint per bootstrap epoch rather than equality with the current build fingerprint. Bootstrap application already authenticates receipts against that original runtime before their atomic append-only persistence. Startup retains exact immutable schema, account/domain/database/path/inode checks and exact signed-artifact coverage. Current reconciliation still authenticates the current runtime independently. No historical rows are rewritten or newly blessed by this change.
 
 The upgrade regression failed before implementation. Tests prove valid build/model upgrades pass; mixed/malformed receipt origins and changed account/domain/database namespace fail without changing database bytes. Related bootstrap, receipt producer, and runtime tests: 165 passed. Independent review: no concrete regression, 49 focused tests passed. Full suite after both upgrade fixes: 3491 passed, 4 skipped, 19 warnings in 96.28 seconds. Black, Flake8, and diff whitespace checks pass. Both reproduced upgrade blockers are repaired; entry-risk integration and operational Gate A remain open.
+
+## User-provided runtime share
+
+The user identified `/Volumes/oliver/Projects/robo_trader`. The mount is an SMB share from `blackm5mbp`; its checkout is main at `51f0e99`, older than the integration baseline. Existing unrelated changes: a type change to `robo_trader.log.1` and untracked `.security_round2_commits.sh`; neither was touched.
+
+- IBC configuration exists, with `TradingMode=paper` and `ReadOnlyApi=yes`. Credentials were not displayed or copied into deliverables.
+- Gateway logs are updating on September 13. This is log evidence only, not a verified broker connection or process-health claim.
+- Latest watchdog failure (September 11) reports 323 consecutive unsuccessful restarts and a preflight block on July 13 equity history. No bypass was attempted.
+- `trading_data.db` has WAL and SHM companions. All three were copied as an offline diagnostic family; source hashes before/after and captured hashes matched. Original files were never opened by SQLite or modified.
+- SQLite inspection occurred only on a second local working copy. Integrity check passes: 234 trades, 2 position rows, 1 account, 57 equity rows, 1 portfolio. Latest trade is `2026-07-13 13:55:32`; latest equity is `2026-07-13 14:04:20`. No FIFO or exact bootstrap tables exist.
+- Raw diagnostic capture and hashes: workspace `work/blackm5mbp-evidence-mluk9kys`. This is not a broker-reviewed or process-quiescent operational backup and cannot authorize bootstrap or launch.
+- Share `.env` also lacks the explicit paper-account/allow-list/type and newer runtime identity fields.
+- `blackm5mbp.local` lacks a known-host entry; existing trusted alias `blackm5mbp` verifies but rejects available SSH authentication for user `oliver`. User was asked for the configured SSH username/alias. No host-key check was bypassed and no remote command ran.
+
+The June handoff documents historical accounting and data-quality incidents already motivating the canonical remediation plan. It is historical context, not current pricing or launch evidence. Current work continues from the newer isolated integration branch; the mounted runtime remains unchanged.
