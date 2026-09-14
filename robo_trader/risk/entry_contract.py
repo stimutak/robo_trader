@@ -226,6 +226,8 @@ class RiskReason(str, Enum):
     INTENT_BROKER_LINEAGE_MISMATCH = "intent_broker_lineage_mismatch"
     MISSING_EVIDENCE_SCOPE = "missing_evidence_scope"
     EVIDENCE_SCOPE_MISMATCH = "evidence_scope_mismatch"
+    MISSING_EXECUTION_PRICE = "missing_execution_price"
+    EXECUTION_PRICE_BELOW_QUOTE = "execution_price_below_quote"
     MISSING_QUOTE = "missing_quote"
     MISSING_SECTOR = "missing_sector"
     MISSING_CORRELATION = "missing_correlation"
@@ -957,6 +959,7 @@ class EntryRiskEvidence(_SealedCapability):
     symbol: Optional[str] = None
     observed_at: Optional[datetime] = None
     quote: Optional[RefreshedQuoteEvidence] = None
+    execution_price_ceiling_usd: Optional[Decimal] = None
     sector: Optional[str] = None
     correlation: Optional[CorrelationEvidence] = None
     liquidity: Optional[LiquidityEvidence] = None
@@ -1017,6 +1020,14 @@ class EntryRiskEvidence(_SealedCapability):
             if type(self.quote) is not RefreshedQuoteEvidence:
                 raise EntryRiskContractError("quote evidence is malformed")
             self.quote.__post_init__(_seal)
+        if self.execution_price_ceiling_usd is not None:
+            object.__setattr__(
+                self,
+                "execution_price_ceiling_usd",
+                _decimal(
+                    self.execution_price_ceiling_usd, "execution_price_ceiling_usd", positive=True
+                ),
+            )
         if self.sector is not None:
             object.__setattr__(self, "sector", _sector(self.sector))
         if self.correlation is not None:
@@ -1070,6 +1081,7 @@ def build_entry_risk_evidence(
     symbol: Optional[str] = None,
     observed_at: Optional[datetime] = None,
     quote: Optional[RefreshedQuoteEvidence] = None,
+    execution_price_ceiling_usd: Optional[Decimal] = None,
     sector: Optional[str] = None,
     correlation: Optional[CorrelationEvidence] = None,
     liquidity: Optional[LiquidityEvidence] = None,
@@ -1127,6 +1139,7 @@ def build_entry_risk_evidence(
             "symbol": symbol,
             "observed_at": observed_at,
             "quote": quote,
+            "execution_price_ceiling_usd": execution_price_ceiling_usd,
             "sector": sector,
             "correlation": correlation,
             "liquidity": liquidity,
@@ -1613,6 +1626,7 @@ def _capability_state(capability: object) -> tuple[object, ...]:
             evidence.symbol,
             _optional_time_state(evidence.observed_at),
             None if evidence.quote is None else _capability_state(evidence.quote),
+            _optional_decimal_state(evidence.execution_price_ceiling_usd),
             evidence.sector,
             None if evidence.correlation is None else _capability_state(evidence.correlation),
             None if evidence.liquidity is None else _capability_state(evidence.liquidity),
@@ -1919,6 +1933,7 @@ def evaluate_entry_intent(
             reasons.append(RiskReason.CHURN_LIMIT)
 
     required_money = (
+        ("execution_price_ceiling_usd", RiskReason.MISSING_EXECUTION_PRICE),
         ("portfolio_equity_usd", RiskReason.MISSING_PORTFOLIO_EQUITY),
         ("account_equity_usd", RiskReason.MISSING_ACCOUNT_EXPOSURE),
         ("account_gross_notional_usd", RiskReason.MISSING_ACCOUNT_EXPOSURE),
@@ -2007,6 +2022,13 @@ def evaluate_entry_intent(
     if quote is not None and quote.producer_id != active_quote_producer:
         reasons.append(RiskReason.QUOTE_SOURCE_MISMATCH)
 
+    if (
+        quote is not None
+        and evidence.execution_price_ceiling_usd is not None
+        and evidence.execution_price_ceiling_usd < quote.price_usd
+    ):
+        reasons.append(RiskReason.EXECUTION_PRICE_BELOW_QUOTE)
+
     ml = evidence.ml_corroboration
     if ml is not None and not _scoped_market_evidence_matches(
         ml,
@@ -2038,6 +2060,7 @@ def evaluate_entry_intent(
 
     if (
         quote is None
+        or evidence.execution_price_ceiling_usd is None
         or evidence.correlation is None
         or evidence.liquidity is None
         or evidence.portfolio_equity_usd is None
@@ -2176,18 +2199,19 @@ def evaluate_entry_intent(
     limiting_capacity, capacity_usd = _minimum_capacity(capacities)
     if capacity_usd <= 0:
         return _rejected(intent, now, [RiskReason.NO_CAPACITY], quote)
-    quantity = _floor_quantity(capacity_usd, quote.price_usd)
+    execution_price = evidence.execution_price_ceiling_usd
+    quantity = _floor_quantity(capacity_usd, execution_price)
     if quantity <= 0:
         return _rejected(intent, now, [RiskReason.NO_CAPACITY], quote)
     approved_notional = _exact_multiply(
-        quote.price_usd,
+        execution_price,
         Decimal(quantity),
         "approved_notional_usd",
     )
     _assert_approved_within_all_capacities(
         quantity=quantity,
         approved_notional_usd=approved_notional,
-        price_usd=quote.price_usd,
+        price_usd=execution_price,
         capacities=capacities,
     )
     decision_expiry = _approved_decision_expiry(

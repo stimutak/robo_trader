@@ -11,7 +11,8 @@ The contract floors whole-share quantity at the minimum remaining capacity:
 requested allocation, symbol exposure, sector exposure, portfolio gross exposure,
 liquidity, available cash, buying power, daily gross filled notional, account leverage, and any
 explicitly configured per-order notional cap. Calculations use exact Decimal
-arithmetic and verify the result against every capacity. The Gate-A symbol
+arithmetic, divide by an explicit execution-price ceiling, and verify the
+result against every capacity using that ceiling. The Gate-A symbol
 position cap cannot exceed 2% of portfolio equity.
 
 `max_order_notional_usd` must be explicitly supplied. A positive Decimal enables
@@ -19,9 +20,17 @@ that optional cap; explicit None corresponds to disabling the optional
 `RiskConfig.max_order_notional` setting. Missing required risk evidence never
 means zero exposure or unlimited capacity.
 
-For example, a $1,000 per-order cap at a $333 share price permits at most three
+For example, a $1,000 per-order cap at a $333 execution-price ceiling permits at most three
 shares ($999), provided all other limits allow them. A cap below one share's
 price rejects the entry.
+
+`execution_price_ceiling_usd` is required exact positive evidence and cannot be
+below the validated broker quote. The source quote is not rewritten. With a
+$333 quote and 25 bps paper slippage, the ceiling is $333.8325: a $2,000 capacity
+allows five shares and reserves $1,669.1625. Six shares would cost $2,002.995.
+Missing, understated or mutated ceiling evidence rejects entry. A quantity's
+approved notional represents reserved worst-case principal; actual filled
+notional remains separately recorded from producer-owned terminal execution.
 
 Account leverage uses total account equity multiplied by the configured exact
 leverage ratio (1 through 4), minus gross holdings across all portfolios and
@@ -150,8 +159,8 @@ Inside the owning entry context, the gateway reads the registered exact executor
 current finite slippage setting and the independently validated quote. It returns
 the modeled BUY fill, explicit zero commission and a conservative price ceiling
 of max(reference, modeled fill). The broker quote itself remains unchanged.
-No cost estimate grants order authority. Risk sizing/reservation and final
-submission must still consume and bind this ceiling to the executable policy;
+No cost estimate grants order authority. Risk sizing and durable principal reservations now use the supplied ceiling.
+Final gateway evidence assembly and submission must still bind it to the executable policy;
 any policy or reference-price change requires re-evaluation. Paper-performance
 analysis must state the simulator's zero-commission assumption.
 

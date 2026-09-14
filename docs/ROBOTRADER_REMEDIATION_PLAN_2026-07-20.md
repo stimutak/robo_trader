@@ -1879,3 +1879,13 @@ Broader risk/safety/security/pricing/gateway/submitter/routing/settlement checks
 1304 passed, 4 existing skips, 1 warning in 26.92 seconds
 (work/paper-cost-safety.log). Black, changed-file Flake8 and whitespace checks
 pass. Paper readiness remains false; operational launch and profitability are unverified.
+
+September 14 ceiling-consumption follow-up: the exact risk contract now requires
+owned positive execution-price ceiling evidence, rejects missing/understated
+values, and uses it for quantity, approved principal and all-capacity postconditions.
+The reservation journal records that principal while the source quote remains
+unchanged. Related regressions: 322 passed; independent review: 301 passed;
+broader safety/security/risk/execution/settlement checks: 1309 passed, 4 existing
+skips. Formatting, changed-file lint and whitespace checks pass. Final gateway
+policy binding, complete admission and terminal release/BUY settlement remain
+open. No startup or BUY authority was enabled; Gate A remains closed.

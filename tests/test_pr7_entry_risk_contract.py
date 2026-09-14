@@ -208,6 +208,9 @@ def _evidence(**changes: object) -> EntryRiskEvidence:
         "symbol": "AAPL",
         "observed_at": NOW - timedelta(seconds=1),
         "quote": quote,
+        # Test producer explicitly models zero slippage; production must use
+        # its independently validated executor cost ceiling.
+        "execution_price_ceiling_usd": None if quote is None else quote.price_usd,
         "sector": "Technology",
         "correlation": correlation,
         "liquidity": liquidity,

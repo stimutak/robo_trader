@@ -532,3 +532,27 @@ Broader risk/safety/security/pricing/gateway/submitter/routing/settlement checks
 1304 passed, 4 existing skips, 1 warning in 26.92 seconds
 (work/paper-cost-safety.log). Black, changed-file Flake8 and whitespace checks
 pass. Paper readiness remains false; operational launch and profitability are unverified.
+
+## September 14: execution ceiling in exact entry sizing
+
+The owned risk evidence now requires an explicit positive Decimal execution-price
+ceiling, includes it in its mutation-detection fingerprint, and rejects missing
+ceilings or values below the validated source quote. Quantity, approved principal
+and every capacity postcondition use the ceiling; the broker quote is unchanged.
+The durable reservation adapter consequently records the ceiling-based principal.
+
+A regression demonstrates $333 plus 25 bps slippage: at $2,000 capacity the contract
+permits five shares and reserves $1,669.1625; six would cost $2,002.995. Tests also
+cover precision-2 arithmetic, missing/understated evidence, mutation rejection and
+real journal replay of the principal. Related contract/reservation regressions:
+322 passed in 1.38 seconds. Independent review: 301 focused tests passed.
+Broader risk/safety/security/pricing/gateway/submitter/routing/settlement checks:
+1309 passed, 4 existing skips, 1 warning in 26.59 seconds. Black, changed-file
+Flake8 and whitespace checks pass. Logs: work/entry-ceiling-red.log,
+work/entry-ceiling-related.log and work/entry-ceiling-safety.log.
+
+The shared test producer explicitly models zero slippage when no test ceiling
+is specified; production receives no inferred ceiling. Final gateway evidence
+assembly must provide the registered executor's verified cost and bind the same
+policy/reference at reservation and submission. Complete admission, authenticated
+terminal release/BUY settlement and operational gates remain open; readiness is false.
