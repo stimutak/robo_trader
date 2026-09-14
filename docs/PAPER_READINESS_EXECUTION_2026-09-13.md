@@ -505,3 +505,30 @@ Broader risk/safety/security/gateway/routing/settlement/status/bootstrap checks:
 1294 passed, 4 existing skips, 1 warning in 28.52 seconds
 (work/pending-capacity-safety.log). Black, changed-file Flake8 and whitespace
 checks pass. This is component integration evidence; paper readiness remains false.
+
+## September 14: deterministic paper execution pricing
+
+Tracing the actual paper model confirmed producer-explicit zero commission and
+slippage plus 0.0001 tick rounding. A new regression reproduced an authorized
+fill changing from 12.3457 to 12.3456 under ambient Decimal precision 6 with
+ROUND_DOWN. Replaced the Decimal sink arithmetic with exact integer ratios and
+one half-even tick rounding. This fixes the execution result and provides one
+shared model for proposed entry pricing; no commission schedule was invented.
+
+Registered gateway bindings now retain the exact executor for a task-owned
+entry_execution_cost read. It revalidates quote/ledger evidence, checks current
+slippage and returns the modeled fill, explicit zero fee and max(reference, fill)
+ceiling without changing quote evidence. Risk sizing and the reservation/final
+execution boundary still need to bind this cost model; BUY remains disabled.
+
+Related pricing/Decimal-sink/gateway/submitter/valuation tests: 164 passed,
+1 warning in 8.39 seconds. Independent review: 47 focused tests passed, no
+actionable defect. Coverage includes half-even ties, signed slippage, hostile
+Decimal contexts, invalid slippage, round-down ceilings and changed registered
+executor settings. Logs: work/paper-cost-rounding-red.log,
+work/paper-cost-model-tests.log and work/paper-cost-related.log.
+
+Broader risk/safety/security/pricing/gateway/submitter/routing/settlement checks:
+1304 passed, 4 existing skips, 1 warning in 26.92 seconds
+(work/paper-cost-safety.log). Black, changed-file Flake8 and whitespace checks
+pass. Paper readiness remains false; operational launch and profitability are unverified.

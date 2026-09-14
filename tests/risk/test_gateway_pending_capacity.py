@@ -117,3 +117,22 @@ async def test_cancellation_drains_journal_read_before_releasing_account_gate(le
         await task
     assert not gateway._account_order_gate.locked()
     assert getattr(gateway, "_entry_market_context", None) is None
+
+
+@pytest.mark.asyncio
+async def test_entry_cost_uses_registered_executor_and_current_slippage(ledger, monkeypatch):
+    gateway, quotes, _, _ = _gateway(ledger, monkeypatch)
+    async with gateway.serialize_entry("AAPL", portfolio_id="default"):
+        initial = gateway.entry_execution_cost(portfolio_id="default")
+        assert initial.reference_price_usd == quotes["AAPL"].price
+        assert initial.commission_minor == 0
+        executor = gateway._bindings["default"].executor
+        executor.slippage_bps = 25.0
+        updated = gateway.entry_execution_cost(portfolio_id="default")
+        assert updated.price_ceiling_usd > initial.price_ceiling_usd
+        assert updated.slippage_bps == Decimal("25.0")
+        executor.slippage_bps = float("nan")
+        with pytest.raises(PaperReductionGatewayError, match="slippage"):
+            gateway.entry_execution_cost(portfolio_id="default")
+    with pytest.raises(PaperReductionGatewayError, match="entry context"):
+        gateway.entry_execution_cost(portfolio_id="default")

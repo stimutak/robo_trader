@@ -63,7 +63,11 @@ def _gateway(ledger, monkeypatch):
         stop=AsyncMock(),
     )
     gateway._protective_quote_producers = {"default": monitor}
-    gateway._bindings = {"default": _PaperRuntimeBinding(None, None, monitor, None)}
+    from robo_trader.execution import PaperExecutor
+
+    gateway._bindings = {
+        "default": _PaperRuntimeBinding(None, None, monitor, None, PaperExecutor())
+    }
     return gateway, quotes, requests, monitor
 
 

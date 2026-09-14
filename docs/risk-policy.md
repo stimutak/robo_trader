@@ -137,6 +137,24 @@ replay. The gateway supplies that provenance; constructing a totals object alone
 cannot establish authoritative risk evidence. Final reservation must atomically
 compare this context's head and bind all decision inputs, including sector.
 
+## Current paper execution cost
+
+The simulator explicitly produces zero commission. A shared pricing model now
+applies signed basis-point slippage with exact integer-ratio arithmetic and one
+half-even rounding to a 0.0001 USD tick. The authorized Decimal execution sink
+uses that calculation, independent of the caller's Decimal precision or rounding
+mode. A reproduced precision-6/ROUND_DOWN case previously filled at 12.3456 instead
+of 12.3457; the corrected sink produces 12.3457.
+
+Inside the owning entry context, the gateway reads the registered exact executor's
+current finite slippage setting and the independently validated quote. It returns
+the modeled BUY fill, explicit zero commission and a conservative price ceiling
+of max(reference, modeled fill). The broker quote itself remains unchanged.
+No cost estimate grants order authority. Risk sizing/reservation and final
+submission must still consume and bind this ceiling to the executable policy;
+any policy or reference-price change requires re-evaluation. Paper-performance
+analysis must state the simulator's zero-commission assumption.
+
 ## Remaining runtime work
 
 Owned account-wide snapshots, durable cooldown evidence, daily-risk replay and

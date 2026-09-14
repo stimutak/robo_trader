@@ -15,7 +15,9 @@ import threading
 import weakref
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import Decimal
+
+from .paper_execution_cost import LOCAL_PAPER_COMMISSION_MINOR, exact_paper_fill_price
 from enum import Enum
 from typing import TYPE_CHECKING, cast
 
@@ -25,9 +27,6 @@ if TYPE_CHECKING:
 
 class PaperExecutionCapabilityError(RuntimeError):
     """A terminal paper submission lacked exact one-shot authority."""
-
-
-_PAPER_FILL_PRICE_TICK = Decimal("0.0001")
 
 
 class _CapabilityKind(Enum):
@@ -506,19 +505,12 @@ def _build_sealed_capability_runtime():
             ):
                 return ExecutionResult(False, "Stale reference price for market order")
         if exact_base is not None:
-            slip_decimal = (
-                exact_base * Decimal(str(executor.slippage_bps)) / Decimal("10000")
-                if executor.slippage_bps
-                else Decimal("0")
-            )
-            unrounded_fill = (
-                exact_base + slip_decimal
-                if order.side.upper() in {"BUY", "BUY_TO_COVER"}
-                else exact_base - slip_decimal
-            )
-            if not unrounded_fill.is_finite() or unrounded_fill <= 0:
-                return ExecutionResult(False, "Invalid paper execution fill")
-            fill_decimal = unrounded_fill.quantize(_PAPER_FILL_PRICE_TICK, rounding=ROUND_HALF_EVEN)
+            try:
+                fill_decimal = exact_paper_fill_price(
+                    exact_base, Decimal(str(executor.slippage_bps)), order.side.upper()
+                )
+            except ValueError as error:
+                return ExecutionResult(False, f"Invalid paper execution fill: {error}")
             fill = float(fill_decimal)
         else:
             slip = base * (executor.slippage_bps / 10_000.0) if executor.slippage_bps else 0.0
@@ -549,7 +541,7 @@ def _build_sealed_capability_runtime():
             # The current local-paper executor's explicit cost model has no
             # commission.  Zero is producer evidence here, not a database
             # default or a value inferred after execution.
-            commission_minor=0,
+            commission_minor=LOCAL_PAPER_COMMISSION_MINOR,
             commission_currency="USD",
             commission_source="LOCAL_PAPER_EXECUTOR_EXACT_COMMISSION_V1",
             occurred_at=occurred_at,

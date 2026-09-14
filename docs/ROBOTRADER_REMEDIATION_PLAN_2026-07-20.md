@@ -1866,3 +1866,16 @@ Broader risk/safety/security/gateway/routing/settlement/status/bootstrap checks:
 1294 passed, 4 existing skips, 1 warning in 28.52 seconds
 (work/pending-capacity-safety.log). Black, changed-file Flake8 and whitespace
 checks pass. This is component integration evidence; paper readiness remains false.
+
+September 14 execution-price follow-up: a reproduced ambient-Decimal rounding
+error in an authorized paper fill is fixed with shared exact rational slippage
+and one half-even tick rounding. The model retains explicit zero commission.
+The owning gateway context can now read current registered-executor pricing and
+a conservative ceiling without modifying broker quote evidence. Related tests:
+164 passed; independent review: 47 passed. Risk sizing/reservation and final
+submission still must bind the estimate; no BUY issuer or launch gate changed.
+
+Broader risk/safety/security/pricing/gateway/submitter/routing/settlement checks:
+1304 passed, 4 existing skips, 1 warning in 26.92 seconds
+(work/paper-cost-safety.log). Black, changed-file Flake8 and whitespace checks
+pass. Paper readiness remains false; operational launch and profitability are unverified.

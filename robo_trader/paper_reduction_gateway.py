@@ -28,6 +28,7 @@ from .clients.subprocess_ibkr_client import SubprocessIBKRClient
 from .database_async import AsyncTradingDatabase
 from .execution import ExecutionResult, Order, PaperExecutor
 from .market_data_contract import BrokerProtectiveQuote
+from .paper_execution_cost import PaperEntryCost, paper_entry_cost
 from .paper_execution_capability import (
     PaperReductionExecutionAuthority,
     _bind_gateway_reduction_execution,
@@ -122,6 +123,7 @@ class _PaperRuntimeBinding:
     reduction_execution_authority: PaperReductionExecutionAuthority
     protective_quote_producer: object
     settlement_participant: PaperRuntimeSettlementParticipant
+    executor: PaperExecutor | None = None
 
 
 @dataclass(slots=True)
@@ -905,6 +907,7 @@ class PaperReductionGateway:
             reduction_execution_authority=reduction_execution_authority,
             protective_quote_producer=protective_quote_producer,
             settlement_participant=settlement_participant,
+            executor=executor,
         )
         return None
 
@@ -1064,6 +1067,22 @@ class PaperReductionGateway:
         if (state.last_sequence, state.last_chain_hash) != context.journal_head:
             raise PaperReductionGatewayError("entry journal changed during evaluation")
         return state
+
+    def entry_execution_cost(self, *, portfolio_id: str) -> PaperEntryCost:
+        """Estimate current registered paper pricing inside the owning context."""
+        self.entry_valuation(portfolio_id=portfolio_id)
+        binding = self._bindings[portfolio_id]
+        if type(binding.executor) is not PaperExecutor:
+            raise PaperReductionGatewayError("entry cost requires a registered exact executor")
+        slippage = binding.executor.slippage_bps
+        if type(slippage) is not float or not math.isfinite(slippage) or not 0 <= slippage < 10000:
+            raise PaperReductionGatewayError("entry executor slippage is invalid")
+        context = self._entry_market_context
+        quote = next(quote for quote in context.quotes if quote.symbol == context.symbol)
+        try:
+            return paper_entry_cost(quote.price, Decimal(str(slippage)))
+        except ValueError as error:
+            raise PaperReductionGatewayError("entry executable price is invalid") from error
 
     async def entry_pending_exposure(
         self, *, portfolio_id: str, sector: str

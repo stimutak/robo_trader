@@ -202,3 +202,15 @@ def test_public_kill_switch_gate_blocks_while_private_sink_remains_narrowly_call
     authorized_result = _submit(executor, order)
     assert authorized_result.ok is True
     assert authorized_result.fill_price == 123.45
+
+
+def test_paper_fill_rounding_is_independent_of_ambient_precision_and_rounding():
+    from decimal import localcontext, ROUND_DOWN
+
+    executor = PaperExecutor(slippage_bps=0.04131)
+    with localcontext() as context:
+        context.prec = 6
+        context.rounding = ROUND_DOWN
+        result = _submit(executor, _order(price=Decimal("12.3456")))
+    assert result.ok, result.message
+    assert result.exact_fill_price == Decimal("12.3457")
