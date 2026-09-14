@@ -43,6 +43,19 @@ def _gateway(ledger, monkeypatch):
     gateway._account_order_gate = asyncio.Lock()
     gateway._database = database
     gateway._runtime_context = SimpleNamespace(runtime_contract=runtime)
+    from robo_trader.safety import SafetyJournal, SafetyRuntimeCoordinator, PaperExecutionIdentity
+    from tests.test_pr7_entry_risk_contract import NOW
+
+    journal = SafetyJournal(runtime.safety_journal_path, clock=lambda: NOW)
+    journal.initialize(
+        execution_domain_scope=runtime.safety_execution_domain_scope,
+        account_scope=runtime.safety_account_scope,
+    )
+    gateway._coordinator = SafetyRuntimeCoordinator(
+        PaperExecutionIdentity(runtime.safety_execution_domain_scope, runtime.safety_account_scope),
+        journal,
+    )
+    gateway._coordinator.start()
     gateway._client = SimpleNamespace(
         protective_quote_generation="generation-1",
         ping=AsyncMock(return_value=True),

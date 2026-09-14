@@ -1186,6 +1186,15 @@ class SafetyRuntimeCoordinator:
     def safety_journal_runtime_path_identity(self) -> Optional[Tuple[int, int]]:
         return self._journal.runtime_path_identity
 
+    def replay_for_entry(self):
+        """Read current bound journal state without issuing or clearing authority."""
+        if not self._started:
+            raise RuntimeNotStarted("entry replay requires a started coordinator")
+        return self._journal.replay(
+            expected_execution_domain_scope=self._identity.execution_domain_scope,
+            expected_account_scope=self._identity.account_scope,
+        )
+
     def start(self) -> None:
         """Replay the supplied journal and refuse unresolved prior authority."""
 

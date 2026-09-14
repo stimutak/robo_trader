@@ -68,6 +68,7 @@ from .safety import (
     TerminalOrderStatus,
     TimeInForce,
 )
+from .risk.entry_reservations import PendingEntryCapacity, summarize_entry_capacity
 from .safety.readiness import require_paper_terminal_settlement_ready
 from .safety.sqlite_identity import lexical_path_preserving_leaf
 from .safety_runtime_evidence import assemble_local_paper_safety_evidence
@@ -112,6 +113,7 @@ class _EntryMarketContext:
     ledger: PaperRiskLedgerSnapshot
     quotes: tuple[BrokerProtectiveQuote, ...]
     started_monotonic: float
+    journal_head: tuple[int, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -944,11 +946,19 @@ class PaperReductionGateway:
                     raise PaperReductionGatewayError(
                         "entry portfolio has no registered runtime binding"
                     )
+                entry_journal = await self._read_entry_journal_locked()
                 entry_ledger = await collect_paper_risk_ledger_snapshot(
                     self._database, self._runtime_context.runtime_contract
                 )
                 if portfolio_id not in dict(entry_ledger.portfolio_cash):
                     raise PaperReductionGatewayError("entry portfolio has no ledger coverage")
+                if any(
+                    event.portfolio_id not in dict(entry_ledger.portfolio_cash)
+                    for event in entry_journal.pending_entry_events
+                ):
+                    raise PaperReductionGatewayError(
+                        "pending entry portfolio has no ledger coverage"
+                    )
             current_quote: BrokerProtectiveQuote | None = None
             if symbol is not None:
                 held_symbols = (
@@ -1006,11 +1016,70 @@ class PaperReductionGateway:
                         entry_ledger,
                         quotes,
                         entry_started,
+                        (entry_journal.last_sequence, entry_journal.last_chain_hash),
                     )
+                    self.entry_valuation(portfolio_id=portfolio_id)
+                    await self._assert_entry_journal_current(self._entry_market_context)
                     self.entry_valuation(portfolio_id=portfolio_id)
                 yield current_quote
             finally:
                 self._entry_market_context = None
+
+    async def _read_entry_journal_locked(self):
+        coordinator = getattr(self, "_coordinator", None)
+        runtime = self._runtime_context.runtime_contract
+        if (
+            not self._account_order_gate.locked()
+            or type(coordinator) is not SafetyRuntimeCoordinator
+            or not coordinator.started
+            or coordinator.identity_account_scope != runtime.safety_account_scope
+            or coordinator.identity_execution_domain_scope != runtime.safety_execution_domain_scope
+            or coordinator.safety_journal_database_path
+            != lexical_path_preserving_leaf(runtime.safety_journal_path)
+        ):
+            raise PaperReductionGatewayError("entry journal coordinator binding is invalid")
+        task = asyncio.create_task(asyncio.to_thread(coordinator.replay_for_entry))
+        cancellation = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                if task.cancelled():
+                    raise
+                cancellation = error
+            except BaseException:
+                break
+        try:
+            state = task.result()
+        except Exception as error:
+            raise PaperReductionGatewayError("entry journal replay failed") from error
+        if cancellation is not None:
+            raise cancellation
+        if state.active_reservations or state.quarantined_reservations:
+            raise PaperReductionGatewayError("entry blocked by unresolved reduction authority")
+        return state
+
+    async def _assert_entry_journal_current(self, context):
+        state = await self._read_entry_journal_locked()
+        if (state.last_sequence, state.last_chain_hash) != context.journal_head:
+            raise PaperReductionGatewayError("entry journal changed during evaluation")
+        return state
+
+    async def entry_pending_exposure(
+        self, *, portfolio_id: str, sector: str
+    ) -> PendingEntryCapacity:
+        """Read current pending capacity only inside the task-owned entry context."""
+        self.entry_valuation(portfolio_id=portfolio_id)
+        context = self._entry_market_context
+        state = await self._assert_entry_journal_current(context)
+        self.entry_valuation(portfolio_id=portfolio_id)
+        return summarize_entry_capacity(
+            state,
+            portfolio_id=portfolio_id,
+            symbol=context.symbol,
+            sector=sector,
+            held_symbols=tuple(position.symbol for position in context.ledger.positions),
+        )
 
     def entry_valuation(self, *, portfolio_id: str) -> PaperEntryValuation:
         """Revalidate all held marks while the calling task owns entry serialization.

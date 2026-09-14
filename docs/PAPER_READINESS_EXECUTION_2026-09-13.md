@@ -476,3 +476,32 @@ skipped or timeouts relaxed for this change. Final containment inspection confir
 PAPER_TERMINAL_SETTLEMENT_READY=False, baseline BUY rejection, and no production
 call site for the new adapter. A fresh read-only SSH probe still timed out on
 blackm5mbp port 22; no remote changes occurred.
+
+## September 14: pending-capacity read model and gateway context
+
+Added exact pending principal totals across account/portfolio/symbol/sector,
+including inactive portfolio reservations and the union of held/pending symbols
+for slots and duplicate detection. Unresolved reservations never age out. Cash
+and daily totals are portfolio-scoped; buying power and gross are account-scoped.
+The gateway obtains bound read-only coordinator replay before collecting ledger
+and quotes, pins the journal head in its task-owned context, checks it before
+yielding and on every pending read, and revalidates valuation after asynchronous
+reads. Pending portfolios without ledger coverage and unresolved reductions block.
+Cancellation drains journal workers before releasing the account gate.
+
+Related risk/safety/gateway/routing/contract verification: 761 passed, 1 warning
+in 14.31 seconds. Independent review: 9 focused tests passed, no actionable defect.
+Tests cover exact arithmetic at precision 2, account/portfolio scoping, inactive
+reservations, held/pending slot union, task ownership, journal changes during
+quotes and after context creation, missing portfolio coverage and cancellation.
+Logs: work/pending-capacity-related.log and initial focused red/green logs.
+
+Final admission must still bind the complete decision inputs to this head and
+atomically compare it when reserving. Commission/fee allowance, executable price
+ceilings, authenticated terminal release/recovery and BUY settlement remain open.
+No adapter submission call, paper readiness change or operational launch occurred.
+
+Broader risk/safety/security/gateway/routing/settlement/status/bootstrap checks:
+1294 passed, 4 existing skips, 1 warning in 28.52 seconds
+(work/pending-capacity-safety.log). Black, changed-file Flake8 and whitespace
+checks pass. This is component integration evidence; paper readiness remains false.

@@ -1852,3 +1852,17 @@ Full post-change repository suite: 3729 passed, 4 existing skips, 19 warnings in
 containment inspection confirms readiness false, BUY rejection, and no production
 adapter invocation. Operational launch remains unverified and blocked by the
 outstanding gate evidence; no remote services or data were changed.
+
+September 14 pending-read follow-up: exact unresolved principal totals now feed a
+task-owned gateway read model with an unchanged bound journal head. Account-wide
+symbol/sector/gross/buying-power and portfolio cash/daily totals include inactive
+reservations. Held/pending symbols share one slot. Reads drain on cancellation;
+missing ledger coverage and unresolved reductions block. Related verification:
+761 passed; independent review: 9 passed. Atomic final head comparison, complete
+admission evidence, fee/price envelopes and authenticated terminal release/BUY
+settlement remain open. Gate A remains closed.
+
+Broader risk/safety/security/gateway/routing/settlement/status/bootstrap checks:
+1294 passed, 4 existing skips, 1 warning in 28.52 seconds
+(work/pending-capacity-safety.log). Black, changed-file Flake8 and whitespace
+checks pass. This is component integration evidence; paper readiness remains false.

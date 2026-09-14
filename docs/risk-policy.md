@@ -110,15 +110,37 @@ format contract and must remain compatible when the risk model evolves. The
 existing journal hash chain is not an independent rollback anchor.
 
 Before activation, bind account/portfolio identity, sector, pending totals and
-all decision evidence to the journal head under account serialization. Add the
-pending-capacity read model, authenticated atomic terminal release/recovery,
+all decision evidence to the journal head under account serialization. Add authenticated atomic terminal release/recovery,
 and final execution-capacity rechecks. The reservation record alone proves
 neither complete risk evaluation nor permission to submit an order.
+
+## Pending-capacity read model
+
+The gateway's task-owned entry context now pins the verified journal head before
+collecting ledger/quote evidence and rejects any change before yielding. Its
+asynchronous pending-exposure read replays the bound journal again and revalidates
+quote/ledger freshness after the await. Reads run off the event loop; cancellation
+drains the worker before releasing account serialization. Unresolved reductions
+and pending portfolios missing from the authenticated ledger block the context.
+
+Pending symbol, sector and buying-power totals cover every account portfolio;
+cash and daily principal totals cover the entry portfolio. Account gross pending
+notional covers all reservations, including inactive portfolios. Position slots
+count the union of held and pending symbols, so a symbol cannot consume two
+slots. Every unresolved entry contributes regardless of age. Values use exact
+Decimal arithmetic and retain the journal head for atomic reservation comparison.
+These are principal-notional totals; final cash admission must also account for
+any execution commissions or fees and enforce its executable price ceiling.
+
+The aggregation function is a non-authorizing calculation over caller-verified
+replay. The gateway supplies that provenance; constructing a totals object alone
+cannot establish authoritative risk evidence. Final reservation must atomically
+compare this context's head and bind all decision inputs, including sector.
 
 ## Remaining runtime work
 
 Owned account-wide snapshots, durable cooldown evidence, daily-risk replay and
-ingestion, and Config-level policy binding now exist. Pending-capacity aggregation and terminal release,
+ingestion, and Config-level policy binding now exist. Authenticated terminal release,
 complete market/account evidence, production verifier
 construction, final contract consumption, and baseline BUY settlement remain
 open. These components must be integrated and verified before entry authority is
