@@ -52,12 +52,7 @@ from robo_trader.safety import (
     PortfolioAllocationEvidence,
 )
 from robo_trader.safety import ReconciliationStatus as SafetyReconciliationStatus
-from robo_trader.safety import (
-    SafetyJournal,
-    SubmissionDescriptor,
-    TimeInForce,
-    TransportState,
-)
+from robo_trader.safety import SafetyJournal, SubmissionDescriptor, TimeInForce, TransportState
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
 ACCOUNT_SCOPE = "acct_v1_" + "0123456789abcdef" * 4

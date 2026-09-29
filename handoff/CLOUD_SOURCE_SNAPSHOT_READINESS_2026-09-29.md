@@ -1,5 +1,16 @@
 # Cloud source snapshot readiness — 2026-09-29
 
+**Published:** initial full checkpoint `e0f3999` is available on
+`codex/paper-rebuild-integration-2026-09-29` in
+[draft PR #130](https://github.com/stimutak/robo_trader/pull/130). GitHub visibility
+is public and native authentication/push were verified. The native owner scanned
+the 96-commit history with Gitleaks 8.30.1 (zero findings) and the selected current
+files (two deterministic test-key false positives, no real credential findings).
+The exact 91 staged blobs matched the scanned candidate. The original inventory
+and earlier restricted-environment limitations below are retained as history.
+See [current state](../CURRENT_STATE.md) for remaining CI/review issues; source
+publication does not enable Gate A or deploy the operational checkout.
+
 **Historical pre-publication inventory.** The native integration owner is publishing the complete reviewed source checkpoint on `codex/paper-rebuild-integration-2026-09-29`; see `../CURRENT_STATE.md` and that branch's PR for current publication/check status. The facts below record the earlier local-only state. The remote is `github.com/stimutak/robo_trader.git` (credential-free identity only). Local rebuild branch `codex/paper-readiness-2026-09-13` is at `cae45e0`, 96 commits ahead of fetched `origin/main` (`57f7634`) and zero behind. The working tree has 34 modified tracked files and 50 untracked files, including the two September 29 handoffs. A cloud checkout of `origin/main` is therefore not the candidate being tested locally. No Git state or operational data was changed to publish it.
 
 ## Exact current inclusion candidates

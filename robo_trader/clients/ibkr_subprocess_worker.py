@@ -34,11 +34,10 @@ os.environ["IBKR_FORCE_DISCONNECT"] = "1"
 
 from ib_async import ExecutionFilter  # noqa: E402
 
-from robo_trader.clients.exact_historical_decoder import ExactHistoricalIB as IB  # noqa: E402
-
 from robo_trader.broker_account_identity import (  # noqa: E402
     is_supported_paper_account_identifier,
 )
+from robo_trader.clients.exact_historical_decoder import ExactHistoricalIB as IB  # noqa: E402
 from robo_trader.market_data_contract import _exact_volume, _volume_text  # noqa: E402
 from robo_trader.market_hours import get_market_session  # noqa: E402
 from robo_trader.protective_quote_evidence import (  # noqa: E402

@@ -1485,6 +1485,7 @@ async def test_successful_fill_is_settled_and_journal_released_before_gateway_un
 @pytest.mark.asyncio
 async def test_gateway_ingests_daily_notional_before_journal_release(harness, monkeypatch):
     from datetime import datetime, timezone
+
     from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
     from tests.risk.test_daily_filled_notional import MutableClock, _service
 
@@ -1531,6 +1532,7 @@ async def test_daily_ingestion_failure_and_cancellation_preserve_committed_fill(
     harness, monkeypatch, failure
 ):
     from datetime import datetime, timezone
+
     from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
     from tests.risk.test_daily_filled_notional import MutableClock, _service
 

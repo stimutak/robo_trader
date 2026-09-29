@@ -13,12 +13,12 @@ import pytest
 from robo_trader.execution import LocalPaperExecutionEvidence
 from robo_trader.paper_entry_settlement import build_paper_entry_terminal_record
 from robo_trader.paper_reduction_submitter import (
-    LocalPaperTerminalOutcome,
     LocalPaperOrderStatus,
     LocalPaperOutcomeProvenance,
+    LocalPaperTerminalOutcome,
 )
 from robo_trader.paper_terminal_settlement import PaperAccountSettlementState
-from robo_trader.protective_quote_evidence import _produce_protective_quote, ProtectiveQuoteSource
+from robo_trader.protective_quote_evidence import ProtectiveQuoteSource, _produce_protective_quote
 from robo_trader.risk.entry_reservations import reserve_entry_capacity
 from robo_trader.safety import SafetyJournal
 from robo_trader.safety.entry_capacity import claim_entry_capacity
@@ -26,12 +26,12 @@ from robo_trader.safety.models import ValidationError
 from robo_trader.stop_loss_monitor import StopLossMonitor
 from tests.safety.conftest import ACCOUNT_A
 from tests.test_pr7_entry_risk_contract import (
-    NOW,
     ACTIVE_GENERATION,
+    NOW,
     _evaluate,
     _evidence,
-    _quote,
     _intent,
+    _quote,
 )
 
 

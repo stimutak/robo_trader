@@ -7,6 +7,12 @@ branch is `codex/paper-rebuild-integration-2026-09-29`. Use that branch until it
 PR is merged; after merge, use updated `main`. Do not assume an older `main`
 checkout contains this checkpoint. Record `git rev-parse HEAD` when continuing.
 
+The complete checkpoint was pushed as `e0f39996843b65ca53ed352b231bc36f78ed8565`
+and is under [draft PR #130](https://github.com/stimutak/robo_trader/pull/130).
+Publication is complete; merge is pending checks and review. The operational
+checkout was not upgraded or deployed. Subsequent commits on this same branch
+carry review/CI fixes; use its current HEAD when continuing implementation.
+
 **Gate A remains closed. Source publication does not deploy or enable trading.**
 Runtime readiness stays false, the gateway rejects BUY, IBKR connections remain
 paper/read-only, and no live broker orders are authorized. Existing operational
@@ -63,3 +69,57 @@ and a roaming laptop via private Tailscale/SSH; external-Gateway mode still need
 implementation and separate client-ID/state allocation. Another human such as
 Carolyn needs authorized account access and verified data entitlement, not merely
 a shared tunnel.
+
+## Publication checks and review configuration
+
+At the first PR run, the configured GitHub Actions ran despite draft status.
+Docker build, container structure and Compose rendering passed, as did the
+integration/performance matrices and BugBot. Full unit matrices were still
+running when this note was written. Import-order checks failed; the follow-up
+uses the same CI formatter versions and passes Black, isort and flake8 on all
+141 Python paths changed from main. Whole-repository local checks also reported
+older archive/script formatting debt outside those changed paths.
+
+Remaining failures need resolution before merge: the Claude review workflow
+returned HTTP 401 because its OAuth token was revoked and produced no review.
+The six Bandit SQL findings were independently verified as fixed-string or
+immutable allowlisted-identifier construction, with all external values bound.
+Six line-specific explanations/suppressions leave query ASTs unchanged; the same
+CI Bandit 1.9.4 command now passes with zero medium/high findings.
+TruffleHog reported one unverified URI in
+the synthetic credential-bearing `authority.example` test input used to assert
+rejection before network access. It is not an operational credential. Preserve
+the rejection test and handle that exact false positive without suppressing
+unrelated secret scanning. Its same-line fixture annotation prevents future
+HEAD-only findings, but the original `e0f3999` commit remains in the scanned PR
+history. Clearing that historical result needs an exact reviewed exception or
+an explicitly coordinated history rewrite; this publication did neither and
+did not force-push. Check the live PR for subsequent results.
+
+A separate cloud reviewer checked backtesting/maintenance at **exactly
+`e0f39996843b65ca53ed352b231bc36f78ed8565`** and found no verified new integration
+blocker or reproduced accounting duplication/look-ahead defect. Its system
+Python 3.12 run of `tests/backtesting tests/maintenance` passed **253 tests in
+5.80 seconds**. The initially bundled interpreter failed 52 maintenance checks
+because its `_sqlite3` lacks `__file__`; those passed on system Python. This is
+scoped external evidence, not a full-repository approval. After the import-order
+follow-up, the local independent reviewer confirmed all 51 files retained the
+same non-import AST and imported names, and repeated **236 focused passes**.
+
+GitHub's repository API reports `allow_auto_merge=false`; this PR has no
+auto-merge request. Main has no branch protection and no repository rulesets,
+so required review/check enforcement is not configured. Configured reviews and
+green CI therefore do **not** imply an automatic merge. External app check suites
+were queued, but that is not evidence that those apps completed a review or that
+their draft-PR policies were verified. No repository protections, secrets, or
+auto-merge settings were changed during publication.
+
+To restore the existing Claude review workflow, the account owner should run
+`claude setup-token` in a private local terminal, complete the account sign-in,
+and replace the repository Actions secret named `CLAUDE_CODE_OAUTH_TOKEN` under
+GitHub **Settings → Secrets and variables → Actions**. Do not paste the token in
+chat, a PR, or a tracked file. Then rerun the failed Claude Code Review job and
+verify that an actual review appears. This follows the
+[official action setup](https://github.com/anthropics/claude-code-action/blob/main/docs/setup.md).
+The failed run was [36597299209](https://github.com/stimutak/robo_trader/actions/runs/36597299209);
+re-running it before replacing the revoked credential cannot repair authentication.

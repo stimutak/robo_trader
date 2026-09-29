@@ -6,9 +6,9 @@ with FIFO, and persist cash/position/outbox before releasing the reservation.
 Constructing these values does none of those things.
 """
 
+import json
 from dataclasses import asdict, dataclass
 from decimal import Decimal
-import json
 
 from .paper_terminal_settlement import (
     PaperAccountSettlementState,
@@ -16,13 +16,13 @@ from .paper_terminal_settlement import (
     _strict_integral_decimal,
 )
 from .safety.models import (
+    JournalEvent,
+    JournalEventType,
     TerminalOrderStatus,
     ValidationError,
     _exact_decimal_add,
     _exact_decimal_subtract,
     _strict_decimal,
-    JournalEvent,
-    JournalEventType,
     canonical_json,
     parse_fixed_decimal,
     sha256_text,

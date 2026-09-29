@@ -1,8 +1,8 @@
 """Additive terminal kinds preserve actual committed reduction evidence."""
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import sqlite3
 
 import pytest
 
@@ -11,7 +11,7 @@ from robo_trader.database_migrations import (
     apply_exact_state_migrations,
     assert_paper_settlement_hot_schema,
 )
-from tests.test_pr2b3_terminal_settlement_persistence import _runtime_contract, _seed, _request
+from tests.test_pr2b3_terminal_settlement_persistence import _request, _runtime_contract, _seed
 
 
 @pytest.mark.asyncio
@@ -103,8 +103,8 @@ async def test_invalid_kind_rejected_by_sql(tmp_path, kind):
 
 @pytest.mark.asyncio
 async def test_reduction_outbox_and_writer_reject_relabelled_reduction(tmp_path):
-    from robo_trader.safety.models import ValidationError
     from robo_trader.database_migrations import _PAPER_REDUCTION_SETTLEMENT_TRIGGER_SQL
+    from robo_trader.safety.models import ValidationError
 
     contract = _runtime_contract(tmp_path)
     database = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)
@@ -151,6 +151,7 @@ async def test_missing_kind_constraint_rejected_by_hot_audit(tmp_path):
 
 def test_bootstrap_crosslink_rejects_unverifiable_entry_history():
     from types import SimpleNamespace
+
     from robo_trader.reconciliation.bootstrap_producer import (
         BootstrapReconciliationBlocked,
         _crosslink_safety_journal_orders,

@@ -557,10 +557,11 @@ def _crosslink_safety_journal_orders(
             raise BootstrapReconciliationBlocked("entry terminal crosslink failed") from exc
     elif entry_events:
         raise BootstrapReconciliationBlocked("entry journal lacks discriminated terminal storage")
+    # Schema presence selects one of two fixed SQL fragments; no row value is interpolated.
     reduction_filter = " WHERE settlement_kind='REDUCTION'" if "settlement_kind" in columns else ""
     settlement_rows = tuple(
         connection.execute(
-            "SELECT settlement_id,execution_domain_scope,account_scope,portfolio_id,"
+            "SELECT settlement_id,execution_domain_scope,account_scope,portfolio_id,"  # nosec B608
             "con_id,symbol,reservation_id,claim_id,order_ref,protective_quote_payload,"
             "request_fingerprint,request_payload_json,terminal_status,trade_id,"
             "database_path,database_identity,database_device,database_inode,committed_at,"

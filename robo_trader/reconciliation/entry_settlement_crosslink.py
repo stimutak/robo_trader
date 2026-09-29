@@ -1,7 +1,7 @@
 """Crosslink entry releases against committed storage in a held bootstrap snapshot."""
 
-from dataclasses import asdict
 import json
+from dataclasses import asdict
 
 from robo_trader.paper_entry_settlement import validate_stored_paper_entry_terminal_record
 from robo_trader.paper_entry_storage_replay import _read_entry_storage_on_connection

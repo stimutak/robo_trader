@@ -8,8 +8,8 @@ import pytest
 from robo_trader.paper_reduction_gateway import PaperReductionGatewayError
 from tests.risk.test_paper_entry_valuation import _gateway
 from tests.risk.test_paper_ledger_snapshot import ledger  # noqa: F401
-from tests.test_exact_state_bootstrap import _bootstrap_evidence_keys  # noqa: F401
 from tests.risk.test_pending_entry_capacity import append
+from tests.test_exact_state_bootstrap import _bootstrap_evidence_keys  # noqa: F401
 
 POLICY = (("AAPL", "Technology"), ("NVDA", "Technology"), ("TSLA", "Consumer"))
 
@@ -68,6 +68,7 @@ async def test_sector_read_rechecks_journal_and_task_ownership(ledger, monkeypat
 async def test_sector_includes_inactive_short_without_netting(ledger, monkeypatch):
     from dataclasses import fields
     from unittest.mock import AsyncMock
+
     import robo_trader.paper_reduction_gateway as module
     from robo_trader.risk.paper_ledger_snapshot import (
         PaperRiskPosition,

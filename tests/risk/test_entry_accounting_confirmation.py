@@ -9,9 +9,9 @@ import pytest
 from robo_trader.paper_entry_receipt import recover_committed_entry_receipt
 from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
 from tests.risk.test_daily_filled_notional import MutableClock, _service
-from tests.test_paper_entry_terminal_record import case  # noqa: F401
 from tests.test_paper_entry_persistence import entry_db  # noqa: F401
 from tests.test_paper_entry_storage_replay import _commit
+from tests.test_paper_entry_terminal_record import case  # noqa: F401
 
 
 async def _setup(entry_db, case, tmp_path):
@@ -88,6 +88,7 @@ async def test_confirmation_rejects_forgery_rebinding_and_staleness(
     entry_db, case, tmp_path, monkeypatch, change
 ):
     from types import SimpleNamespace
+
     from robo_trader.risk import paper_entry_accounting_confirmation as module
     from robo_trader.safety.models import ValidationError
 

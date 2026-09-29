@@ -205,7 +205,7 @@ def test_public_kill_switch_gate_blocks_while_private_sink_remains_narrowly_call
 
 
 def test_paper_fill_rounding_is_independent_of_ambient_precision_and_rounding():
-    from decimal import localcontext, ROUND_DOWN
+    from decimal import ROUND_DOWN, localcontext
 
     executor = PaperExecutor(slippage_bps=0.04131)
     with localcontext() as context:

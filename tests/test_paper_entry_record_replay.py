@@ -120,14 +120,15 @@ def test_historical_record_still_valid_after_unrelated_journal_append(case, tmp_
 def test_replay_preserves_canonical_quote_decimal_scale(case, tmp_path):
     # A protective quote's own serialization intentionally preserves its price
     # spelling; unlike accounting values, trailing zeros affect its identity.
+    import time
     from decimal import Decimal
+
     from robo_trader.paper_entry_record_replay import _quote
     from robo_trader.protective_quote_evidence import (
         ProtectiveQuoteSource,
         _produce_protective_quote,
     )
-    from tests.test_pr7_entry_risk_contract import NOW, ACTIVE_GENERATION
-    import time
+    from tests.test_pr7_entry_risk_contract import ACTIVE_GENERATION, NOW
 
     quote = _produce_protective_quote(
         case["quote_producer"],
@@ -152,6 +153,7 @@ def test_replay_preserves_canonical_quote_decimal_scale(case, tmp_path):
 def test_large_quantity_replay_ignores_ambient_precision(case, tmp_path, filled, trapped):
     from dataclasses import replace
     from decimal import Decimal, Inexact, Rounded, localcontext
+
     from robo_trader.paper_reduction_submitter import LocalPaperOrderStatus
 
     assert case["outcome"].requested_quantity == Decimal("123")

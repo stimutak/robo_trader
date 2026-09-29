@@ -6,10 +6,10 @@ As elsewhere in this process, the registry enforces implementation integrity;
 it is not isolation from hostile code sharing the interpreter.
 """
 
-from dataclasses import dataclass
-from datetime import datetime
 import json
 import weakref
+from dataclasses import dataclass
+from datetime import datetime
 
 import aiosqlite
 

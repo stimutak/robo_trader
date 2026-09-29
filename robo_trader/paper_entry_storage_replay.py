@@ -1,10 +1,10 @@
 """Read-only entry storage verification; no execution, repair, or release permit."""
 
+import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-import json
-import re
 
 from .accounting.fifo import FillSide
 from .accounting.fifo_runtime import RuntimePaperFillEvidence, verify_runtime_fill_in_transaction

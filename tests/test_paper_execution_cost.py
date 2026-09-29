@@ -1,6 +1,6 @@
 """Exact local-paper cost estimates share the executor's rounding policy."""
 
-from decimal import Decimal, localcontext, ROUND_DOWN
+from decimal import ROUND_DOWN, Decimal, localcontext
 
 import pytest
 

@@ -1,6 +1,6 @@
+import json
 from dataclasses import replace
 from decimal import Decimal, localcontext
-import json
 
 import pytest
 

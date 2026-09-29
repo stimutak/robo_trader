@@ -7,9 +7,9 @@ import pytest
 
 from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
 from tests.risk.test_daily_filled_notional import MutableClock, _service
-from tests.test_paper_entry_terminal_record import case  # noqa: F401
 from tests.test_paper_entry_persistence import entry_db  # noqa: F401
 from tests.test_paper_entry_storage_replay import _commit
+from tests.test_paper_entry_terminal_record import case  # noqa: F401
 
 
 @pytest.mark.asyncio
@@ -32,11 +32,12 @@ async def test_entry_outbox_replays_once_into_daily_account_total(entry_db, case
 
 
 async def _reduce_first(entry_db, case):
-    from dataclasses import replace
     import hashlib
     import json
-    from tests.test_pr2b3_terminal_settlement_persistence import _request, _quote_payload
+    from dataclasses import replace
+
     from tests.fifo_runtime_test_support import install_synthetic_fifo_epoch
+    from tests.test_pr2b3_terminal_settlement_persistence import _quote_payload, _request
 
     database, runtime, _ = entry_db
     portfolio = "portfolio-reduction"
@@ -165,6 +166,7 @@ async def test_entry_replay_refuses_independent_verifier_failure(entry_db, case,
 @pytest.mark.parametrize("status", ["REJECTED", "CANCELLED", "EXPIRED"])
 async def test_zero_fill_entry_counts_receipt_but_not_notional(entry_db, case, tmp_path, status):
     from dataclasses import replace
+
     from robo_trader.paper_reduction_submitter import LocalPaperOrderStatus
 
     database, runtime, _ = entry_db

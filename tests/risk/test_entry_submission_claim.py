@@ -1,17 +1,17 @@
 """Entry attempts require one durable claim without releasing capacity."""
 
-from datetime import timedelta
-from dataclasses import replace
 import json
+from dataclasses import replace
+from datetime import timedelta
 
 import pytest
 
 from robo_trader.safety import SafetyJournal
 from robo_trader.safety.entry_capacity import claim_entry_capacity, validate_entry_claim_event
 from robo_trader.safety.journal import (
-    StateTransitionError,
-    JournalIntegrityError,
     IdempotencyConflict,
+    JournalIntegrityError,
+    StateTransitionError,
 )
 from robo_trader.safety.models import JournalEventType
 from tests.risk.test_pending_entry_capacity import append, journal_at
@@ -226,6 +226,7 @@ def test_replay_rejects_hash_valid_claim_with_wrong_parent(tmp_path):
 
 def test_claim_identifier_collision_rolls_back_before_append(tmp_path, monkeypatch):
     from types import SimpleNamespace
+
     from robo_trader.safety import entry_capacity
 
     journal = journal_at(tmp_path)
@@ -257,8 +258,8 @@ def test_claim_keeps_all_pending_risk_capacity_reserved(tmp_path):
 
 def test_bootstrap_cannot_ignore_claimed_entry(tmp_path):
     from robo_trader.reconciliation.bootstrap_producer import (
-        _crosslink_safety_journal_orders,
         BootstrapReconciliationBlocked,
+        _crosslink_safety_journal_orders,
     )
 
     journal = journal_at(tmp_path)

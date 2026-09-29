@@ -5,8 +5,8 @@ from datetime import timedelta
 
 import pytest
 
-from robo_trader.safety import SafetyJournal
 from robo_trader.risk.entry_reservations import reserve_entry_capacity
+from robo_trader.safety import SafetyJournal
 from robo_trader.safety.journal import JournalError
 from tests.safety.conftest import ACCOUNT_A
 from tests.test_pr7_entry_risk_contract import NOW, _evaluate, _intent
@@ -130,8 +130,8 @@ def test_pending_entry_blocks_same_contract_reduction_authority(tmp_path):
 
 def test_bootstrap_cannot_ignore_pending_entry_capacity(tmp_path):
     from robo_trader.reconciliation.bootstrap_producer import (
-        _crosslink_safety_journal_orders,
         BootstrapReconciliationBlocked,
+        _crosslink_safety_journal_orders,
     )
 
     journal = journal_at(tmp_path / "journal.sqlite")
@@ -198,6 +198,7 @@ def test_replay_rejects_semantically_invalid_entry_payload_even_with_valid_hash_
     tmp_path, field, value
 ):
     import json
+
     from robo_trader.safety.models import canonical_json, sha256_text
 
     source = journal_at(tmp_path / "source.sqlite")

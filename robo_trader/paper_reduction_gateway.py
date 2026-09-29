@@ -21,8 +21,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
-from zoneinfo import ZoneInfo
 from typing import AsyncIterator, Awaitable, Callable, Optional
+from zoneinfo import ZoneInfo
 
 from .broker_safety_evidence import BrokerContractSafetySnapshot
 from .clients.subprocess_ibkr_client import SubprocessIBKRClient
@@ -34,12 +34,12 @@ from .market_data_contract import (
     bar_interval_seconds,
     market_data_max_age_seconds,
 )
-from .paper_execution_cost import PaperEntryCost, paper_entry_cost
 from .paper_execution_capability import (
     PaperReductionExecutionAuthority,
     _bind_gateway_reduction_execution,
     _issue_gateway_reduction_binding_capability,
 )
+from .paper_execution_cost import PaperEntryCost, paper_entry_cost
 from .paper_reduction_submitter import (
     LocalPaperOrderStatus,
     LocalPaperTerminalOutcome,
@@ -58,8 +58,10 @@ from .reconciliation.identity import (
     RuntimeSafetyContext,
     assert_validated_runtime_safety_context,
 )
-from .risk.paper_fill_accounting import PaperFillAccounting, PaperFillReplayResult
+from .risk.canonical_correlation import CanonicalCorrelation, canonical_correlation
 from .risk.entry_contract import _exact_multiply, _exact_subtract, _sector, _symbol
+from .risk.entry_reservations import PendingEntryCapacity, summarize_entry_capacity
+from .risk.paper_fill_accounting import PaperFillAccounting, PaperFillReplayResult
 from .risk.paper_ledger_snapshot import (
     PaperRiskLedgerSnapshot,
     PaperRiskLedgerSnapshotError,
@@ -75,8 +77,6 @@ from .safety import (
     TerminalOrderStatus,
     TimeInForce,
 )
-from .risk.entry_reservations import PendingEntryCapacity, summarize_entry_capacity
-from .risk.canonical_correlation import CanonicalCorrelation, canonical_correlation
 from .safety.readiness import require_paper_terminal_settlement_ready
 from .safety.sqlite_identity import lexical_path_preserving_leaf
 from .safety_runtime_evidence import assemble_local_paper_safety_evidence

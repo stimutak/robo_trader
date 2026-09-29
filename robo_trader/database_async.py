@@ -44,12 +44,6 @@ from robo_trader.database_migrations import (
     assert_exact_state_schema,
     assert_paper_settlement_hot_schema,
 )
-from robo_trader.paper_entry_receipt import (
-    PaperEntrySettlementReceipt,
-    recover_committed_entry_receipt,
-)
-from robo_trader.paper_entry_settlement import PaperEntryTerminalRecord
-from robo_trader.paper_settlement_record_dispatch import assert_reduction_only_terminal_history
 from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.financial_state_bootstrap import (
     _SAFE_ID,
@@ -76,6 +70,12 @@ from robo_trader.market_data_contract import (
     market_data_max_age_seconds,
     validate_canonical_storage_row,
 )
+from robo_trader.paper_entry_receipt import (
+    PaperEntrySettlementReceipt,
+    recover_committed_entry_receipt,
+)
+from robo_trader.paper_entry_settlement import PaperEntryTerminalRecord
+from robo_trader.paper_settlement_record_dispatch import assert_reduction_only_terminal_history
 from robo_trader.paper_terminal_settlement import (
     PaperAccountSettlementState,
     PaperTerminalSettlementConflict,
@@ -87,10 +87,10 @@ from robo_trader.paper_terminal_settlement import (
     _produce_paper_terminal_settlement_receipt,
 )
 from robo_trader.safety.models import (
-    canonical_json,
     MODEL_VERSION,
     _exact_decimal_subtract,
     _strict_decimal,
+    canonical_json,
     decimal_to_fixed,
     parse_fixed_decimal,
     parse_utc_text,
@@ -4892,6 +4892,8 @@ class AsyncTradingDatabase:
             raise ValueError("market data limit must be an integer between 1 and 10000")
         if timeframe is not None:
             bar_interval_seconds(timeframe)
+        # The relation contains only fixed table names and literal storage column keys;
+        # every caller/row value below is passed as a bound parameter.
         relation = canonical_market_data_relation()
         async with self.get_connection() as conn:
             v2_object = await (
@@ -4914,7 +4916,7 @@ class AsyncTradingDatabase:
                     ORDER BY timestamp DESC, interval_seconds ASC,
                              retrieval_timestamp DESC, con_id DESC, schema_version DESC
                     LIMIT 1
-                """
+                """  # nosec B608
                 selector_params = (symbol,)
             else:
                 selector_sql = f"""
@@ -4929,7 +4931,7 @@ class AsyncTradingDatabase:
                     ORDER BY timestamp DESC, interval_seconds ASC,
                              retrieval_timestamp DESC, con_id DESC, schema_version DESC
                     LIMIT 1
-                """
+                """  # nosec B608
                 selector_params = (symbol, timeframe)
             selected = await (await conn.execute(selector_sql, selector_params)).fetchone()
             rows = []
@@ -4961,7 +4963,7 @@ class AsyncTradingDatabase:
                       AND use_rth = ? AND what_to_show = ? AND schema_version = ?
                     ORDER BY timestamp DESC, retrieval_timestamp DESC
                     LIMIT ?
-                    """,
+                    """,  # nosec B608
                     (*identity, limit),
                 )
                 rows = await cursor.fetchall()

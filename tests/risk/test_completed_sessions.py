@@ -6,8 +6,8 @@ from decimal import Decimal
 
 import pytest
 
-from robo_trader.market_hours import regular_session_bounds
 from robo_trader.market_data_contract import CanonicalBar, CanonicalBarBatch, MarketSession
+from robo_trader.market_hours import regular_session_bounds
 from robo_trader.risk.completed_sessions import completed_regular_sessions
 from tests.risk.test_canonical_correlation import batch as base_batch
 

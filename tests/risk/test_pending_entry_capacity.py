@@ -1,7 +1,7 @@
 """Pending capacity includes durable reservations across all account portfolios."""
 
-from decimal import Decimal, localcontext
 import uuid
+from decimal import Decimal, localcontext
 
 import pytest
 
@@ -11,13 +11,13 @@ from tests.safety.conftest import ACCOUNT_A
 from tests.test_pr7_entry_risk_contract import (
     NOW,
     _contract,
-    _intent,
-    _evaluate,
-    _quote,
-    _evidence,
     _correlation,
-    _liquidity,
+    _evaluate,
+    _evidence,
+    _intent,
     _limits,
+    _liquidity,
+    _quote,
 )
 
 

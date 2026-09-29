@@ -1,5 +1,13 @@
 # Paper rebuild handoff — 2026-09-29
 
+**Publication update:** the complete source checkpoint is now on
+`codex/paper-rebuild-integration-2026-09-29` under
+[draft PR #130](https://github.com/stimutak/robo_trader/pull/130), initially
+published as `e0f3999`. Read [CURRENT_STATE.md](../CURRENT_STATE.md) for the current
+continuation branch, CI/review results and merge status. The local-only inventory
+below is the historical state before that publication, not a remaining transfer
+requirement. Main and the operational paper checkout have not been upgraded.
+
 This is a state snapshot for continuation, not an activation decision. Keep Gate A closed: `robo_trader/safety/readiness.py` remains false, the gateway BUY path still rejects, and the runner does not yet supply an entry authority. Do not infer trading readiness or profitability from passing tests.
 
 ## Exact checkout state

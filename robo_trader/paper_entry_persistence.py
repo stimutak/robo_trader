@@ -6,11 +6,11 @@ storage only: it never commits, issues a receipt, or releases journal capacity.
 Its result is plain data and is invalid as execution or release authority.
 """
 
+import json
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-import json
-import uuid
 
 from .accounting.fifo import FillSide
 from .accounting.fifo_runtime import (
@@ -23,17 +23,17 @@ from .paper_entry_settlement import (
     validate_stored_paper_entry_terminal_record,
 )
 from .paper_terminal_settlement import _exact_decimal_multiply
-from .safety.sqlite_identity import SQLitePathBinding
 from .safety.models import (
     ValidationError,
+    _exact_decimal_add,
+    _exact_decimal_subtract,
     canonical_json,
     parse_fixed_decimal,
     parse_utc_text,
     sha256_text,
     utc_to_text,
-    _exact_decimal_add,
-    _exact_decimal_subtract,
 )
+from .safety.sqlite_identity import SQLitePathBinding
 
 
 @dataclass(frozen=True)

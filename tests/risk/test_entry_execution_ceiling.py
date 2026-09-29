@@ -8,8 +8,8 @@ import pytest
 from robo_trader.paper_execution_cost import paper_entry_cost
 from robo_trader.risk.entry_contract import EntryRiskContractError
 from robo_trader.risk.entry_reservations import reserve_entry_capacity
-from tests.test_pr7_entry_risk_contract import _evaluate, _evidence, _intent
 from tests.safety.test_entry_capacity import journal_at
+from tests.test_pr7_entry_risk_contract import _evaluate, _evidence, _intent
 
 
 def test_entry_sizes_at_slippage_ceiling_without_relabeling_broker_quote():

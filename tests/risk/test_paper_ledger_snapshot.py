@@ -12,9 +12,9 @@ from robo_trader.risk.paper_ledger_snapshot import (
     assert_owned_paper_risk_ledger_snapshot,
     collect_paper_risk_ledger_snapshot,
 )
-from tests.test_exact_state_bootstrap import (
+from tests.test_exact_state_bootstrap import (  # noqa: F401 - test-only trust fixture
     _backup_receipt,
-    _bootstrap_evidence_keys,  # noqa: F401 - test-only trust fixture
+    _bootstrap_evidence_keys,
     _candidate_bundle,
     _legacy_database,
 )
@@ -118,7 +118,7 @@ async def _settle(ledger, *, filled=True):
 
     from robo_trader.paper_terminal_settlement import PaperAccountSettlementState
     from robo_trader.safety.models import OrderSide, TerminalOrderStatus, decimal_to_fixed
-    from tests.test_pr2b3_terminal_settlement_persistence import _request, _quote_payload
+    from tests.test_pr2b3_terminal_settlement_persistence import _quote_payload, _request
 
     database, runtime, candidate = ledger
     position = candidate.positions[0]
@@ -200,6 +200,7 @@ async def test_snapshot_replays_real_terminal_history_and_fifo(ledger, filled):
 @pytest.mark.asyncio
 async def test_snapshot_uses_one_transaction_during_concurrent_cash_update(ledger, monkeypatch):
     import aiosqlite
+
     from robo_trader.risk import paper_ledger_snapshot as module
 
     database, runtime, candidate = ledger
@@ -294,6 +295,7 @@ async def test_cancelled_snapshot_releases_transaction_and_requires_pool_recover
     ledger, monkeypatch
 ):
     import asyncio
+
     from robo_trader.risk import paper_ledger_snapshot as module
 
     database, runtime, _ = ledger
@@ -339,6 +341,7 @@ async def test_snapshot_rejects_foreign_account(ledger):
 @pytest.mark.asyncio
 async def test_snapshot_age_includes_time_spent_validating_history(ledger, monkeypatch):
     from datetime import datetime, timezone
+
     from robo_trader.risk import paper_ledger_snapshot as module
 
     database, runtime, _ = ledger
@@ -392,6 +395,7 @@ async def test_snapshot_preserves_authenticated_history_start(ledger):
 async def test_daily_history_uses_new_york_date_including_dst(ledger, origin, as_of, complete):
     from dataclasses import fields
     from datetime import datetime
+
     from robo_trader.risk.paper_ledger_snapshot import (
         _issue_snapshot,
         assert_complete_paper_daily_history,

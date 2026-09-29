@@ -16,10 +16,10 @@ import weakref
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from decimal import Decimal
-
-from .paper_execution_cost import LOCAL_PAPER_COMMISSION_MINOR, exact_paper_fill_price
 from enum import Enum
 from typing import TYPE_CHECKING, cast
+
+from .paper_execution_cost import LOCAL_PAPER_COMMISSION_MINOR, exact_paper_fill_price
 
 if TYPE_CHECKING:
     from .execution import PaperExecutor

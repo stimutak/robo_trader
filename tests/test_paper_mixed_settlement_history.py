@@ -13,7 +13,7 @@ from tests.risk.test_paper_entry_ledger_snapshot import bootstrapped_entry  # no
 from tests.test_exact_state_bootstrap import _bootstrap_evidence_keys  # noqa: F401
 from tests.test_paper_entry_persistence import _snapshot
 from tests.test_paper_entry_storage_replay import _commit, _corrupt
-from tests.test_pr2b3_terminal_settlement_persistence import _request, _quote_payload
+from tests.test_pr2b3_terminal_settlement_persistence import _quote_payload, _request
 
 
 async def _close_request(database, runtime):
@@ -127,9 +127,9 @@ async def test_buy_release_sell_buy_reconstructs_after_each_reopen(
     bootstrapped_entry, tmp_path, monkeypatch
 ):
     from robo_trader.paper_entry_receipt import recover_committed_entry_receipt
+    from robo_trader.paper_entry_release import release_entry_capacity
     from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
     from robo_trader.safety import SafetyJournal
-    from robo_trader.paper_entry_release import release_entry_capacity
     from tests.risk.test_daily_filled_notional import MutableClock, _service
     from tests.risk.test_paper_entry_ledger_snapshot import make_bootstrapped_entry_case
 

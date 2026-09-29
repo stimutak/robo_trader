@@ -7,8 +7,8 @@ import pytest
 
 from robo_trader.safety import SafetyJournal
 from tests.risk.test_entry_accounting_confirmation import _setup
-from tests.test_paper_entry_terminal_record import case  # noqa: F401
 from tests.test_paper_entry_persistence import entry_db  # noqa: F401
+from tests.test_paper_entry_terminal_record import case  # noqa: F401
 
 
 async def _prepared(entry_db, case, tmp_path):
@@ -154,6 +154,7 @@ async def test_copied_evidence_cannot_release(entry_db, case, tmp_path, forged):
 @pytest.mark.parametrize("mutation", ["parent", "quantity", "status", "accounting", "duplicate"])
 async def test_replay_rejects_hash_valid_invalid_release(entry_db, case, tmp_path, mutation):
     import json
+
     from robo_trader.paper_entry_release import release_entry_capacity
     from robo_trader.safety.journal import JournalIntegrityError
 
@@ -217,8 +218,8 @@ async def test_replay_rejects_hash_valid_invalid_release(entry_db, case, tmp_pat
 @pytest.mark.asyncio
 async def test_release_key_cannot_be_reused_by_another_journal_path(entry_db, case, tmp_path):
     from robo_trader.paper_entry_release import release_entry_capacity
-    from robo_trader.safety.models import JournalEventType
     from robo_trader.safety.journal import IdempotencyConflict
+    from robo_trader.safety.models import JournalEventType
 
     receipt, accounting, confirmation, journal, head = await _prepared(entry_db, case, tmp_path)
     event = release_entry_capacity(
@@ -283,6 +284,7 @@ async def test_retry_rejects_hash_valid_release_that_misstates_actual_fill(
 @pytest.mark.asyncio
 async def test_release_is_exact_under_small_decimal_context(entry_db, case, tmp_path):
     from decimal import localcontext
+
     from robo_trader.paper_entry_release import release_entry_capacity
 
     receipt, accounting, confirmation, journal, head = await _prepared(entry_db, case, tmp_path)
@@ -303,6 +305,7 @@ def rewrite_release_as_zero_fill(journal, event):
     """Corrupt only a temporary test journal while keeping its hash chain valid."""
     import json
     import sqlite3
+
     from robo_trader.safety.models import canonical_json, sha256_text, utc_to_text
 
     payload = json.loads(event.payload_json)

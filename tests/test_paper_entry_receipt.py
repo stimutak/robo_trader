@@ -1,19 +1,19 @@
 """Only an independent committed read may produce an entry receipt."""
 
-from datetime import datetime, timezone
 import copy
+from datetime import datetime, timezone
 
 import pytest
 
-from robo_trader.paper_entry_receipt import (
-    recover_committed_entry_receipt,
-    assert_owned_entry_receipt,
-)
 from robo_trader.paper_entry_persistence import stage_entry_settlement
+from robo_trader.paper_entry_receipt import (
+    assert_owned_entry_receipt,
+    recover_committed_entry_receipt,
+)
 from robo_trader.paper_entry_settlement import build_paper_entry_terminal_record
 from robo_trader.safety.models import ValidationError
+from tests.test_paper_entry_persistence import _snapshot, entry_db  # noqa: F401
 from tests.test_paper_entry_terminal_record import case  # noqa: F401
-from tests.test_paper_entry_persistence import entry_db, _snapshot  # noqa: F401
 
 
 @pytest.mark.asyncio
@@ -55,8 +55,9 @@ async def test_uncommitted_row_cannot_produce_receipt_then_commit_can(entry_db, 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["replace", "deepcopy", "pickle", "record_mutation"])
 async def test_receipt_copies_and_mutations_cannot_pass_ownership(entry_db, case, operation):
-    from dataclasses import replace
     import pickle
+    from dataclasses import replace
+
     from tests.test_paper_entry_storage_replay import _commit
 
     database, runtime, journal = entry_db
@@ -80,6 +81,7 @@ async def test_receipt_copies_and_mutations_cannot_pass_ownership(entry_db, case
 @pytest.mark.asyncio
 async def test_recovery_connection_is_sqlite_read_only(entry_db, case, monkeypatch):
     import sqlite3
+
     import robo_trader.paper_entry_receipt as module
     from tests.test_paper_entry_storage_replay import _commit
 
@@ -105,6 +107,7 @@ async def test_recovery_connection_is_sqlite_read_only(entry_db, case, monkeypat
 @pytest.mark.asyncio
 async def test_receipt_cannot_transfer_to_other_scope_or_replaced_file(entry_db, case, tmp_path):
     from dataclasses import replace
+
     from tests.test_paper_entry_storage_replay import _commit
 
     database, runtime, journal = entry_db
@@ -132,6 +135,7 @@ async def test_receipt_cannot_transfer_to_other_scope_or_replaced_file(entry_db,
 @pytest.mark.asyncio
 async def test_record_shaped_object_cannot_replace_receipt_record(entry_db, case):
     from types import SimpleNamespace
+
     from tests.test_paper_entry_storage_replay import _commit
 
     database, runtime, journal = entry_db

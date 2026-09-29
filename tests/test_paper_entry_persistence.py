@@ -7,12 +7,12 @@ import pytest
 import pytest_asyncio
 
 from robo_trader.database_async import AsyncTradingDatabase
-from robo_trader.paper_entry_settlement import build_paper_entry_terminal_record
 from robo_trader.paper_entry_persistence import stage_entry_settlement
+from robo_trader.paper_entry_settlement import build_paper_entry_terminal_record
 from robo_trader.safety import SafetyJournal
+from tests.fifo_runtime_test_support import install_synthetic_fifo_epoch
 from tests.test_paper_entry_terminal_record import case  # noqa: F401
 from tests.test_pr2b3_terminal_settlement_persistence import _runtime_contract
-from tests.fifo_runtime_test_support import install_synthetic_fifo_epoch
 
 
 @pytest_asyncio.fixture
@@ -153,6 +153,7 @@ async def test_stage_failure_rolls_back_even_if_outer_caller_commits(
 async def test_zero_fill_stages_only_terminal_account_lineage(entry_db, case, status):
     from dataclasses import replace
     from decimal import Decimal
+
     from robo_trader.paper_reduction_submitter import LocalPaperOrderStatus
 
     database, runtime, journal = entry_db
@@ -307,6 +308,7 @@ async def test_price_improvement_updates_cash_pnl_and_compatibility_equity(entry
 async def test_closed_position_reentry_checks_retained_metadata(entry_db, case, legacy_cost):
     from dataclasses import replace
     from decimal import Decimal
+
     from robo_trader.safety.models import ValidationError
 
     database, runtime, journal = entry_db
@@ -369,6 +371,7 @@ async def test_closed_position_reentry_checks_retained_metadata(entry_db, case, 
 async def test_invalid_storage_context_cannot_mutate(entry_db, case, tmp_path, failure):
     from dataclasses import replace
     from datetime import timedelta
+
     from robo_trader.safety.models import ValidationError
 
     database, runtime, journal = entry_db
@@ -406,6 +409,7 @@ async def test_invalid_storage_context_cannot_mutate(entry_db, case, tmp_path, f
 @pytest.mark.asyncio
 async def test_path_replacement_during_stage_rolls_back_before_return(entry_db, case, tmp_path):
     import sqlite3
+
     from robo_trader.safety.sqlite_identity import SQLiteIdentityError
 
     database, runtime, journal = entry_db

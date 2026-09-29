@@ -114,6 +114,7 @@ def test_mutated_or_stale_batches_fail():
 
 def test_coefficient_rounding_is_upward_and_absolute():
     from fractions import Fraction
+
     from robo_trader.risk.canonical_correlation import _upper_correlation
 
     left = tuple(map(Fraction, (1, 0, -1)))
@@ -156,6 +157,7 @@ def test_mismatched_or_incomplete_window_is_rejected(change):
 
 def test_session_boundary_return_is_excluded():
     from dataclasses import replace
+
     from robo_trader.market_data_contract import MarketSession, MarketSessionPolicy
 
     candidate = batch()

@@ -12,8 +12,8 @@ to avoid event loop starvation in busy async environments.
 """
 
 import asyncio
-import hmac
 import hashlib
+import hmac
 import inspect
 import json
 import math

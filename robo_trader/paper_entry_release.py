@@ -1,9 +1,9 @@
 """Bind owned entry settlement/accounting proofs to durable safety-journal release."""
 
-from dataclasses import asdict
 import json
-from pathlib import Path
 import re
+from dataclasses import asdict
+from pathlib import Path
 
 from .paper_entry_receipt import assert_owned_entry_receipt
 from .paper_terminal_settlement import _exact_decimal_multiply
@@ -25,8 +25,9 @@ def release_entry_capacity(journal, receipt, confirmation, *, database, accounti
     confirmation; an exact already-committed release returns its original event.
     The final gateway must hold its account lock over confirmation and release.
     """
-    from .safety.journal import SafetyJournal, StateTransitionError
     from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
+
+    from .safety.journal import SafetyJournal, StateTransitionError
 
     if type(journal) is not SafetyJournal or type(accounting) is not PaperFillAccounting:
         raise StateTransitionError("entry release requires exact journal and accounting producers")

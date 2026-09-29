@@ -1,7 +1,7 @@
 """Remote approvals must be fresh, exact, and fail closed on transport errors."""
 
-import json
 import http.client
+import json
 import socket
 import ssl
 import threading
@@ -140,7 +140,7 @@ def test_transport_failure_is_sanitized_and_closed(transport):
     "endpoint",
     [
         "http://authority.example/v1/verify",
-        "https://user:pass@authority.example/v1/verify",
+        "https://user:pass@authority.example/v1/verify",  # trufflehog:ignore - synthetic rejection fixture; no network call
         "https://authority.example/v1/verify?token=secret",
         "https://authority.example/#fragment",
         "https://authority.example/\nheader",

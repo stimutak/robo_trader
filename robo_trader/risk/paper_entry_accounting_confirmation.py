@@ -5,14 +5,14 @@ Identity sealing protects implementation integrity, not against hostile code
 sharing this Python interpreter. The final gateway must retain its account lock.
 """
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from decimal import Decimal
 import json
 import math
 import threading
 import time
 import weakref
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from robo_trader.paper_entry_receipt import assert_owned_entry_receipt

@@ -1,17 +1,17 @@
 """Strict read validation of proposed entry records; never execution authority."""
 
-from dataclasses import dataclass, fields, asdict
-from datetime import datetime
-from decimal import Decimal
 import json
 import math
+from dataclasses import asdict, dataclass, fields
+from datetime import datetime
+from decimal import Decimal
 
 from .execution import LocalPaperExecutionEvidence
 from .paper_entry_settlement import _build_paper_entry_terminal_record
 from .paper_reduction_submitter import (
-    LocalPaperTerminalOutcome,
     LocalPaperOrderStatus,
     LocalPaperOutcomeProvenance,
+    LocalPaperTerminalOutcome,
 )
 from .paper_terminal_settlement import (
     PaperAccountSettlementState,
@@ -23,11 +23,11 @@ from .safety.models import (
     JournalEvent,
     JournalEventType,
     ValidationError,
+    _strict_decimal,
     canonical_json,
     parse_fixed_decimal,
     parse_utc_text,
     sha256_text,
-    _strict_decimal,
 )
 
 

@@ -1,6 +1,6 @@
 # Paper recovery and Gate A status — 2026-09-29
 
-This is the assignment and evidence tracker. A completed legacy startup preflight is **not** completion of rebuild Gate A. All execution discussed here is local simulated paper fills; no IBKR broker order placement is authorized.
+This is the assignment and evidence tracker. Operational watchdog source and historical relaunch links refer to the separate original Mac checkout; those fixes are not transplanted into this rebuild snapshot. A completed legacy startup preflight is **not** completion of rebuild Gate A. All execution discussed here is local simulated paper fills; no IBKR broker order placement is authorized.
 
 **Current session handoff:** [2026-09-29 recovery handoff](../handoff/HANDOFF_2026-09-29_recovery.md). It supersedes the 2026-09-13 handoff's `--force` relaunch recipe for current operations. The underlying historical handoff remains intact.
 
@@ -8,7 +8,7 @@ This is the assignment and evidence tracker. A completed legacy startup prefligh
 
 ## Checkouts and authoritative plans
 
-- Operational checkout: `/Users/oliver/Projects/robo_trader`, `feature/paper-relaunch-m5`, inspected at `a09b567`. See [paper relaunch handoff](../handoff/HANDOFF_2026-09-13_paper_relaunch.md).
+- Operational checkout: `/Users/oliver/Projects/robo_trader`, `feature/paper-relaunch-m5`, inspected at `a09b567`. See [paper relaunch handoff](/Users/oliver/Projects/robo_trader/handoff/HANDOFF_2026-09-13_paper_relaunch.md).
 - Rebuild checkout: `/Users/oliver/Documents/Codex/2026-09-13/prior-conversation-with-codex-conversation-role/work/robo_trader`, `codex/paper-readiness-2026-09-13`. Its owner handles rebuild tests and runtime work. Do not merge or deploy this unfinished checkout as a startup repair.
 - Gate A authority: rebuild [remediation plan][gate-plan] and [execution record][execution]. The latter explicitly names the remediation plan as canonical. The map below tracks its Gate A requirements; this tracker does not replace the source specifications or count a missing assignment as completed work.
 
@@ -86,7 +86,7 @@ Utility tests should cover discrepancies, stale/missing/mismatched quotes, exist
 
 ### Implemented and verified
 
-Changed [watchdog](../scripts/watchdog.sh), new [read-only guard](../scripts/watchdog_preflight.py), and new [focused tests](../tests/test_watchdog_safety_restart.py). The helper reuses the four existing non-Gateway checks, resolves `.env` risk values, and writes neither DB rows nor `.preflight_last_ok`. Its process has a 15-second hard timeout. Missing/malformed configuration, helper failures, unexpected output, and BLOCK results deny automatic restart before process kills.
+Changed [watchdog](/Users/oliver/Projects/robo_trader/scripts/watchdog.sh), new [read-only guard](/Users/oliver/Projects/robo_trader/scripts/watchdog_preflight.py), and new [focused tests](/Users/oliver/Projects/robo_trader/tests/test_watchdog_safety_restart.py). The helper reuses the four existing non-Gateway checks, resolves `.env` risk values, and writes neither DB rows nor `.preflight_last_ok`. Its process has a 15-second hard timeout. Missing/malformed configuration, helper failures, unexpected output, and BLOCK results deny automatic restart before process kills.
 
 While a block persists, supervision rechecks at 60 seconds (including outside trading hours once blocked), alerts on changed reasons, and reminds hourly. It preserves the prior failure counter without inflating it. Clear checks allow normal recovery during trading hours; a manually recovered runner with fresh activity resumes normal supervision. Ordinary failed launches still back off to 300 seconds after escalation. A nonzero launcher result or merely surviving stalled PID does not establish recovery.
 

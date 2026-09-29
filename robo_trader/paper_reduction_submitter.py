@@ -11,13 +11,13 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import (
+    MAX_EMAX,
+    MIN_EMIN,
     Context,
     Decimal,
     DecimalException,
     Inexact,
     InvalidOperation,
-    MAX_EMAX,
-    MIN_EMIN,
     Overflow,
 )
 from enum import Enum

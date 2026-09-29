@@ -172,6 +172,7 @@ def test_reentry_preserves_closed_history_until_a_new_fill():
 
 def test_buy_close_and_reentry_agree_with_fifo_realized_pnl():
     from datetime import timedelta
+
     from robo_trader.accounting.fifo import FillSide
     from robo_trader.accounting.fifo_runtime import append_runtime_fill_in_transaction
     from tests.accounting.test_fifo_runtime_settlement import _connection, _evidence

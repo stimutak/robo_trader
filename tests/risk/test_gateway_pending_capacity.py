@@ -8,8 +8,8 @@ import pytest
 from robo_trader.paper_reduction_gateway import PaperReductionGatewayError
 from tests.risk.test_paper_entry_valuation import _gateway
 from tests.risk.test_paper_ledger_snapshot import ledger  # noqa: F401
-from tests.test_exact_state_bootstrap import _bootstrap_evidence_keys  # noqa: F401
 from tests.risk.test_pending_entry_capacity import append
+from tests.test_exact_state_bootstrap import _bootstrap_evidence_keys  # noqa: F401
 
 
 @pytest.mark.asyncio
@@ -86,6 +86,7 @@ async def test_pending_and_held_same_symbol_share_one_position_slot(ledger, monk
 @pytest.mark.asyncio
 async def test_cancellation_drains_journal_read_before_releasing_account_gate(ledger, monkeypatch):
     import threading
+
     from robo_trader.safety import SafetyRuntimeCoordinator
 
     gateway, _, _, _ = _gateway(ledger, monkeypatch)

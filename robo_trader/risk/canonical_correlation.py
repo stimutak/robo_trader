@@ -4,12 +4,12 @@ Callers own transport provenance, expected account coverage and window policy.
 This module never mints risk evidence or treats a constructed batch as authority.
 """
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from fractions import Fraction
-import hashlib
-import json
 from math import isqrt
 from zoneinfo import ZoneInfo
 

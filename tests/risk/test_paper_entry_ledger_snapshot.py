@@ -14,25 +14,25 @@ import pytest_asyncio
 from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.execution import LocalPaperExecutionEvidence
 from robo_trader.paper_reduction_submitter import (
-    LocalPaperTerminalOutcome,
     LocalPaperOrderStatus,
     LocalPaperOutcomeProvenance,
+    LocalPaperTerminalOutcome,
 )
-from robo_trader.protective_quote_evidence import _produce_protective_quote, ProtectiveQuoteSource
+from robo_trader.protective_quote_evidence import ProtectiveQuoteSource, _produce_protective_quote
 from robo_trader.risk.entry_reservations import reserve_entry_capacity
 from robo_trader.risk.paper_ledger_snapshot import (
-    collect_paper_risk_ledger_snapshot,
     PaperRiskLedgerSnapshotError,
+    collect_paper_risk_ledger_snapshot,
 )
 from robo_trader.safety import SafetyJournal
 from robo_trader.safety.entry_capacity import claim_entry_capacity
 from robo_trader.stop_loss_monitor import StopLossMonitor
 from tests import test_pr7_entry_risk_contract as risk_fixture
+from tests.test_exact_state_bootstrap import _legacy_database  # noqa: F401
 from tests.test_exact_state_bootstrap import (
+    _backup_receipt,
     _bootstrap_evidence_keys,
     _candidate_bundle,
-    _backup_receipt,
-    _legacy_database,  # noqa: F401
 )
 from tests.test_paper_entry_persistence import _snapshot
 from tests.test_paper_entry_storage_replay import _commit

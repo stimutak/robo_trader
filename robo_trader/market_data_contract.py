@@ -462,11 +462,12 @@ CANONICAL_STORAGE_KEYS = frozenset(
 
 def canonical_market_data_relation(*, include_v2: bool = True) -> str:
     """A fixed-identifier SQL relation preserving both storage representations."""
+    # Column identifiers come only from the immutable, literal key set above.
     columns = ", ".join(sorted(CANONICAL_STORAGE_KEYS))
-    legacy = f"SELECT {columns}, 'unknown' AS volume_unit FROM canonical_market_data"
+    legacy = f"SELECT {columns}, 'unknown' AS volume_unit FROM canonical_market_data"  # nosec B608
     if not include_v2:
         return f"({legacy})"
-    current = f"SELECT {columns}, volume_unit FROM canonical_market_data_v2"
+    current = f"SELECT {columns}, volume_unit FROM canonical_market_data_v2"  # nosec B608
     return f"({legacy} UNION ALL {current})"
 
 

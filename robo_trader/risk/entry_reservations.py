@@ -5,17 +5,15 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from robo_trader.safety.entry_capacity import validate_entry_capacity_event
-from robo_trader.safety.models import ReplayState, parse_fixed_decimal
-
 from robo_trader.safety.journal import ReservationConflict, SafetyJournal
-from robo_trader.safety.models import utc_to_text
+from robo_trader.safety.models import ReplayState, parse_fixed_decimal, utc_to_text
 
 from .entry_contract import (
     EntrySide,
-    _sector,
-    _identifier,
-    _symbol,
     _exact_subtract,
+    _identifier,
+    _sector,
+    _symbol,
     assert_and_consume_risk_decision,
 )
 

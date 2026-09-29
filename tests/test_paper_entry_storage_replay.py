@@ -8,8 +8,8 @@ from robo_trader.paper_entry_persistence import stage_entry_settlement
 from robo_trader.paper_entry_settlement import build_paper_entry_terminal_record
 from robo_trader.paper_entry_storage_replay import read_entry_settlement
 from robo_trader.safety.models import ValidationError
+from tests.test_paper_entry_persistence import _snapshot, entry_db  # noqa: F401
 from tests.test_paper_entry_terminal_record import case  # noqa: F401
-from tests.test_paper_entry_persistence import entry_db, _snapshot  # noqa: F401
 
 
 async def _commit(entry_db, case):
@@ -152,6 +152,7 @@ async def test_changed_storage_rejects_without_repair(entry_db, case, table, sql
 async def test_zero_fill_recovery_never_claims_a_trade(entry_db, case, status):
     from dataclasses import replace
     from decimal import Decimal
+
     from robo_trader.paper_reduction_submitter import LocalPaperOrderStatus
 
     database, runtime, journal = entry_db
@@ -182,8 +183,9 @@ async def test_zero_fill_recovery_never_claims_a_trade(entry_db, case, status):
 
 @pytest.mark.asyncio
 async def test_recovery_works_with_reopened_database_and_no_quote_producer(entry_db, case):
-    from robo_trader.database_async import AsyncTradingDatabase
     import gc
+
+    from robo_trader.database_async import AsyncTradingDatabase
 
     database, runtime, journal = entry_db
     record, original = await _commit(entry_db, case)

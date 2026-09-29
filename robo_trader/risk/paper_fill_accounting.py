@@ -11,20 +11,20 @@ import asyncio
 import json
 from contextlib import aclosing
 from dataclasses import dataclass
-from decimal import Decimal
 from datetime import datetime
+from decimal import Decimal
 from typing import Mapping
 
 from robo_trader.config import RuntimeContract
 from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.paper_entry_receipt import PaperEntrySettlementReceipt, assert_owned_entry_receipt
-from robo_trader.safety.journal import SafetyJournal
-from robo_trader.safety.models import parse_fixed_decimal, parse_utc_text
 from robo_trader.paper_terminal_settlement import (
     PaperTerminalSettlementReceipt,
     assert_producer_owned_paper_terminal_settlement_receipt,
 )
 from robo_trader.risk.filled_notional import DailyFilledNotional, ExecutedFill, FillSide
+from robo_trader.safety.journal import SafetyJournal
+from robo_trader.safety.models import parse_fixed_decimal, parse_utc_text
 
 
 class PaperFillAccountingError(RuntimeError):

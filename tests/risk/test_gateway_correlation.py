@@ -7,14 +7,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from robo_trader.paper_reduction_gateway import PaperReductionGatewayError
 from robo_trader.clients.subprocess_ibkr_client import IBKRTransportPoisonedError
-from tests.risk.test_paper_entry_valuation import _gateway
-from tests.risk.test_paper_ledger_snapshot import ledger  # noqa: F401
-from tests.test_exact_state_bootstrap import _bootstrap_evidence_keys  # noqa: F401
-from tests.risk.test_pending_entry_capacity import append
+from robo_trader.paper_reduction_gateway import PaperReductionGatewayError
 from tests.canonical_batch_test_support import bind_test_canonical_batch
 from tests.risk.test_canonical_correlation import batch as make_batch
+from tests.risk.test_paper_entry_valuation import _gateway
+from tests.risk.test_paper_ledger_snapshot import ledger  # noqa: F401
+from tests.risk.test_pending_entry_capacity import append
+from tests.test_exact_state_bootstrap import _bootstrap_evidence_keys  # noqa: F401
 
 
 def setup(ledger, monkeypatch):
@@ -121,6 +121,7 @@ async def test_correlation_read_is_task_owned(ledger, monkeypatch):
 @pytest.mark.asyncio
 async def test_history_expiring_during_final_await_is_rejected(ledger, monkeypatch):
     from datetime import timedelta
+
     import robo_trader.paper_reduction_gateway as module
 
     gateway, batches = setup(ledger, monkeypatch)

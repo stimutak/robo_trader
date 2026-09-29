@@ -1,6 +1,6 @@
 # Handoff — paper recovery and Gate A rebuild (2026-09-29)
 
-This is the current handoff for the operational M5 checkout. The [2026-09-13 relaunch handoff](HANDOFF_2026-09-13_paper_relaunch.md) remains the historical migration and launch record, but its `--force` relaunch recipe is **not** a safe next step given the discrepancies found today. Detailed assignment and Gate A evidence live in [the recovery tracker](../docs/PAPER_RECOVERY_STATUS_2026-09-29.md). The rebuild checkout has its own [2026-09-29 handoff](HANDOFF_2026-09-29_paper_rebuild.md).
+This is the current handoff for the operational M5 checkout. The [2026-09-13 relaunch handoff](/Users/oliver/Projects/robo_trader/handoff/HANDOFF_2026-09-13_paper_relaunch.md) remains the historical migration and launch record, but its `--force` relaunch recipe is **not** a safe next step given the discrepancies found today. Detailed assignment and Gate A evidence live in [the recovery tracker](../docs/PAPER_RECOVERY_STATUS_2026-09-29.md). The rebuild checkout has its own [2026-09-29 handoff](HANDOFF_2026-09-29_paper_rebuild.md).
 
 ## Safe stopping point, observed 12:14 ET
 

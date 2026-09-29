@@ -43,7 +43,7 @@ def _gateway(ledger, monkeypatch):
     gateway._account_order_gate = asyncio.Lock()
     gateway._database = database
     gateway._runtime_context = SimpleNamespace(runtime_contract=runtime)
-    from robo_trader.safety import SafetyJournal, SafetyRuntimeCoordinator, PaperExecutionIdentity
+    from robo_trader.safety import PaperExecutionIdentity, SafetyJournal, SafetyRuntimeCoordinator
     from tests.test_pr7_entry_risk_contract import NOW
 
     journal = SafetyJournal(runtime.safety_journal_path, clock=lambda: NOW)
@@ -197,6 +197,7 @@ async def test_entry_context_rejects_unregistered_account_portfolio(ledger, monk
 @pytest.mark.asyncio
 async def test_entry_valuation_rejects_expired_ledger_read(ledger, monkeypatch):
     from datetime import datetime, timedelta, timezone
+
     import robo_trader.paper_reduction_gateway as module
 
     gateway, _, _, _ = _gateway(ledger, monkeypatch)
@@ -216,6 +217,7 @@ async def test_entry_valuation_rejects_expired_ledger_read(ledger, monkeypatch):
 @pytest.mark.asyncio
 async def test_inactive_cash_and_short_positions_remain_in_account_valuation(ledger, monkeypatch):
     from dataclasses import fields
+
     import robo_trader.paper_reduction_gateway as module
     from robo_trader.risk.paper_ledger_snapshot import (
         PaperRiskPosition,
@@ -257,6 +259,7 @@ async def test_entry_ledger_age_cannot_be_hidden_by_wall_clock_shift(ledger, mon
 @pytest.mark.asyncio
 async def test_gateway_prepares_replay_before_entry_daily_notional(ledger, monkeypatch):
     from datetime import datetime, timezone
+
     from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
     from tests.risk.test_daily_filled_notional import MutableClock, _service
     from tests.risk.test_paper_ledger_snapshot import _settle
@@ -330,6 +333,7 @@ async def test_cancelled_replay_cannot_leave_accounting_ready(ledger, monkeypatc
 @pytest.mark.asyncio
 async def test_bootstrap_day_replay_does_not_prove_complete_daily_history(ledger, monkeypatch):
     from datetime import datetime, timezone
+
     from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
     from tests.risk.test_daily_filled_notional import MutableClock, _service
 
@@ -350,6 +354,7 @@ async def test_bootstrap_day_replay_does_not_prove_complete_daily_history(ledger
 async def test_complete_day_total_is_bound_to_gateway_read_time(ledger, monkeypatch):
     from dataclasses import fields
     from datetime import datetime, timedelta, timezone
+
     import robo_trader.paper_reduction_gateway as module
     from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
     from robo_trader.risk.paper_ledger_snapshot import (
@@ -404,6 +409,7 @@ async def test_entry_admission_history_comes_from_verified_account_snapshot(ledg
 @pytest.mark.asyncio
 async def test_nonzero_terminal_fill_extends_symbol_cooldown(ledger, monkeypatch):
     from datetime import timedelta
+
     from tests.risk.test_paper_ledger_snapshot import _settle
 
     gateway, _, _, _ = _gateway(ledger, monkeypatch)
@@ -417,6 +423,7 @@ async def test_nonzero_terminal_fill_extends_symbol_cooldown(ledger, monkeypatch
 @pytest.mark.asyncio
 async def test_rejected_zero_fill_does_not_extend_cooldown(ledger, monkeypatch):
     from datetime import timedelta
+
     from tests.risk.test_paper_ledger_snapshot import _settle
 
     gateway, _, _, _ = _gateway(ledger, monkeypatch)
@@ -431,6 +438,7 @@ async def test_rejected_zero_fill_does_not_extend_cooldown(ledger, monkeypatch):
 async def test_symbol_exposure_and_cooldown_include_other_portfolios(ledger, monkeypatch):
     from dataclasses import fields
     from datetime import timedelta
+
     import robo_trader.paper_reduction_gateway as module
     from robo_trader.risk.paper_ledger_snapshot import (
         PaperRiskFill,
