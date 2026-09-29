@@ -3,6 +3,7 @@ import json
 import queue
 import threading
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, localcontext
 from types import SimpleNamespace
 
 import pytest
@@ -606,6 +607,7 @@ def _valid_historical_data(symbol="AAPL", contract_symbol="AAPL", con_id=265598)
     now = datetime.now(timezone.utc).isoformat()
     return {
         "bars": [],
+        "bar_schema_version": 2,
         "requested_symbol": symbol,
         "qualified_contract": {
             "symbol": contract_symbol,
@@ -703,8 +705,25 @@ async def test_historical_validation_poisons_exact_generation_before_stop(monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "volume, expected_volume",
+    [
+        (10, 10),
+        (1.0000000000000001e18, None),
+        (Decimal("10.000"), 10),
+        (0, 0),
+        (Decimal("123456789012345678901234567890"), 123456789012345678901234567890),
+        (Decimal("10.25"), Decimal("10.25")),
+        (True, None),
+        (-1, None),
+        (Decimal("NaN"), None),
+        (Decimal("Infinity"), None),
+    ],
+)
 async def test_worker_historical_response_uses_qualified_identity_and_aware_times(
     monkeypatch,
+    volume,
+    expected_volume,
 ):
     contract = SimpleNamespace(
         symbol="AAPL",
@@ -722,7 +741,7 @@ async def test_worker_historical_response_uses_qualified_identity_and_aware_time
         high=101,
         low=99,
         close=100.5,
-        volume=10,
+        volume=volume,
         average=100.2,
         barCount=3,
     )
@@ -743,8 +762,17 @@ async def test_worker_historical_response_uses_qualified_identity_and_aware_time
             return [bar]
 
     monkeypatch.setattr(worker, "ib", FakeIB())
-    result = await worker.handle_get_historical_bars({"symbol": "AAPL"})
+    with localcontext() as context:
+        context.prec = 6
+        result = await worker.handle_get_historical_bars({"symbol": "AAPL"})
+    if expected_volume is None:
+        assert result["status"] == "error"
+        assert "volume" in result["error"].lower()
+        return
     assert result["status"] == "success"
+    assert Decimal(result["data"]["bars"][0]["volume"]) == expected_volume
+    assert type(result["data"]["bars"][0]["volume"]) is str
+    assert result["data"]["bar_schema_version"] == 2
     assert result["data"]["qualified_contract"]["con_id"] == 265598
     assert datetime.fromisoformat(result["data"]["broker_timestamp"]).utcoffset() is not None
     assert datetime.fromisoformat(result["data"]["bars"][0]["date"]).utcoffset() is not None
@@ -1380,3 +1408,21 @@ async def test_historical_transport_rejects_alias_identity_and_daily_bars():
     with pytest.raises(ValueError, match="only intraday datetime"):
         await fresh.get_historical_bars("AAPL", bar_size="1 day")
     assert not fresh_process.stdin.writes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [None, 1, True, "2"])
+async def test_historical_response_requires_exact_decimal_schema(version):
+    data = _valid_historical_data()
+    if version is None:
+        data.pop("bar_schema_version", None)
+    else:
+        data["bar_schema_version"] = version
+
+    def handler(process, request):
+        _feed(process, _response(request, data=data))
+
+    client, _, generation = _attach_client(handler)
+    with pytest.raises(IBKRTransportPoisonedError, match="schema"):
+        await client.get_historical_bars("AAPL")
+    assert generation.poisoned_reason is not None

@@ -709,7 +709,7 @@ async def test_offline_atomic_bootstrap_migrates_raw_legacy_schema_in_one_commit
     with sqlite3.connect(path) as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM rt_schema_migrations " "WHERE component='paper_exact_state'"
-        ).fetchone() == (3,)
+        ).fetchone() == (4,)
         assert connection.execute("SELECT COUNT(*) FROM paper_state_bootstraps").fetchone() == (1,)
         assert connection.execute(
             "SELECT COUNT(*) FROM exact_bootstrap_evidence_consumptions"

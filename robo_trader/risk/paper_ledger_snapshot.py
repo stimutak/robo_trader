@@ -21,9 +21,12 @@ from robo_trader.accounting.fifo import FifoLedger
 from robo_trader.config import RuntimeContract
 from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.database_migrations import assert_paper_settlement_hot_schema
+from robo_trader.paper_entry_settlement import PaperEntryTerminalRecord
+from robo_trader.paper_entry_storage_replay import read_entry_settlement
+from robo_trader.safety.journal import SafetyJournal
 from robo_trader.database_validator import DatabaseValidator
 from robo_trader.reconciliation.runtime_integration import _read_validated_bootstrap_candidates
-from robo_trader.safety.models import parse_fixed_decimal
+from robo_trader.safety.models import parse_fixed_decimal, parse_utc_text
 from robo_trader.safety.sqlite_identity import SQLiteIdentityError, SQLitePathBinding
 
 
@@ -247,14 +250,118 @@ def _verify_fifo(connection, candidates, expected_fills, expected_links):
         raise PaperRiskLedgerSnapshotError("FIFO terminal links are missing or mismatched")
 
 
+async def _replay_entry(
+    connection,
+    row,
+    database,
+    runtime,
+    candidates,
+    cash,
+    quantities,
+    latest_cash_source,
+    latest_position_source,
+    fills,
+    expected_fifo_links,
+    expected_fifo_fills,
+):
+    """Validate an entry on the collector's transaction, then advance history.
+
+    No independent connection or owned execution capability is used here: the
+    collector needs immutable facts from exactly its existing read snapshot.
+    """
+    if not runtime.safety_journal_path:
+        raise PaperRiskLedgerSnapshotError("entry history requires the safety journal")
+    record = PaperEntryTerminalRecord(row[2])
+    if record.fingerprint != row[1]:
+        raise PaperRiskLedgerSnapshotError("entry record fingerprint differs")
+    stored = await read_entry_settlement(
+        connection,
+        record,
+        database=database,
+        runtime_contract=runtime,
+        journal=SafetyJournal(runtime.safety_journal_path),
+    )
+    if stored.settlement_id != row[0]:
+        raise PaperRiskLedgerSnapshotError("entry terminal identity differs")
+    data = json.loads(record.payload_json)
+    claim, pre, post, outcome = (
+        data["claim"],
+        data["pre_account"],
+        data["post_values"],
+        data["outcome"],
+    )
+    capacity = json.loads(data["reservation"]["payload_json"])
+    portfolio, symbol, con_id = claim["portfolio_id"], capacity["symbol"], claim["con_id"]
+    key = (portfolio, symbol)
+    if portfolio not in cash or parse_fixed_decimal(pre["cash"]) != cash[portfolio]:
+        raise PaperRiskLedgerSnapshotError("entry cash history is discontinuous")
+    # Gross flatness is checked across all bootstrapped portfolios, not merely
+    # the entry's portfolio or the signed account sum. An absent key is legal
+    # only here, after the journal-bound flat-entry record and storage validate.
+    if any(q != 0 for (_, s), (_, q) in quantities.items() if s == symbol):
+        raise PaperRiskLedgerSnapshotError("entry position history is not gross-flat")
+    if key in quantities and quantities[key][0] != con_id:
+        raise PaperRiskLedgerSnapshotError("entry contract history changed")
+    if pre["position_source_settlement_id"] != latest_position_source.get(key):
+        raise PaperRiskLedgerSnapshotError("entry position source history is discontinuous")
+    at = parse_utc_text(outcome["observed_at"])
+    if at < candidates[portfolio].effective_at or at > datetime.now(timezone.utc):
+        raise PaperRiskLedgerSnapshotError("entry fill timestamp is outside the accounting epoch")
+    quantity = parse_fixed_decimal(outcome["filled_quantity"])
+    cash[portfolio] = parse_fixed_decimal(post["cash"])
+    latest_cash_source[portfolio] = stored.settlement_id
+    if quantity:
+        quantities[key] = (con_id, parse_fixed_decimal(post["position_quantity"]))
+        latest_position_source[key] = stored.settlement_id
+        fill = outcome["fill_evidence"]
+        fills.append(PaperRiskFill(portfolio, symbol, fill["execution_id"], at))
+        expected_fifo_links.append(
+            (
+                stored.settlement_id,
+                record.fingerprint,
+                fill["execution_id"],
+                fill["commission_minor"],
+                fill["commission_currency"],
+                fill["commission_source"],
+            )
+        )
+        expected_fifo_fills.append(
+            (
+                portfolio,
+                fill["execution_id"],
+                symbol,
+                con_id,
+                "BUY",
+                quantity,
+                parse_fixed_decimal(outcome["exact_fill_price"]),
+                fill["commission_minor"],
+                record.fingerprint,
+            )
+        )
+
+
 async def collect_paper_risk_ledger_snapshot(
     database: AsyncTradingDatabase, runtime: RuntimeContract
 ) -> PaperRiskLedgerSnapshot:
-    """Rebuild all portfolios from immutable history in one SQLite snapshot.
+    """Rebuild complete paper history and projections in one read snapshot."""
+    if type(database) is not AsyncTradingDatabase:
+        raise PaperRiskLedgerSnapshotError("exact shared database is required")
+    async with database.get_connection() as connection:
+        await connection.execute("BEGIN")
+        try:
+            return await _collect_paper_risk_ledger_snapshot_in_transaction(
+                database, runtime, connection
+            )
+        finally:
+            await connection.rollback()
 
-    Mutable cash/quantity projections must match that reconstruction exactly.
-    Legacy trades cannot stand in for terminal fills. Bootstraps provide the
-    opening balances, and every later committed fill must agree with FIFO.
+
+async def _collect_paper_risk_ledger_snapshot_in_transaction(database, runtime, connection):
+    """Validate history in an existing transaction without committing or rolling back.
+
+    Reduction persistence reuses this before any mutation when ENTRY history
+    exists. A second connection would validate a different snapshot and deadlock
+    the single-connection pool. The caller owns transaction lifecycle.
     """
     if type(database) is not AsyncTradingDatabase or type(runtime) is not RuntimeContract:
         raise PaperRiskLedgerSnapshotError("exact shared database and runtime are required")
@@ -267,202 +374,200 @@ async def collect_paper_risk_ledger_snapshot(
     ):
         raise PaperRiskLedgerSnapshotError("explicit paper read-only runtime is required")
     expected_path, identity = database._expected_safety_database(runtime_contract=runtime)
+    if not connection.in_transaction:
+        raise PaperRiskLedgerSnapshotError("ledger reconstruction requires a transaction")
     binding = None
     try:
-        async with database.get_connection() as connection:
-            binding = SQLitePathBinding.open_readonly(database.db_path)
-            descriptor = await database._sqlite_descriptor_identity(connection)
-            binding = binding.bind_sqlite_connection(descriptor)
-            if (descriptor.device, descriptor.inode) != database._expected_database_file_identity:
-                raise PaperRiskLedgerSnapshotError("ledger database identity was replaced")
-            # Use the start of collection as a conservative freshness bound;
-            # expensive history validation must not make old evidence look new.
-            observed_at = datetime.now(timezone.utc)
-            await connection.execute("BEGIN")
-            try:
-                await assert_paper_settlement_hot_schema(connection)
-                candidates = await _read_validated_bootstrap_candidates(
-                    connection, runtime, binding
-                )
-                cash = {
-                    portfolio: candidate.account.cash for portfolio, candidate in candidates.items()
-                }
-                quantities = {
-                    (portfolio, p.symbol): (p.con_id, Decimal(p.quantity))
-                    for portfolio, candidate in candidates.items()
-                    for p in candidate.positions
-                }
-                latest_cash_source = {portfolio: None for portfolio in candidates}
-                latest_position_source = {key: None for key in quantities}
-                fingerprints = await (
-                    await connection.execute(
-                        "SELECT portfolio_id,candidate_fingerprint FROM main.paper_state_bootstraps"
-                    )
-                ).fetchall()
-                if dict(fingerprints) != {p: c.fingerprint() for p, c in candidates.items()}:
-                    raise PaperRiskLedgerSnapshotError("bootstrap candidate fingerprint mismatch")
-                fills = []
-                expected_fifo_fills = []
-                expected_fifo_links = []
-                rows = await (await connection.execute("""
-                    SELECT settlement_id,request_fingerprint,request_payload_json,
-                           protective_quote_payload,trade_id,database_path,database_identity,
-                           database_device,database_inode,committed_at,receipt_fingerprint,schema_version,
-                           portfolio_id,symbol,execution_domain_scope,account_scope
-                    FROM main.paper_reduction_settlements ORDER BY rowid
-                """)).fetchall()
-                for row in rows:
-                    receipt = database._paper_settlement_receipt_from_row(row[:12])
-                    request = receipt.request
-                    if (
-                        row[12:]
-                        != (
-                            request.portfolio_id,
-                            request.symbol,
-                            runtime.safety_execution_domain_scope,
-                            runtime.safety_account_scope,
-                        )
-                        or request.account_scope != runtime.safety_account_scope
-                        or request.execution_domain_scope != runtime.safety_execution_domain_scope
-                        or receipt.database_path != str(expected_path)
-                        or receipt.database_identity != identity
-                        or (receipt.database_device, receipt.database_inode)
-                        != (descriptor.device, descriptor.inode)
-                    ):
-                        raise PaperRiskLedgerSnapshotError(
-                            "terminal receipt scope or database identity mismatch"
-                        )
-                    key = (request.portfolio_id, request.symbol)
-                    if (
-                        request.portfolio_id not in cash
-                        or key not in quantities
-                        or quantities[key]
-                        != (request.con_id, request.expected_pre_position_quantity)
-                    ):
-                        raise PaperRiskLedgerSnapshotError(
-                            "terminal position history is discontinuous"
-                        )
-                    if request.expected_pre_cash != cash[request.portfolio_id]:
-                        raise PaperRiskLedgerSnapshotError("terminal cash history is discontinuous")
-                    if request.outcome_at < candidates[
-                        request.portfolio_id
-                    ].effective_at or request.outcome_at > datetime.now(timezone.utc):
-                        raise PaperRiskLedgerSnapshotError(
-                            "terminal fill timestamp is outside the accounting epoch"
-                        )
-                    cash[request.portfolio_id] = request.expected_post_cash
-                    quantities[key] = (request.con_id, request.expected_post_position_quantity)
-                    latest_cash_source[request.portfolio_id] = receipt.settlement_id
-                    if request.filled_quantity:
-                        latest_position_source[key] = receipt.settlement_id
-                        fills.append(
-                            PaperRiskFill(
-                                request.portfolio_id,
-                                request.symbol,
-                                request.fill_execution_id,
-                                request.outcome_at,
-                            )
-                        )
-                        expected_fifo_links.append(
-                            (
-                                receipt.settlement_id,
-                                request.fingerprint(),
-                                request.fill_execution_id,
-                                request.fill_commission_minor,
-                                request.fill_commission_currency,
-                                request.fill_commission_source,
-                            )
-                        )
-                        expected_fifo_fills.append(
-                            (
-                                request.portfolio_id,
-                                request.fill_execution_id,
-                                request.symbol,
-                                request.con_id,
-                                "SELL" if request.side.value == "SELL" else "BUY",
-                                request.filled_quantity,
-                                request.fill_price,
-                                request.fill_commission_minor,
-                                request.fingerprint(),
-                            )
-                        )
-                # Projection state may change marks/P&L, but cash and quantity
-                # changes require committed trading or an explicitly supported
-                # accounting event. Keeping an old source ID cannot bless a rewrite.
-                compatibility_accounts = await (
-                    await connection.execute(
-                        "SELECT portfolio_id FROM main.account ORDER BY portfolio_id"
-                    )
-                ).fetchall()
-                if tuple(row[0] for row in compatibility_accounts) != tuple(sorted(cash)):
-                    raise PaperRiskLedgerSnapshotError("account projection coverage is incomplete")
-                account_rows = await (await connection.execute("""
-                    SELECT portfolio_id,cash_text,source_settlement_id FROM main.paper_account_settlement_state
-                """)).fetchall()
-                if len(account_rows) != len(cash) or any(
-                    p not in cash
-                    or parse_fixed_decimal(value, "cash") != cash[p]
-                    or source != latest_cash_source[p]
-                    for p, value, source in account_rows
-                ):
-                    raise PaperRiskLedgerSnapshotError(
-                        "mutable cash projection disagrees with immutable history"
-                    )
-                position_rows = await (await connection.execute("""
-                    SELECT p.portfolio_id,p.symbol,p.quantity,s.source_settlement_id
-                    FROM main.positions p LEFT JOIN main.paper_position_settlement_state s
-                      ON s.portfolio_id=p.portfolio_id AND s.symbol=p.symbol
-                """)).fetchall()
-                seen = set()
-                for portfolio, symbol, quantity, source in position_rows:
-                    key = (portfolio, symbol)
-                    if (
-                        portfolio not in cash
-                        or DatabaseValidator.validate_symbol(symbol) != symbol
-                        or type(quantity) is not int
-                        or key in seen
-                        or Decimal(quantity) != quantities.get(key, (None, Decimal(0)))[1]
-                        or source != latest_position_source.get(key)
-                    ):
-                        raise PaperRiskLedgerSnapshotError(
-                            "mutable position projection disagrees with immutable history"
-                        )
-                    seen.add(key)
-                if any(
-                    quantity != 0 and key not in seen for key, (_, quantity) in quantities.items()
-                ):
-                    raise PaperRiskLedgerSnapshotError("nonzero position projection is missing")
-                await connection._execute(
-                    _verify_fifo,
-                    connection._conn,
+        binding = SQLitePathBinding.open_readonly(database.db_path)
+        descriptor = await database._sqlite_descriptor_identity(connection)
+        binding = binding.bind_sqlite_connection(descriptor)
+        if (descriptor.device, descriptor.inode) != database._expected_database_file_identity:
+            raise PaperRiskLedgerSnapshotError("ledger database identity was replaced")
+        observed_at = datetime.now(timezone.utc)
+        await assert_paper_settlement_hot_schema(connection)
+        candidates = await _read_validated_bootstrap_candidates(connection, runtime, binding)
+        cash = {portfolio: candidate.account.cash for portfolio, candidate in candidates.items()}
+        quantities = {
+            (portfolio, p.symbol): (p.con_id, Decimal(p.quantity))
+            for portfolio, candidate in candidates.items()
+            for p in candidate.positions
+        }
+        latest_cash_source = {portfolio: None for portfolio in candidates}
+        latest_position_source = {key: None for key in quantities}
+        fingerprints = await (
+            await connection.execute(
+                "SELECT portfolio_id,candidate_fingerprint FROM main.paper_state_bootstraps"
+            )
+        ).fetchall()
+        if dict(fingerprints) != {p: c.fingerprint() for p, c in candidates.items()}:
+            raise PaperRiskLedgerSnapshotError("bootstrap candidate fingerprint mismatch")
+        fills = []
+        expected_fifo_fills = []
+        expected_fifo_links = []
+        rows = await (await connection.execute("""
+            SELECT settlement_id,request_fingerprint,request_payload_json,
+                   protective_quote_payload,trade_id,database_path,database_identity,
+                   database_device,database_inode,committed_at,receipt_fingerprint,schema_version,
+                   portfolio_id,symbol,execution_domain_scope,account_scope,settlement_kind
+            FROM main.paper_reduction_settlements ORDER BY rowid
+        """)).fetchall()
+        for row in rows:
+            if row[16] == "ENTRY":
+                await _replay_entry(
+                    connection,
+                    row,
+                    database,
+                    runtime,
                     candidates,
-                    expected_fifo_fills,
+                    cash,
+                    quantities,
+                    latest_cash_source,
+                    latest_position_source,
+                    fills,
                     expected_fifo_links,
+                    expected_fifo_fills,
                 )
-                binding.assert_connection_identity(
-                    await database._sqlite_descriptor_identity(connection)
+                continue
+            if row[16] != "REDUCTION":
+                raise PaperRiskLedgerSnapshotError("unknown terminal settlement kind")
+            receipt = database._paper_settlement_receipt_from_row(row[:12])
+            request = receipt.request
+            if (
+                row[12:16]
+                != (
+                    request.portfolio_id,
+                    request.symbol,
+                    runtime.safety_execution_domain_scope,
+                    runtime.safety_account_scope,
                 )
-                return _issue_snapshot(
-                    account_scope=runtime.safety_account_scope,
-                    execution_domain_scope=runtime.safety_execution_domain_scope,
-                    database_path=str(expected_path),
-                    database_identity=identity,
-                    database_device=descriptor.device,
-                    database_inode=descriptor.inode,
-                    observed_at=observed_at,
-                    portfolio_cash=tuple(sorted(cash.items())),
-                    bootstrap_effective_at=tuple(
-                        (p, c.effective_at) for p, c in sorted(candidates.items())
-                    ),
-                    positions=tuple(
-                        PaperRiskPosition(p, s, c, q)
-                        for (p, s), (c, q) in sorted(quantities.items())
-                        if q
-                    ),
-                    fills=tuple(fills),
+                or request.account_scope != runtime.safety_account_scope
+                or request.execution_domain_scope != runtime.safety_execution_domain_scope
+                or receipt.database_path != str(expected_path)
+                or receipt.database_identity != identity
+                or (receipt.database_device, receipt.database_inode)
+                != (descriptor.device, descriptor.inode)
+            ):
+                raise PaperRiskLedgerSnapshotError(
+                    "terminal receipt scope or database identity mismatch"
                 )
-            finally:
-                await connection.rollback()
+            key = (request.portfolio_id, request.symbol)
+            if (
+                request.portfolio_id not in cash
+                or key not in quantities
+                or quantities[key] != (request.con_id, request.expected_pre_position_quantity)
+            ):
+                raise PaperRiskLedgerSnapshotError("terminal position history is discontinuous")
+            if request.expected_pre_cash != cash[request.portfolio_id]:
+                raise PaperRiskLedgerSnapshotError("terminal cash history is discontinuous")
+            if request.outcome_at < candidates[
+                request.portfolio_id
+            ].effective_at or request.outcome_at > datetime.now(timezone.utc):
+                raise PaperRiskLedgerSnapshotError(
+                    "terminal fill timestamp is outside the accounting epoch"
+                )
+            cash[request.portfolio_id] = request.expected_post_cash
+            quantities[key] = (request.con_id, request.expected_post_position_quantity)
+            latest_cash_source[request.portfolio_id] = receipt.settlement_id
+            if request.filled_quantity:
+                latest_position_source[key] = receipt.settlement_id
+                fills.append(
+                    PaperRiskFill(
+                        request.portfolio_id,
+                        request.symbol,
+                        request.fill_execution_id,
+                        request.outcome_at,
+                    )
+                )
+                expected_fifo_links.append(
+                    (
+                        receipt.settlement_id,
+                        request.fingerprint(),
+                        request.fill_execution_id,
+                        request.fill_commission_minor,
+                        request.fill_commission_currency,
+                        request.fill_commission_source,
+                    )
+                )
+                expected_fifo_fills.append(
+                    (
+                        request.portfolio_id,
+                        request.fill_execution_id,
+                        request.symbol,
+                        request.con_id,
+                        "SELL" if request.side.value == "SELL" else "BUY",
+                        request.filled_quantity,
+                        request.fill_price,
+                        request.fill_commission_minor,
+                        request.fingerprint(),
+                    )
+                )
+        # Projection state may change marks/P&L, but cash and quantity
+        # changes require committed trading or an explicitly supported
+        # accounting event. Keeping an old source ID cannot bless a rewrite.
+        compatibility_accounts = await (
+            await connection.execute("SELECT portfolio_id FROM main.account ORDER BY portfolio_id")
+        ).fetchall()
+        if tuple(row[0] for row in compatibility_accounts) != tuple(sorted(cash)):
+            raise PaperRiskLedgerSnapshotError("account projection coverage is incomplete")
+        account_rows = await (await connection.execute("""
+            SELECT portfolio_id,cash_text,source_settlement_id FROM main.paper_account_settlement_state
+        """)).fetchall()
+        if len(account_rows) != len(cash) or any(
+            p not in cash
+            or parse_fixed_decimal(value, "cash") != cash[p]
+            or source != latest_cash_source[p]
+            for p, value, source in account_rows
+        ):
+            raise PaperRiskLedgerSnapshotError(
+                "mutable cash projection disagrees with immutable history"
+            )
+        position_rows = await (await connection.execute("""
+            SELECT p.portfolio_id,p.symbol,p.quantity,s.source_settlement_id
+            FROM main.positions p LEFT JOIN main.paper_position_settlement_state s
+              ON s.portfolio_id=p.portfolio_id AND s.symbol=p.symbol
+        """)).fetchall()
+        seen = set()
+        for portfolio, symbol, quantity, source in position_rows:
+            key = (portfolio, symbol)
+            if (
+                portfolio not in cash
+                or DatabaseValidator.validate_symbol(symbol) != symbol
+                or type(quantity) is not int
+                or key in seen
+                or Decimal(quantity) != quantities.get(key, (None, Decimal(0)))[1]
+                or source != latest_position_source.get(key)
+            ):
+                raise PaperRiskLedgerSnapshotError(
+                    "mutable position projection disagrees with immutable history"
+                )
+            seen.add(key)
+        if any(quantity != 0 and key not in seen for key, (_, quantity) in quantities.items()):
+            raise PaperRiskLedgerSnapshotError("nonzero position projection is missing")
+        await connection._execute(
+            _verify_fifo,
+            connection._conn,
+            candidates,
+            expected_fifo_fills,
+            expected_fifo_links,
+        )
+        binding.assert_connection_identity(await database._sqlite_descriptor_identity(connection))
+        return _issue_snapshot(
+            account_scope=runtime.safety_account_scope,
+            execution_domain_scope=runtime.safety_execution_domain_scope,
+            database_path=str(expected_path),
+            database_identity=identity,
+            database_device=descriptor.device,
+            database_inode=descriptor.inode,
+            observed_at=observed_at,
+            portfolio_cash=tuple(sorted(cash.items())),
+            bootstrap_effective_at=tuple(
+                (p, c.effective_at) for p, c in sorted(candidates.items())
+            ),
+            positions=tuple(
+                PaperRiskPosition(p, s, c, q) for (p, s), (c, q) in sorted(quantities.items()) if q
+            ),
+            fills=tuple(fills),
+        )
     except PaperRiskLedgerSnapshotError:
         raise
     except SQLiteIdentityError as exc:

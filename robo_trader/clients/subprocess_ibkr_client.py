@@ -13,6 +13,7 @@ to avoid event loop starvation in busy async environments.
 
 import asyncio
 import hmac
+import hashlib
 import inspect
 import json
 import math
@@ -25,7 +26,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -54,7 +55,9 @@ from robo_trader.broker_safety_evidence import (
 )
 from robo_trader.market_data_contract import (
     BrokerProtectiveQuote,
+    CanonicalBar,
     CanonicalBarBatch,
+    HistoricalBarContract,
     MarketDataSource,
     MarketSession,
     canonicalize_historical_bars,
@@ -447,6 +450,10 @@ class SubprocessIBKRClient:
         self._historical_lineage_lock = threading.Lock()
         self._historical_lineage_generation_id: Optional[str] = None
         self._historical_lineage_by_symbol: dict[str, QualifiedStockContractLineage] = {}
+        self._canonical_batches: dict[
+            tuple[str, str, bool],
+            tuple[CanonicalBarBatch, _WorkerGeneration, str, tuple],
+        ] = {}
         # The worker receives a fresh, secret-free environment rather than the
         # parent's ambient process environment. Preserve only the validated
         # dev/test classification needed by deterministic synthetic accounts;
@@ -460,6 +467,7 @@ class SubprocessIBKRClient:
         with self._historical_lineage_lock:
             self._historical_lineage_generation_id = None
             self._historical_lineage_by_symbol.clear()
+            self._canonical_batches.clear()
 
     def _cache_historical_lineage(
         self,
@@ -479,7 +487,17 @@ class SubprocessIBKRClient:
                     with self._historical_lineage_lock:
                         if self._historical_lineage_generation_id != generation.generation_id:
                             self._historical_lineage_by_symbol.clear()
+                            self._canonical_batches.clear()
                             self._historical_lineage_generation_id = generation.generation_id
+                        previous = self._historical_lineage_by_symbol.get(lineage.symbol)
+                        if previous is not None and self._qualified_lineage_identity(
+                            previous
+                        ) != self._qualified_lineage_identity(lineage):
+                            self._canonical_batches = {
+                                key: record
+                                for key, record in self._canonical_batches.items()
+                                if key[0] != lineage.symbol
+                            }
                         self._historical_lineage_by_symbol[lineage.symbol] = lineage
         if not current:
             self._invalidate_historical_lineage()
@@ -536,6 +554,112 @@ class SubprocessIBKRClient:
                 "Historical contract lineage generation is inconsistent"
             )
         return lineage
+
+    @staticmethod
+    def _qualified_lineage_identity(lineage):
+        return tuple(
+            getattr(lineage, name)
+            for name in (
+                "con_id",
+                "symbol",
+                "local_symbol",
+                "security_type",
+                "currency",
+                "exchange",
+                "primary_exchange",
+                "trading_class",
+            )
+        )
+
+    def _invalidate_canonical_request(self, symbol, bar_size, use_rth, what_to_show):
+        # Raw history refreshes supersede only matching canonical TRADES data.
+        # Different windows retain their own original retrieval timestamps.
+        if what_to_show == "TRADES":
+            with self._historical_lineage_lock:
+                self._canonical_batches.pop((symbol, bar_size, bool(use_rth)), None)
+
+    @staticmethod
+    def _canonical_batch_fingerprint(batch: CanonicalBarBatch) -> str:
+        if (
+            type(batch) is not CanonicalBarBatch
+            or type(batch.contract) is not HistoricalBarContract
+            or type(batch.bars) is not tuple
+        ):
+            raise ValueError("canonical batch structure is invalid")
+        batch.__post_init__()
+        batch.contract.__post_init__()
+        values = [tuple(getattr(batch.contract, f.name) for f in fields(batch.contract))]
+        for bar in batch.bars:
+            if type(bar) is not CanonicalBar:
+                raise ValueError("canonical bar structure is invalid")
+            bar.__post_init__()
+            values.append(tuple(getattr(bar, f.name) for f in fields(bar) if f.name != "contract"))
+        return hashlib.sha256(repr(tuple(values)).encode("utf-8")).hexdigest()
+
+    def _check_canonical_batch(self, batch, *, publishing_generation=None):
+        """Check source ownership under the same lock order as lineage publication."""
+        if type(batch) is not CanonicalBarBatch:
+            raise ValueError("canonical batch is not producer-owned")
+        generation = self._generation
+        if generation is None:
+            raise ValueError("canonical batch has no current producer generation")
+        with generation.state_lock:
+            with self._connection_state_lock:
+                if (
+                    self._generation is not generation
+                    or generation.poisoned_reason is not None
+                    or not self._connected
+                    or self._connection_generation_id != generation.generation_id
+                    or batch.contract.transport_generation != generation.generation_id
+                    or (
+                        publishing_generation is not None
+                        and publishing_generation is not generation
+                    )
+                ):
+                    raise ValueError("canonical batch producer generation is obsolete")
+                with self._historical_lineage_lock:
+                    lineage = self._historical_lineage_by_symbol.get(batch.contract.symbol)
+                    if (
+                        self._historical_lineage_generation_id != generation.generation_id
+                        or lineage is None
+                        or lineage.con_id != batch.contract.con_id
+                        or lineage.primary_exchange != batch.contract.primary_exchange
+                    ):
+                        raise ValueError("canonical batch lineage is no longer current")
+                    fingerprint = self._canonical_batch_fingerprint(batch)
+                    key = (batch.contract.symbol, batch.contract.timeframe, batch.contract.use_rth)
+                    identity = self._qualified_lineage_identity(lineage)
+                    if publishing_generation is not None:
+                        if (
+                            lineage.retrieval_timestamp != batch.contract.retrieval_time
+                            or lineage.broker_timestamp != batch.contract.broker_time
+                        ):
+                            raise ValueError(
+                                "canonical publication does not match source retrieval"
+                            )
+                        self._canonical_batches[key] = (batch, generation, fingerprint, identity)
+                    else:
+                        record = self._canonical_batches.get(key)
+                        if (
+                            record is None
+                            or record[0] is not batch
+                            or record[1] is not generation
+                            or record[2] != fingerprint
+                            or record[3] != identity
+                        ):
+                            raise ValueError("canonical batch is copied, modified or superseded")
+        return batch
+
+    def assert_current_canonical_batch(self, batch: CanonicalBarBatch) -> CanonicalBarBatch:
+        """Require this client's latest unchanged batch for its timeframe/session.
+
+        This proves in-process producer ownership, not freshness or risk approval.
+        Consumers must check source age, window policy and account coverage too.
+        """
+        try:
+            return self._check_canonical_batch(batch)
+        except (AttributeError, TypeError) as error:
+            raise ValueError("canonical batch structure was modified") from error
 
     def _clear_connection_tuple_locked(self) -> None:
         """Clear connected-session fields while holding the state lock."""
@@ -3275,6 +3399,8 @@ class SubprocessIBKRClient:
         data: dict,
         generation: _WorkerGeneration,
     ) -> QualifiedStockContractLineage:
+        if type(data.get("bar_schema_version")) is not int or data["bar_schema_version"] != 2:
+            raise ValueError("historical response decimal bar schema is unsupported")
         expected_contract_keys = {
             "con_id",
             "symbol",
@@ -3394,7 +3520,8 @@ class SubprocessIBKRClient:
             use_rth: Use regular trading hours only
 
         Returns:
-            List of bar dictionaries with date, open, high, low, close, volume
+            List of bar dictionaries with date, open, high, low, close, volume.
+            Volume is exact decimal text in source units (shares/lots unverified).
         """
         normalized_symbol = self._normalize_historical_symbol(symbol)
         if bar_size not in _INTRADAY_BAR_SIZES:
@@ -3417,7 +3544,9 @@ class SubprocessIBKRClient:
                 },
                 timeout=60.0,  # Historical data can take longer
             )
-            return self._validate_historical_response(normalized_symbol, data, generation)
+            bars = self._validate_historical_response(normalized_symbol, data, generation)
+            self._invalidate_canonical_request(normalized_symbol, bar_size, use_rth, what_to_show)
+            return bars
 
     async def get_canonical_historical_bars(
         self,
@@ -3453,10 +3582,12 @@ class SubprocessIBKRClient:
                 timeout=60.0,
             )
             bars = self._validate_historical_response(normalized_symbol, data, generation)
+            self._invalidate_canonical_request(normalized_symbol, bar_size, use_rth, what_to_show)
             # The lifecycle lock prevents generation replacement between the
             # response validation above and this exact lineage read.
             lineage = self.get_cached_historical_lineage(normalized_symbol)
-            return canonicalize_historical_bars(
+            batch = canonicalize_historical_bars(
+                schema_version=2,
                 symbol=normalized_symbol,
                 records=bars,
                 lineage=lineage,
@@ -3464,6 +3595,7 @@ class SubprocessIBKRClient:
                 use_rth=use_rth,
                 what_to_show=what_to_show,
             )
+            return self._check_canonical_batch(batch, publishing_generation=generation)
 
     def _validate_protective_quote_response(
         self,

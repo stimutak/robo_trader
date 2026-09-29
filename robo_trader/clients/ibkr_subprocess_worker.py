@@ -32,11 +32,14 @@ from typing import Any, NamedTuple, Optional, cast
 # This prevents zombie connections when the worker process exits
 os.environ["IBKR_FORCE_DISCONNECT"] = "1"
 
-from ib_async import IB, ExecutionFilter  # noqa: E402
+from ib_async import ExecutionFilter  # noqa: E402
+
+from robo_trader.clients.exact_historical_decoder import ExactHistoricalIB as IB  # noqa: E402
 
 from robo_trader.broker_account_identity import (  # noqa: E402
     is_supported_paper_account_identifier,
 )
+from robo_trader.market_data_contract import _exact_volume, _volume_text  # noqa: E402
 from robo_trader.market_hours import get_market_session  # noqa: E402
 from robo_trader.protective_quote_evidence import (  # noqa: E402
     MAX_PROTECTIVE_SOURCE_EVENT_ID_LENGTH,
@@ -405,6 +408,11 @@ def _canonical_decimal(value: Any) -> str:
     if decimal_value == 0:
         return "0"
     return format(decimal_value.normalize(), "f")
+
+
+def _historical_volume(value: Any) -> str:
+    """Serialize exact decoded source quantities without claiming shares or lots."""
+    return _volume_text(_exact_volume(value))
 
 
 def _required_int(value: Any, field: str, *, allow_zero: bool = False) -> int:
@@ -2098,7 +2106,7 @@ async def handle_get_historical_bars(params: dict) -> dict:
                     "high": float(bar.high),
                     "low": float(bar.low),
                     "close": float(bar.close),
-                    "volume": int(bar.volume),
+                    "volume": _historical_volume(bar.volume),
                     "average": float(bar.average) if hasattr(bar, "average") else 0.0,
                     "barCount": int(bar.barCount) if hasattr(bar, "barCount") else 0,
                 }
@@ -2118,6 +2126,7 @@ async def handle_get_historical_bars(params: dict) -> dict:
             "status": "success",
             "data": {
                 "bars": bars_data,
+                "bar_schema_version": 2,
                 "requested_symbol": symbol,
                 "qualified_contract": contract_identity,
                 "broker_timestamp": _aware_iso(broker_time),

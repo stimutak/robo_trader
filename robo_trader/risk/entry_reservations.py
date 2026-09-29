@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from robo_trader.safety.entry_capacity import validate_entry_capacity_event
-from robo_trader.safety.models import JournalEventType, ReplayState, parse_fixed_decimal
+from robo_trader.safety.models import ReplayState, parse_fixed_decimal
 
 from robo_trader.safety.journal import ReservationConflict, SafetyJournal
 from robo_trader.safety.models import utc_to_text
@@ -73,10 +73,9 @@ def summarize_entry_capacity(state, *, portfolio_id, symbol, sector, held_symbol
     if type(state) is not ReplayState:
         raise ValueError("pending capacity requires an exact journal replay")
     state.__post_init__()
-    if (
-        tuple(e for e in state.events if e.event_type is JournalEventType.ENTRY_CAPACITY_RESERVED)
-        != state.pending_entry_events
-    ):
+    from robo_trader.safety.entry_release import pending_entries_from_events
+
+    if pending_entries_from_events(state.events) != state.pending_entry_events:
         raise ValueError("pending capacity replay omits entry events")
     if state.active_reservations or state.quarantined_reservations:
         raise ValueError("unresolved reduction prevents entry capacity evaluation")

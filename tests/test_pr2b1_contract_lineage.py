@@ -39,6 +39,7 @@ def _historical_data() -> dict:
                 "volume": 10,
             }
         ],
+        "bar_schema_version": 2,
         "requested_symbol": "AAPL",
         "qualified_contract": {
             "con_id": 265598,

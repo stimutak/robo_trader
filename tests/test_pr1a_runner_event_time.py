@@ -662,6 +662,9 @@ async def _configure_order_runtime(runner: AsyncRunner, executor_result=None) ->
     )
     frame = batch.to_frame()
     runner._canonical_bar_batches = {"AAPL": (batch, frame)}
+    from tests.canonical_batch_test_support import bind_test_canonical_batch
+
+    bind_test_canonical_batch(runner, batch)
     broker_quote = BrokerProtectiveQuote(
         schema_version=1,
         symbol="AAPL",
@@ -1765,6 +1768,9 @@ async def test_extended_hours_entry_requires_and_accepts_matching_exact_session(
     extended_batch = CanonicalBarBatch(extended_contract, (extended_bar,))
     extended_frame = extended_batch.to_frame()
     runner._canonical_bar_batches["AAPL"] = (extended_batch, extended_frame)
+    from tests.canonical_batch_test_support import bind_test_canonical_batch
+
+    bind_test_canonical_batch(runner, extended_batch)
     quote = replace(
         runner._broker_protective_quotes["AAPL"],
         session=MarketSession.PRE_MARKET,
@@ -1814,6 +1820,9 @@ async def test_final_entry_admission_rejects_stale_canonical_bar_batch() -> None
     stale_batch = CanonicalBarBatch(stale_contract, (stale_bar,))
     stale_frame = stale_batch.to_frame()
     runner._canonical_bar_batches["AAPL"] = (stale_batch, stale_frame)
+    from tests.canonical_batch_test_support import bind_test_canonical_batch
+
+    bind_test_canonical_batch(runner, stale_batch)
 
     result = await _place_order(
         runner,

@@ -91,6 +91,9 @@ def _contract():
 
 
 def _payload(*, now: datetime = NOW):
+    execution_start = (now - timedelta(seconds=2)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
     return {
         "snapshot_schema_version": 3,
         "account": ACCOUNT,
@@ -153,7 +156,7 @@ def _payload(*, now: datetime = NOW):
                 "quantity": "1.25",
                 "price": "120.25",
                 "average_price": "120.25",
-                "executed_at": (now - timedelta(minutes=1)).isoformat(),
+                "executed_at": max(execution_start, now - timedelta(minutes=1)).isoformat(),
                 "execution_exchange": "NASDAQ",
                 "commission": "1.23",
                 "commission_currency": "USD",
@@ -217,9 +220,7 @@ def _payload(*, now: datetime = NOW):
         ],
         "execution_scope": {
             "kind": "broker_date_since_midnight",
-            "start_at": (now - timedelta(seconds=2))
-            .replace(hour=0, minute=0, second=0, microsecond=0)
-            .isoformat(),
+            "start_at": execution_start.isoformat(),
             "end_at": now.isoformat(),
             "retention_scope": "ibkr_gateway_broker_date_since_midnight",
             "full_history": False,
@@ -1073,3 +1074,15 @@ async def test_factory_rejects_missing_account_before_constructing_transport():
         await build_diagnostic_provider(runtime, transport_factory=transport_factory)
 
     assert constructed is False
+
+
+@pytest.mark.parametrize("second", [0, 1, 2, 30, 59, 60])
+def test_snapshot_fixture_keeps_executions_within_scope_at_midnight(second):
+    now = datetime(2026, 9, 17, tzinfo=timezone.utc) + timedelta(seconds=second)
+    normalized_snapshot_from_transport(
+        _payload(now=now),
+        expected_account=ACCOUNT,
+        account_scope=ACCOUNT_SCOPE,
+        max_age_seconds=30.0,
+        now=now + timedelta(seconds=1),
+    )

@@ -861,6 +861,46 @@ async def test_cross_symbol_realized_pnl_settles_against_epoch_total(tmp_path: P
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "commission,post_cash,post_pnl",
+    [
+        (12345, "100079.05", "-120.95"),
+        (-12345, "100325.95", "125.95"),
+    ],
+)
+async def test_commission_trade_projection_is_independent_of_decimal_context(
+    tmp_path, commission, post_cash, post_pnl
+):
+    contract = _runtime_contract(tmp_path)
+    database = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)
+    await database.initialize()
+    try:
+        await _seed(database)
+        request = replace(
+            _request(outcome_at=datetime.now(timezone.utc) - timedelta(seconds=1)),
+            fill_commission_minor=commission,
+            expected_post_cash=Decimal(post_cash),
+            expected_post_realized_pnl=Decimal(post_pnl),
+            expected_post_daily_pnl=Decimal(post_pnl),
+        )
+        with localcontext() as context:
+            context.prec = 4
+            receipt = await database.commit_paper_reduction_outcome(
+                request, runtime_contract=contract
+            )
+        assert receipt.post_cash == Decimal(post_cash)
+        async with database.get_connection() as connection:
+            trade = await (
+                await connection.execute(
+                    "SELECT commission FROM trades WHERE portfolio_id = ?", ("portfolio-a",)
+                )
+            ).fetchone()
+        assert trade == (123.45 if commission > 0 else -123.45,)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_expected_fifo_delta_is_independent_of_ambient_decimal_precision(
     tmp_path: Path,
 ):
@@ -886,7 +926,7 @@ async def test_expected_fifo_delta_is_independent_of_ambient_decimal_precision(
         )
 
         with localcontext() as context:
-            context.prec = 6
+            context.prec = 5
             receipt = await database.commit_paper_reduction_outcome(
                 request,
                 runtime_contract=contract,
@@ -897,6 +937,13 @@ async def test_expected_fifo_delta_is_independent_of_ambient_decimal_precision(
         account = await database.get_account_info(portfolio_id="portfolio-a")
         assert account["realized_pnl_exact"] == Decimal("0.01")
         async with database.get_connection() as connection:
+            trade = await (
+                await connection.execute(
+                    "SELECT notional FROM trades WHERE portfolio_id = ?",
+                    ("portfolio-a",),
+                )
+            ).fetchone()
+            assert trade == (7654.34,)
             fifo_delta = await (
                 await connection.execute(
                     """

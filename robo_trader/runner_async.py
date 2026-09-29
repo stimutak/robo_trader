@@ -1071,11 +1071,21 @@ class AsyncRunner:
             not isinstance(cached, tuple)
             or len(cached) != 2
             or type(cached[0]) is not CanonicalBarBatch
-            or cached[0].contract.symbol != symbol
-            or cached[1].attrs.get("canonical_bar_batch") is not cached[0]
         ):
             return None
-        return cached[0]
+        producer = getattr(self, "ib", None)
+        if type(producer) is not SubprocessIBKRClient:
+            return None
+        try:
+            batch = producer.assert_current_canonical_batch(cached[0])
+            if (
+                batch.contract.symbol != symbol
+                or cached[1].attrs.get("canonical_bar_batch") is not batch
+            ):
+                return None
+            return batch
+        except (ValueError, AttributeError, TypeError):
+            return None
 
     def _entry_session_is_canonical(
         self,

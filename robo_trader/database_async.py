@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, localcontext
 from pathlib import Path
-from typing import AsyncIterator, Callable, Dict, List, Optional, Tuple
+from typing import AsyncIterator, Callable, Dict, List, Optional, Tuple, Union
 
 import aiosqlite
 
@@ -44,6 +44,12 @@ from robo_trader.database_migrations import (
     assert_exact_state_schema,
     assert_paper_settlement_hot_schema,
 )
+from robo_trader.paper_entry_receipt import (
+    PaperEntrySettlementReceipt,
+    recover_committed_entry_receipt,
+)
+from robo_trader.paper_entry_settlement import PaperEntryTerminalRecord
+from robo_trader.paper_settlement_record_dispatch import assert_reduction_only_terminal_history
 from robo_trader.database_validator import DatabaseValidator, ValidationError
 from robo_trader.financial_state_bootstrap import (
     _SAFE_ID,
@@ -66,6 +72,7 @@ from robo_trader.market_data_contract import (
     CANONICAL_STORAGE_KEYS,
     MarketDataContractError,
     bar_interval_seconds,
+    canonical_market_data_relation,
     market_data_max_age_seconds,
     validate_canonical_storage_row,
 )
@@ -75,9 +82,12 @@ from robo_trader.paper_terminal_settlement import (
     PaperTerminalSettlementError,
     PaperTerminalSettlementReceipt,
     PaperTerminalSettlementRequest,
+    _exact_commission_from_minor,
+    _exact_decimal_multiply,
     _produce_paper_terminal_settlement_receipt,
 )
 from robo_trader.safety.models import (
+    canonical_json,
     MODEL_VERSION,
     _exact_decimal_subtract,
     _strict_decimal,
@@ -1553,6 +1563,68 @@ class AsyncTradingDatabase:
                 )
             """)
 
+            # V2 uses exact decimal text; keep every v1 row and its schema intact.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS canonical_market_data_v2 (
+                    schema_version INTEGER NOT NULL CHECK (schema_version = 2),
+                    symbol TEXT NOT NULL,
+                    con_id INTEGER NOT NULL CHECK (con_id > 0),
+                    exchange TEXT NOT NULL CHECK (exchange = 'SMART'),
+                    primary_exchange TEXT NOT NULL CHECK (length(primary_exchange) > 0),
+                    timeframe TEXT NOT NULL CHECK (length(timeframe) > 0),
+                    interval_seconds INTEGER NOT NULL CHECK (interval_seconds > 0),
+                    timezone_name TEXT NOT NULL CHECK (timezone_name = 'UTC'),
+                    session_policy TEXT NOT NULL CHECK (
+                        session_policy IN ('regular-only', 'extended')
+                    ),
+                    timestamp TEXT NOT NULL,
+                    open REAL NOT NULL CHECK (open > 0),
+                    high REAL NOT NULL CHECK (high > 0),
+                    low REAL NOT NULL CHECK (low > 0),
+                    close REAL NOT NULL CHECK (close > 0),
+                    volume TEXT NOT NULL CHECK (typeof(volume) = 'text' AND length(volume) > 0),
+                    volume_unit TEXT NOT NULL CHECK (volume_unit = 'unknown'),
+                    session TEXT NOT NULL CHECK (
+                        session IN ('pre-market', 'regular', 'after-hours')
+                    ),
+                    source TEXT NOT NULL CHECK (source = 'ibkr-historical-trades'),
+                    retrieval_timestamp TEXT NOT NULL CHECK (length(retrieval_timestamp) > 0),
+                    broker_timestamp TEXT NOT NULL CHECK (length(broker_timestamp) > 0),
+                    adjustment_state TEXT NOT NULL CHECK (
+                        adjustment_state IN ('unknown', 'raw', 'adjusted')
+                    ),
+                    quality_flags TEXT NOT NULL DEFAULT '' CHECK (
+                        quality_flags IN ('', 'zero-volume')
+                    ),
+                    transport_generation TEXT NOT NULL CHECK (
+                        length(transport_generation) BETWEEN 1 AND 128
+                    ),
+                    timestamp_semantics TEXT NOT NULL CHECK (
+                        timestamp_semantics = 'bar-start'
+                    ),
+                    use_rth INTEGER NOT NULL CHECK (use_rth IN (0, 1)),
+                    what_to_show TEXT NOT NULL CHECK (what_to_show = 'TRADES'),
+                    CHECK (high >= open AND high >= low AND high >= close),
+                    CHECK (low <= open AND low <= high AND low <= close),
+                    CHECK (
+                        (volume = '0' AND quality_flags = 'zero-volume') OR
+                        (volume != '0' AND quality_flags = '')
+                    ),
+                    PRIMARY KEY (
+                        schema_version, source, con_id, timeframe,
+                        session_policy, adjustment_state, timestamp_semantics,
+                        use_rth, what_to_show, timestamp
+                    )
+                ) WITHOUT ROWID
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_canonical_market_data_v2_symbol_time
+                ON canonical_market_data_v2 (
+                    symbol, timestamp DESC, interval_seconds ASC,
+                    retrieval_timestamp DESC
+                )
+            """)
+
             # Strategy signals table (portfolio-scoped)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS signals (
@@ -2536,9 +2608,14 @@ class AsyncTradingDatabase:
         return receipt
 
     async def iter_paper_terminal_receipts(
-        self, *, runtime_contract: object
-    ) -> AsyncIterator[PaperTerminalSettlementReceipt]:
-        """Stream the account's immutable terminal outbox from one read snapshot.
+        self, *, runtime_contract: object, journal: Optional[object] = None
+    ) -> AsyncIterator[Union[PaperTerminalSettlementReceipt, PaperEntrySettlementReceipt]]:
+        """Stream terminal envelopes in one snapshot's durable insertion order.
+
+        Supplying the exact journal enables committed entry receipt recovery.
+        Entry records use an independent read-only verifier and must match this
+        snapshot's entire envelope. Without a journal, ENTRY history rejects;
+        it is never filtered from an apparently complete recovery.
 
         This is an account-wide recovery API, deliberately not exposed through
         the portfolio proxy. Callers must keep entry admission closed until the
@@ -2546,6 +2623,10 @@ class AsyncTradingDatabase:
         receiving a prefix is never evidence that recovery is complete.
         """
 
+        from robo_trader.safety.journal import SafetyJournal
+
+        if journal is not None and type(journal) is not SafetyJournal:
+            raise PaperTerminalSettlementError("mixed terminal replay requires an exact journal")
         expected_path, database_identity = self._expected_safety_database(
             runtime_contract=runtime_contract
         )
@@ -2570,24 +2651,66 @@ class AsyncTradingDatabase:
                 await conn.execute("BEGIN")
                 try:
                     await assert_paper_settlement_hot_schema(conn)
+                    if journal is None:
+                        await assert_reduction_only_terminal_history(conn)
                     cursor = await conn.execute("""
                         SELECT settlement_id, request_fingerprint, request_payload_json,
                                protective_quote_payload, trade_id, database_path,
                                database_identity, database_device, database_inode,
                                committed_at, receipt_fingerprint, schema_version,
-                               execution_domain_scope, account_scope, portfolio_id, symbol
+                               execution_domain_scope, account_scope, portfolio_id, symbol, settlement_kind
                         FROM main.paper_reduction_settlements ORDER BY rowid
                         """)
                     while rows := await cursor.fetchmany(128):
                         for row in rows:
-                            receipt = self._paper_settlement_receipt_from_row(row[:12])
-                            request = receipt.request
-                            if (
-                                row[12:]
-                                != (domain, account_scope, request.portfolio_id, request.symbol)
-                                or request.execution_domain_scope != domain
-                                or request.account_scope != account_scope
-                            ):
+                            if row[16] == "ENTRY":
+                                receipt = await recover_committed_entry_receipt(
+                                    PaperEntryTerminalRecord(row[2]),
+                                    database=self,
+                                    runtime_contract=runtime_contract,
+                                    journal=journal,
+                                )
+                                data = json.loads(receipt.record.payload_json)
+                                claim = data["claim"]
+                                capacity = json.loads(data["reservation"]["payload_json"])
+                                scope = (
+                                    claim["execution_domain_scope"],
+                                    claim["account_scope"],
+                                    claim["portfolio_id"],
+                                    capacity["symbol"],
+                                )
+                                expected_entry_row = (
+                                    receipt.settlement_id,
+                                    receipt.record.fingerprint,
+                                    receipt.record.payload_json,
+                                    canonical_json(data["quote"]),
+                                    receipt.trade_id,
+                                    receipt.database_path,
+                                    receipt.database_identity,
+                                    receipt.database_device,
+                                    receipt.database_inode,
+                                    utc_to_text(receipt.committed_at),
+                                    receipt.fingerprint(),
+                                    1,
+                                )
+                                if row[:12] != expected_entry_row:
+                                    raise PaperTerminalSettlementError(
+                                        "entry outbox snapshot differs from committed receipt"
+                                    )
+                            elif row[16] == "REDUCTION":
+                                receipt = self._paper_settlement_receipt_from_row(row[:12])
+                                request = receipt.request
+                                scope = (
+                                    request.execution_domain_scope,
+                                    request.account_scope,
+                                    request.portfolio_id,
+                                    request.symbol,
+                                )
+                            else:
+                                raise PaperTerminalSettlementError(
+                                    "unknown terminal settlement kind"
+                                )
+                            if row[12:16] != scope or scope[:2] != (domain, account_scope):
                                 raise PaperTerminalSettlementError(
                                     "terminal replay scope mismatched"
                                 )
@@ -2678,6 +2801,22 @@ class AsyncTradingDatabase:
                 await conn.execute("BEGIN IMMEDIATE")
                 try:
                     await assert_paper_settlement_hot_schema(conn)
+                    has_entry = await (
+                        await conn.execute(
+                            "SELECT 1 FROM main.paper_reduction_settlements "
+                            "WHERE settlement_kind='ENTRY' LIMIT 1"
+                        )
+                    ).fetchone()
+                    if has_entry:
+                        from .risk.paper_ledger_snapshot import (
+                            _collect_paper_risk_ledger_snapshot_in_transaction,
+                        )
+
+                        await _collect_paper_risk_ledger_snapshot_in_transaction(
+                            self, runtime_contract, conn
+                        )
+                    else:
+                        await assert_reduction_only_terminal_history(conn)
                 except RuntimeError as exc:
                     raise PaperTerminalSettlementError(
                         "paper settlement hot schema cannot be authenticated"
@@ -2982,7 +3121,9 @@ class AsyncTradingDatabase:
                             "FIFO remaining cost basis differs from exact position authority"
                         )
                     exact_pnl = fifo_projection.fill_realized_pnl
-                    exact_notional = request.fill_price * request.filled_quantity
+                    exact_notional = _exact_decimal_multiply(
+                        request.fill_price, request.filled_quantity, "paper fill notional"
+                    )
                     cursor = await conn.execute(
                         """
                         INSERT INTO main.trades (
@@ -2997,7 +3138,7 @@ class AsyncTradingDatabase:
                             quantity_int,
                             price_float,
                             float(exact_notional),
-                            float(Decimal(commission_minor).scaleb(-2)),
+                            float(_exact_commission_from_minor(commission_minor)),
                             float(exact_pnl),
                             utc_to_text(committed_at),
                         ),
@@ -3737,6 +3878,14 @@ class AsyncTradingDatabase:
                         f"batch_store_market_data row[{idx}] is not canonical: {exc}"
                     ) from exc
 
+        canonical_table = "canonical_market_data"
+        if canonical_mode:
+            versions = {row["schema_version"] for row in normalized_canonical_rows}
+            if len(versions) != 1:
+                raise ValueError("batch_store_market_data cannot mix canonical schema versions")
+            if versions == {2}:
+                canonical_table = "canonical_market_data_v2"
+
         canonical_conflict: Optional[Tuple[dict, Tuple[str, ...]]] = None
         async with self.get_connection() as conn:
             if canonical_mode:
@@ -3767,6 +3916,8 @@ class AsyncTradingDatabase:
                     "use_rth",
                     "what_to_show",
                 )
+                if canonical_table == "canonical_market_data_v2":
+                    storage_columns += ("volume_unit",)
                 identity_columns = (
                     "schema_version",
                     "source",
@@ -3819,7 +3970,7 @@ class AsyncTradingDatabase:
                         # remain bound through SQLite parameters.
                         existing_query = (
                             f"SELECT {', '.join(storage_columns)} "  # nosec B608
-                            "FROM canonical_market_data WHERE "
+                            f"FROM {canonical_table} WHERE "
                             f"{' AND '.join(f'{column} = ?' for column in identity_columns)} "
                             "AND timestamp BETWEEN ? AND ?"
                         )
@@ -3851,33 +4002,13 @@ class AsyncTradingDatabase:
                 if canonical_conflict is not None:
                     await conn.rollback()
                 else:
-                    await conn.executemany(
-                        """
-                        INSERT INTO canonical_market_data (
-                            schema_version, symbol, con_id, exchange,
-                            primary_exchange, timeframe, interval_seconds,
-                            timezone_name, session_policy, timestamp,
-                            open, high, low, close, volume, session, source,
-                            retrieval_timestamp, broker_timestamp,
-                            adjustment_state, quality_flags, transport_generation,
-                            timestamp_semantics, use_rth, what_to_show
-                        ) VALUES (
-                            :schema_version, :symbol, :con_id, :exchange,
-                            :primary_exchange, :timeframe, :interval_seconds,
-                            :timezone_name, :session_policy, :timestamp,
-                            :open, :high, :low, :close, :volume, :session, :source,
-                            :retrieval_timestamp, :broker_timestamp,
-                            :adjustment_state, :quality_flags, :transport_generation,
-                            :timestamp_semantics, :use_rth, :what_to_show
-                        )
-                        ON CONFLICT (
-                            schema_version, source, con_id, timeframe,
-                            session_policy, adjustment_state, timestamp_semantics,
-                            use_rth, what_to_show, timestamp
-                        ) DO NOTHING
-                        """,
-                        normalized_canonical_rows,
+                    # Identifiers come only from fixed source-code constants.
+                    insert_sql = (
+                        f"INSERT INTO {canonical_table} ({', '.join(storage_columns)}) "  # nosec B608
+                        f"VALUES ({', '.join(':' + column for column in storage_columns)}) "
+                        f"ON CONFLICT ({', '.join((*identity_columns, 'timestamp'))}) DO NOTHING"
                     )
+                    await conn.executemany(insert_sql, normalized_canonical_rows)
                     await conn.commit()
             else:
                 await conn.executemany(
@@ -4761,34 +4892,42 @@ class AsyncTradingDatabase:
             raise ValueError("market data limit must be an integer between 1 and 10000")
         if timeframe is not None:
             bar_interval_seconds(timeframe)
+        relation = canonical_market_data_relation()
         async with self.get_connection() as conn:
+            v2_object = await (
+                await conn.execute(
+                    "SELECT type FROM sqlite_master WHERE name = 'canonical_market_data_v2'"
+                )
+            ).fetchone()
+            if v2_object != ("table",):
+                raise MarketDataContractError("canonical version-2 storage is not a table")
             if timeframe is None:
-                selector_sql = """
+                selector_sql = f"""
                     SELECT timestamp, open, high, low, close, volume,
                            schema_version, con_id, exchange, primary_exchange,
                            timeframe, interval_seconds, timezone_name, session_policy,
                            session, source, retrieval_timestamp, broker_timestamp,
                            adjustment_state, quality_flags, transport_generation,
-                           timestamp_semantics, use_rth, what_to_show
-                    FROM canonical_market_data
+                           timestamp_semantics, use_rth, what_to_show, volume_unit
+                    FROM {relation}
                     WHERE symbol = ?
                     ORDER BY timestamp DESC, interval_seconds ASC,
-                             retrieval_timestamp DESC, con_id DESC
+                             retrieval_timestamp DESC, con_id DESC, schema_version DESC
                     LIMIT 1
                 """
                 selector_params = (symbol,)
             else:
-                selector_sql = """
+                selector_sql = f"""
                     SELECT timestamp, open, high, low, close, volume,
                            schema_version, con_id, exchange, primary_exchange,
                            timeframe, interval_seconds, timezone_name, session_policy,
                            session, source, retrieval_timestamp, broker_timestamp,
                            adjustment_state, quality_flags, transport_generation,
-                           timestamp_semantics, use_rth, what_to_show
-                    FROM canonical_market_data
+                           timestamp_semantics, use_rth, what_to_show, volume_unit
+                    FROM {relation}
                     WHERE symbol = ? AND timeframe = ?
                     ORDER BY timestamp DESC, interval_seconds ASC,
-                             retrieval_timestamp DESC, con_id DESC
+                             retrieval_timestamp DESC, con_id DESC, schema_version DESC
                     LIMIT 1
                 """
                 selector_params = (symbol, timeframe)
@@ -4805,20 +4944,21 @@ class AsyncTradingDatabase:
                     selected[21],
                     selected[22],
                     selected[23],
+                    selected[6],
                 )
                 cursor = await conn.execute(
-                    """
+                    f"""
                     SELECT timestamp, open, high, low, close, volume,
                            schema_version, con_id, exchange, primary_exchange,
                            timeframe, interval_seconds, timezone_name, session_policy,
                            session, source, retrieval_timestamp, broker_timestamp,
                            adjustment_state, quality_flags, transport_generation,
-                           timestamp_semantics, use_rth, what_to_show
-                    FROM canonical_market_data
+                           timestamp_semantics, use_rth, what_to_show, volume_unit
+                    FROM {relation}
                     WHERE symbol = ? AND con_id = ? AND timeframe = ?
                       AND session_policy = ? AND source = ?
                       AND adjustment_state = ? AND timestamp_semantics = ?
-                      AND use_rth = ? AND what_to_show = ?
+                      AND use_rth = ? AND what_to_show = ? AND schema_version = ?
                     ORDER BY timestamp DESC, retrieval_timestamp DESC
                     LIMIT ?
                     """,
@@ -4856,6 +4996,8 @@ class AsyncTradingDatabase:
                         "use_rth": bool(row[22]),
                         "what_to_show": row[23],
                     }
+                    if stored_item["schema_version"] == 2:
+                        stored_item["volume_unit"] = row[24]
                     item = validate_canonical_storage_row(stored_item)
                     item["use_rth"] = bool(item["use_rth"])
                     item["quality_flags"] = tuple(

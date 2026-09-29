@@ -8,6 +8,7 @@ before any entry admission; this adapter itself grants no order authority.
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import aclosing
 from dataclasses import dataclass
 from decimal import Decimal
@@ -16,6 +17,9 @@ from typing import Mapping
 
 from robo_trader.config import RuntimeContract
 from robo_trader.database_async import AsyncTradingDatabase
+from robo_trader.paper_entry_receipt import PaperEntrySettlementReceipt, assert_owned_entry_receipt
+from robo_trader.safety.journal import SafetyJournal
+from robo_trader.safety.models import parse_fixed_decimal, parse_utc_text
 from robo_trader.paper_terminal_settlement import (
     PaperTerminalSettlementReceipt,
     assert_producer_owned_paper_terminal_settlement_receipt,
@@ -108,8 +112,38 @@ class PaperFillAccounting:
             raise cancellation
         return result
 
-    def _record(self, receipt: PaperTerminalSettlementReceipt) -> bool:
+    def _record_entry(self, receipt, database):
+        assert_owned_entry_receipt(receipt, database=database, runtime_contract=self._runtime)
+        data = json.loads(receipt.record.payload_json)
+        portfolio = data["claim"]["portfolio_id"]
+        ledger = self._ledgers.get(portfolio)
+        if ledger is None:
+            raise PaperFillAccountingError("entry receipt has no matching risk ledger scope")
+        outcome = data["outcome"]
+        quantity = parse_fixed_decimal(outcome["filled_quantity"])
+        if quantity == 0:
+            return False
+        fill = outcome["fill_evidence"]
+        return ledger.record_fill(
+            ExecutedFill(
+                broker_execution_id=fill["execution_id"],
+                side=FillSide.BUY,
+                quantity=quantity,
+                price=parse_fixed_decimal(outcome["exact_fill_price"]),
+                currency="USD",
+                executed_at=parse_utc_text(fill["occurred_at"]),
+            )
+        ).recorded
+
+    def _record(
+        self,
+        receipt: PaperTerminalSettlementReceipt | PaperEntrySettlementReceipt,
+        *,
+        database: AsyncTradingDatabase | None = None,
+    ) -> bool:
         self.assert_runtime_coverage(self._runtime, tuple(self._ledgers))
+        if type(receipt) is PaperEntrySettlementReceipt:
+            return self._record_entry(receipt, database)
         assert_producer_owned_paper_terminal_settlement_receipt(receipt)
         request = receipt.request
         if (
@@ -142,7 +176,12 @@ class PaperFillAccounting:
         )
         return result.recorded
 
-    async def ingest(self, receipt: PaperTerminalSettlementReceipt) -> bool:
+    async def ingest(
+        self,
+        receipt: PaperTerminalSettlementReceipt | PaperEntrySettlementReceipt,
+        *,
+        database: AsyncTradingDatabase | None = None,
+    ) -> bool:
         """Record a committed fill without blocking the event loop on fsync.
 
         If cancelled, drain the durable append before propagating cancellation.
@@ -150,7 +189,21 @@ class PaperFillAccounting:
         deduplication in the independently authenticated ledger.
         """
 
+        if database is not None:
+            return await self._run_owned(self._record, receipt, database=database)
         return await self._run_owned(self._record, receipt)
+
+    async def confirm_entry_settlement(self, receipt, *, database: AsyncTradingDatabase):
+        """Drain accounting and return fresh one-use evidence for journal release.
+
+        Cancellation drains durable accounting before propagating and never
+        returns a confirmation. It does not release reserved entry capacity.
+        """
+        from .paper_entry_accounting_confirmation import _produce_entry_accounting_confirmation
+
+        return await self._run_owned(
+            _produce_entry_accounting_confirmation, self, receipt, database=database
+        )
 
     async def replay(self, database: AsyncTradingDatabase) -> PaperFillReplayResult:
         """Replay one complete outbox snapshot; never return success for a prefix."""
@@ -159,9 +212,19 @@ class PaperFillAccounting:
             raise PaperFillAccountingError("replay requires the account-wide database")
         seen = recorded = 0
         async with aclosing(
-            database.iter_paper_terminal_receipts(runtime_contract=self._runtime)
+            database.iter_paper_terminal_receipts(
+                runtime_contract=self._runtime,
+                journal=(
+                    SafetyJournal(self._runtime.safety_journal_path)
+                    if self._runtime.safety_journal_path
+                    else None
+                ),
+            )
         ) as receipts:
             async for receipt in receipts:
-                recorded += int(await self.ingest(receipt))
+                if type(receipt) is PaperEntrySettlementReceipt:
+                    recorded += int(await self.ingest(receipt, database=database))
+                else:
+                    recorded += int(await self.ingest(receipt))
                 seen += 1
         return PaperFillReplayResult(seen, recorded)

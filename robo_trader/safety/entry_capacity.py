@@ -1,4 +1,4 @@
-"""Reservation-only entry journal records; no order permits or release authority.
+"""Entry reservation and claim records; no order permits or release authority.
 
 The final entry gateway must bind evaluated pending capacity to the journal head
 and consume these records with atomic terminal settlement before enabling BUYs.
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 
 from .models import (
     JournalEventType,
@@ -38,6 +39,132 @@ _FIELDS = frozenset(
 def _capacity_key(intent_id):
     # Alphabetic digest encoding keeps opaque IDs out of the raw-account scanner.
     return "ecap-" + sha256_text(intent_id).translate(str.maketrans("0123456789", "ghijklmnop"))
+
+
+def _claim_key(reservation):
+    return "eclaim-" + sha256_text(reservation.idempotency_key).translate(
+        str.maketrans("0123456789", "ghijklmnop")
+    )
+
+
+def validate_entry_claim_event(event, payload, reservation):
+    """Validate the structural link; no execution permit is created here."""
+    from .journal import JournalIntegrityError
+
+    try:
+        if type(payload) is not dict or set(payload) != {
+            "version",
+            "reservation_sequence",
+            "reservation_chain_hash",
+            "order_ref",
+        }:
+            raise ValueError("invalid claim fields")
+        if type(payload["version"]) is not int or payload["version"] != 1:
+            raise ValueError("invalid claim version")
+        if (
+            reservation is None
+            or reservation.event_type is not JournalEventType.ENTRY_CAPACITY_RESERVED
+            or type(payload["reservation_sequence"]) is not int
+            or payload["reservation_sequence"] != reservation.sequence
+            or payload["reservation_chain_hash"] != reservation.chain_hash
+            or event.sequence <= reservation.sequence
+            or event.idempotency_key != _claim_key(reservation)
+            or event.intent_fingerprint != reservation.intent_fingerprint
+            or event.execution_domain_scope != reservation.execution_domain_scope
+            or event.account_scope != reservation.account_scope
+            or event.portfolio_id != reservation.portfolio_id
+            or event.con_id != reservation.con_id
+            or type(event.claim_id) is not str
+            or re.fullmatch(r"claim-[0-9a-f]{32}", event.claim_id) is None
+            or payload["order_ref"] != "entry-" + event.claim_id.removeprefix("claim-")
+        ):
+            raise ValueError("claim does not match its reservation")
+        capacity = json.loads(reservation.payload_json)
+        if (
+            not reservation.occurred_at
+            <= event.occurred_at
+            < parse_utc_text(capacity["expires_at"])
+        ):
+            raise ValueError("claim is outside its reservation lifetime")
+    except (ValueError, TypeError, KeyError) as exc:
+        raise JournalIntegrityError("invalid entry submission claim") from exc
+
+
+def claim_entry_capacity(journal, *, reservation_sequence, reservation_chain_hash, expected_head):
+    """Record one attempt while retaining capacity; never grant order authority.
+
+    The final gateway must authenticate admission and atomically consume the
+    returned claim in a one-shot execution boundary. A caller cannot retry a
+    claim even when a prior caller lost its response or the decision expired.
+    """
+    from .journal import SafetyJournal, StateTransitionError
+
+    if type(journal) is not SafetyJournal:
+        raise StateTransitionError("entry claim requires an exact safety journal")
+    if (
+        type(reservation_sequence) is not int
+        or reservation_sequence <= 0
+        or type(reservation_chain_hash) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", reservation_chain_hash) is None
+        or type(expected_head) is not tuple
+        or len(expected_head) != 2
+        or type(expected_head[0]) is not int
+        or expected_head[0] < 0
+        or type(expected_head[1]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", expected_head[1]) is None
+    ):
+        raise StateTransitionError("entry claim requires exact parent and head identities")
+
+    def operation(connection):
+        state = journal._replay_connection(connection)
+        if expected_head != (state.last_sequence, state.last_chain_hash):
+            raise StateTransitionError("entry claim journal head changed")
+        reservation = next(
+            (
+                event
+                for event in state.pending_entry_events
+                if event.sequence == reservation_sequence
+            ),
+            None,
+        )
+        if reservation is None or reservation.chain_hash != reservation_chain_hash:
+            raise StateTransitionError("entry claim reservation is unavailable")
+        key = _claim_key(reservation)
+        if any(event.idempotency_key == key for event in state.events):
+            raise StateTransitionError("entry capacity has already been claimed")
+        at = journal._event_time()
+        if (
+            not reservation.occurred_at
+            <= at
+            < parse_utc_text(json.loads(reservation.payload_json)["expires_at"])
+        ):
+            raise StateTransitionError("entry claim reservation has expired")
+        claim_id = "claim-" + uuid.uuid4().hex
+        if any(event.claim_id == claim_id for event in state.events):
+            raise StateTransitionError("entry claim identifier already exists")
+        payload = {
+            "version": 1,
+            "reservation_sequence": reservation.sequence,
+            "reservation_chain_hash": reservation.chain_hash,
+            "order_ref": "entry-" + claim_id.removeprefix("claim-"),
+        }
+        event = journal._append(
+            connection,
+            JournalEventType.ENTRY_SUBMISSION_CLAIMED,
+            at,
+            key,
+            reservation.execution_domain_scope,
+            reservation.account_scope,
+            reservation.portfolio_id,
+            reservation.con_id,
+            reservation.intent_fingerprint,
+            claim_id,
+            payload,
+        )
+        validate_entry_claim_event(event, payload, reservation)
+        return event
+
+    return journal._write_transaction(operation)
 
 
 def validate_entry_capacity_event(event, payload):

@@ -1,5 +1,11 @@
 # Robo Trader - ML-Driven Paper Trading Research Platform
 
+**Returning on another computer? Read [CURRENT_STATE.md](CURRENT_STATE.md) first.**
+The September 29 rebuild checkpoint preserves the current implementation and
+handoffs. **Gate A remains closed; BUY execution is disabled.** The active work
+is the [remediation plan](docs/ROBOTRADER_REMEDIATION_PLAN_2026-07-20.md), not the
+historical ML phase checklist below. Source integration does not deploy a trader.
+
 > ## ⚠️ CRITICAL: SYSTEM NOT READY FOR LIVE TRADING ⚠️
 > **This system has critical safety issues that MUST be resolved before any live trading.**  
 > **See [PRODUCTION_READINESS_PLAN.md](PRODUCTION_READINESS_PLAN.md) for the mandatory action plan.**  

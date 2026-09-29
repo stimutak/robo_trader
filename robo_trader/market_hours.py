@@ -2,7 +2,7 @@
 Market hours utilities for checking if the stock market is open.
 """
 
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional, Tuple
 
 import pytz
@@ -129,15 +129,10 @@ def _is_early_close_day(dt: datetime) -> bool:
     if month_day in EARLY_CLOSE_DAYS:
         return True
 
-    # Check for Black Friday (4th Friday of November)
-    if dt.month == 11 and dt.weekday() == 4:  # Friday in November
-        # Count Fridays in November up to this date
-        first_day = dt.replace(day=1)
-        friday_count = sum(1 for d in range(1, dt.day + 1) if dt.replace(day=d).weekday() == 4)
-        if friday_count == 4:  # 4th Friday
-            return True
-
-    return False
+    # The day after Thanksgiving can be November's fifth Friday (e.g. 2024).
+    thanksgiving = _get_nth_weekday_of_month(dt.year, 11, 3, 4)
+    check_date = dt.date() if isinstance(dt, datetime) else dt
+    return check_date == thanksgiving + timedelta(days=1)
 
 
 def _is_market_holiday(dt: datetime) -> bool:
@@ -149,7 +144,7 @@ def _is_market_holiday(dt: datetime) -> bool:
     - Presidents Day (3rd Monday of February)
     - Good Friday (Friday before Easter)
     - Memorial Day (last Monday of May)
-    - Juneteenth (June 19, or observed) - added in 2021
+    - Juneteenth (June 19, or observed) - effective in 2022
     - Independence Day (July 4, or observed)
     - Labor Day (1st Monday of September)
     - Thanksgiving (4th Thursday of November)
@@ -157,15 +152,16 @@ def _is_market_holiday(dt: datetime) -> bool:
     """
     check_date = dt.date() if isinstance(dt, datetime) else dt
     year = check_date.year
-    month_day = (check_date.month, check_date.day)
+    # Announced extraordinary closure within the verified risk-calendar range.
+    if check_date == date(2025, 1, 9):
+        return True  # National Day of Mourning for President Jimmy Carter.
 
     # Check fixed holidays (with weekend observation rules)
     # New Year's Day
     new_years = date(year, 1, 1)
     if new_years.weekday() == 6:  # Sunday -> observe Monday
         new_years = date(year, 1, 2)
-    elif new_years.weekday() == 5:  # Saturday -> observe Friday (prev year)
-        new_years = date(year - 1, 12, 31)
+    # A Saturday New Year's Day has no substitute NYSE weekday closure.
     if check_date == new_years:
         return True
 
@@ -178,8 +174,8 @@ def _is_market_holiday(dt: datetime) -> bool:
     if check_date == july_4:
         return True
 
-    # Juneteenth (June 19) - NYSE holiday since 2021
-    if year >= 2021:
+    # Juneteenth (June 19) - NYSE holiday starting with the 2022 calendar.
+    if year >= 2022:
         juneteenth = date(year, 6, 19)
         if juneteenth.weekday() == 6:  # Sunday -> observe Monday
             juneteenth = date(year, 6, 20)
@@ -236,6 +232,25 @@ def _get_market_close_time(dt: datetime) -> time:
     if _is_early_close_day(dt):
         return time(13, 0)  # 1:00 PM ET on early close days
     return time(16, 0)  # 4:00 PM ET normally
+
+
+RISK_CALENDAR_VERSION = "nyse-2024-2028-20260914"
+
+
+def regular_session_bounds(day: date) -> Optional[Tuple[datetime, datetime]]:
+    """Return UTC regular-session bounds within the verified 2024..2028 calendar.
+
+    Sources and exceptional closures are recorded in docs/market-calendar.md.
+    This is a published schedule, not evidence that a particular symbol traded
+    every interval; liquidity consumers must separately prove complete bars.
+    """
+    if type(day) is not date or not 2024 <= day.year <= 2028:
+        raise ValueError("regular-session risk calendar requires a verified 2024..2028 date")
+    if day.weekday() >= 5 or _is_market_holiday(day):
+        return None
+    start = _EASTERN.localize(datetime.combine(day, time(9, 30)))
+    end = _EASTERN.localize(datetime.combine(day, _get_market_close_time(day)))
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
 
 
 def is_market_open(dt: Optional[datetime] = None) -> bool:

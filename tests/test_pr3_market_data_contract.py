@@ -467,6 +467,7 @@ async def test_client_returns_bars_and_lineage_as_one_canonical_batch(
     now = datetime.now(timezone.utc)
     payload = {
         "bars": [_record("2026-07-23T15:00:00+00:00")],
+        "bar_schema_version": 2,
         "requested_symbol": "AAPL",
         "qualified_contract": {
             "con_id": 265598,

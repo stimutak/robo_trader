@@ -1982,8 +1982,14 @@ class SafetyJournal:
         if (
             event_type is not JournalEventType.ENTRY_CAPACITY_RESERVED
             and connection.execute(
-                "SELECT 1 FROM safety_journal_events WHERE idempotency_key = ? AND event_type = ?",
-                (idempotency_key, JournalEventType.ENTRY_CAPACITY_RESERVED.value),
+                "SELECT 1 FROM safety_journal_events WHERE idempotency_key = ? "
+                "AND event_type IN (?, ?, ?)",
+                (
+                    idempotency_key,
+                    JournalEventType.ENTRY_CAPACITY_RESERVED.value,
+                    JournalEventType.ENTRY_SUBMISSION_CLAIMED.value,
+                    JournalEventType.ENTRY_SETTLEMENT_RELEASED.value,
+                ),
             ).fetchone()
         ):
             raise IdempotencyConflict("idempotency key belongs to entry capacity")
@@ -2168,9 +2174,52 @@ class SafetyJournal:
                 ):
                     raise JournalIntegrityError("conflicting entry capacity scope")
                 pending_entry_events.append(event)
+            elif event.event_type is JournalEventType.ENTRY_SUBMISSION_CLAIMED:
+                from .entry_capacity import validate_entry_claim_event
+
+                reservation = next(
+                    (
+                        prior
+                        for prior in pending_entry_events
+                        if prior.sequence == payload.get("reservation_sequence")
+                    ),
+                    None,
+                )
+                validate_entry_claim_event(event, payload, reservation)
+                if any(
+                    prior.idempotency_key == event.idempotency_key
+                    or (event.claim_id is not None and prior.claim_id == event.claim_id)
+                    for prior in events
+                ):
+                    raise JournalIntegrityError("duplicate entry submission claim")
+            elif event.event_type is JournalEventType.ENTRY_SETTLEMENT_RELEASED:
+                from .entry_release import validate_entry_release_event
+
+                reservation = next(
+                    (
+                        e
+                        for e in pending_entry_events
+                        if e.sequence == payload.get("reservation_sequence")
+                    ),
+                    None,
+                )
+                claim = next(
+                    (e for e in events if e.sequence == payload.get("claim_sequence")), None
+                )
+                validate_entry_release_event(event, payload, reservation, claim)
+                if any(e.idempotency_key == event.idempotency_key for e in events):
+                    raise JournalIntegrityError("duplicate entry settlement release")
+                pending_entry_events.remove(reservation)
             else:
                 if any(
-                    prior.idempotency_key == event.idempotency_key for prior in pending_entry_events
+                    prior.idempotency_key == event.idempotency_key
+                    and prior.event_type
+                    in {
+                        JournalEventType.ENTRY_CAPACITY_RESERVED,
+                        JournalEventType.ENTRY_SUBMISSION_CLAIMED,
+                        JournalEventType.ENTRY_SETTLEMENT_RELEASED,
+                    }
+                    for prior in events
                 ):
                     raise JournalIntegrityError("entry capacity key reused")
                 if event.event_type is JournalEventType.RESERVATION_ACQUIRED and any(

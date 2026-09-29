@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import math
 import os
@@ -27,7 +28,12 @@ from .broker_safety_evidence import BrokerContractSafetySnapshot
 from .clients.subprocess_ibkr_client import SubprocessIBKRClient
 from .database_async import AsyncTradingDatabase
 from .execution import ExecutionResult, Order, PaperExecutor
-from .market_data_contract import BrokerProtectiveQuote
+from .market_data_contract import (
+    BrokerProtectiveQuote,
+    CanonicalBarBatch,
+    bar_interval_seconds,
+    market_data_max_age_seconds,
+)
 from .paper_execution_cost import PaperEntryCost, paper_entry_cost
 from .paper_execution_capability import (
     PaperReductionExecutionAuthority,
@@ -53,7 +59,7 @@ from .reconciliation.identity import (
     assert_validated_runtime_safety_context,
 )
 from .risk.paper_fill_accounting import PaperFillAccounting, PaperFillReplayResult
-from .risk.entry_contract import _exact_multiply, _exact_subtract
+from .risk.entry_contract import _exact_multiply, _exact_subtract, _sector, _symbol
 from .risk.paper_ledger_snapshot import (
     PaperRiskLedgerSnapshot,
     PaperRiskLedgerSnapshotError,
@@ -70,6 +76,7 @@ from .safety import (
     TimeInForce,
 )
 from .risk.entry_reservations import PendingEntryCapacity, summarize_entry_capacity
+from .risk.canonical_correlation import CanonicalCorrelation, canonical_correlation
 from .safety.readiness import require_paper_terminal_settlement_ready
 from .safety.sqlite_identity import lexical_path_preserving_leaf
 from .safety_runtime_evidence import assemble_local_paper_safety_evidence
@@ -104,6 +111,17 @@ class PaperEntryValuation:
     current_symbol_gross_notional_usd: Decimal
     symbol_has_position: bool
     symbol_entry_allowed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PaperEntrySectorExposure:
+    """Non-authorizing exposure under an explicit immutable classification policy."""
+
+    sector: str
+    current_sector_gross_notional_usd: Decimal
+    pending_sector_notional_usd: Decimal
+    classifications: tuple[tuple[str, str], ...]
+    journal_head: tuple[int, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1098,6 +1116,149 @@ class PaperReductionGateway:
             symbol=context.symbol,
             sector=sector,
             held_symbols=tuple(position.symbol for position in context.ledger.positions),
+        )
+
+    async def entry_correlation(
+        self, *, portfolio_id: str, batches: tuple[CanonicalBarBatch, ...], return_count: int
+    ) -> CanonicalCorrelation:
+        """Compute account-wide correlation from current transport-owned history.
+
+        Fetch the configured history window before entering serialization. This
+        read performs no broker I/O and grants no order authority. Final admission
+        must bind the window policy, source version and journal/ledger state.
+        """
+        self.entry_valuation(portfolio_id=portfolio_id)
+        context = self._entry_market_context
+        producer = self._client
+        if type(producer) is not SubprocessIBKRClient or type(batches) is not tuple:
+            raise PaperReductionGatewayError("correlation requires exact owned source batches")
+        state = await self._assert_entry_journal_current(context)
+        self.entry_valuation(portfolio_id=portfolio_id)
+        required_symbols = {context.symbol} | {p.symbol for p in context.ledger.positions}
+        identities = {
+            q.symbol: (q.con_id, q.primary_exchange)
+            for q in context.quotes
+            if q.symbol in required_symbols
+        }
+        for event in state.pending_entry_events:
+            payload = json.loads(event.payload_json)
+            symbol = payload["symbol"]
+            contract = payload["broker_contract"]
+            identity = (contract[0], contract[6])
+            if symbol in identities and identities[symbol] != identity:
+                raise PaperReductionGatewayError(
+                    "correlation pending contract conflicts with marks"
+                )
+            identities[symbol] = identity
+
+        def authenticate():
+            if self._client is not producer:
+                raise ValueError("correlation source client was replaced")
+            owned = {}
+            for batch in batches:
+                producer.assert_current_canonical_batch(batch)
+                symbol = batch.contract.symbol
+                if symbol in owned:
+                    raise ValueError("correlation source coverage is ambiguous")
+                owned[symbol] = batch
+            if set(owned) != set(identities):
+                raise ValueError("correlation source coverage is incomplete")
+            return owned
+
+        try:
+            owned = authenticate()
+            result = canonical_correlation(
+                candidate=owned[context.symbol],
+                held=tuple(owned[symbol] for symbol in sorted(owned) if symbol != context.symbol),
+                expected_contracts=tuple(
+                    (symbol, *identity) for symbol, identity in sorted(identities.items())
+                ),
+                transport_generation=producer.protective_quote_generation,
+                return_count=return_count,
+                now=datetime.now(timezone.utc),
+            )
+            await self._assert_entry_journal_current(context)
+            authenticate()
+        except ValueError as error:
+            raise PaperReductionGatewayError("correlation source evidence is invalid") from error
+        self.entry_valuation(portfolio_id=portfolio_id)
+        max_age = timedelta(
+            seconds=market_data_max_age_seconds(
+                bar_interval_seconds(owned[context.symbol].contract.timeframe)
+            )
+        )
+        now = datetime.now(timezone.utc)
+        if any(
+            not timedelta(0) <= now - timestamp <= max_age
+            for timestamp in (result.observed_at, result.window_end)
+        ):
+            raise PaperReductionGatewayError("correlation history became stale during evaluation")
+        return result
+
+    async def entry_sector_exposure(
+        self, *, portfolio_id: str, classifications: tuple[tuple[str, str], ...]
+    ) -> PaperEntrySectorExposure:
+        """Value all held and pending sectors against explicit policy groupings.
+
+        The caller supplies a complete immutable policy, not a market-data claim.
+        Final admission must bind this same policy and revalidate the ledger and
+        journal; this read cannot authorize an order.
+        """
+        self.entry_valuation(portfolio_id=portfolio_id)
+        context = self._entry_market_context
+        try:
+            if type(classifications) is not tuple:
+                raise ValueError("immutable tuple required")
+            policy = {}
+            for pair in classifications:
+                if type(pair) is not tuple or len(pair) != 2:
+                    raise ValueError("invalid classification pair")
+                symbol, sector = _symbol(pair[0]), _sector(pair[1])
+                if symbol in policy or sector.casefold() in {
+                    "unknown",
+                    "unclassified",
+                    "n/a",
+                    "none",
+                    "other",
+                }:
+                    raise ValueError("ambiguous classification")
+                policy[symbol] = sector
+        except ValueError as error:
+            raise PaperReductionGatewayError("entry classification policy is invalid") from error
+        state = await self._assert_entry_journal_current(context)
+        self.entry_valuation(portfolio_id=portfolio_id)
+        required = {context.symbol} | {p.symbol for p in context.ledger.positions}
+        pending_payloads = tuple(json.loads(e.payload_json) for e in state.pending_entry_events)
+        required.update(payload["symbol"] for payload in pending_payloads)
+        if not required.issubset(policy):
+            raise PaperReductionGatewayError("entry classification coverage is incomplete")
+        for payload in pending_payloads:
+            if policy[payload["symbol"]] != payload["sector"]:
+                raise PaperReductionGatewayError(
+                    "pending entry classification conflicts with policy"
+                )
+        sector = policy[context.symbol]
+        prices = {quote.symbol: quote.price for quote in context.quotes}
+        gross = Decimal("0")
+        for position in context.ledger.positions:
+            if policy[position.symbol] == sector:
+                value = _exact_multiply(
+                    position.quantity, prices[position.symbol], "entry sector valuation"
+                ).copy_abs()
+                gross = _exact_subtract(gross, value.copy_negate(), "entry sector valuation")
+        pending = summarize_entry_capacity(
+            state,
+            portfolio_id=portfolio_id,
+            symbol=context.symbol,
+            sector=sector,
+            held_symbols=tuple(p.symbol for p in context.ledger.positions),
+        )
+        return PaperEntrySectorExposure(
+            sector,
+            gross,
+            pending.pending_sector_notional_usd,
+            tuple(sorted(policy.items())),
+            context.journal_head,
         )
 
     def entry_valuation(self, *, portfolio_id: str) -> PaperEntryValuation:

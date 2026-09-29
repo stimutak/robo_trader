@@ -215,6 +215,9 @@ def _runner(
     )
     frame = batch.to_frame()
     runner._canonical_bar_batches = {"AAPL": (batch, frame)}
+    from tests.canonical_batch_test_support import bind_test_canonical_batch
+
+    bind_test_canonical_batch(runner, batch)
     runner._broker_protective_quotes = (
         {"AAPL": probe.quote} if isinstance(probe, _EntrySerializationProbe) and live_feed else {}
     )

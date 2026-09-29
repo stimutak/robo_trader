@@ -413,3 +413,20 @@ async def test_daily_history_uses_new_york_date_including_dst(ledger, origin, as
             assert_complete_paper_daily_history(
                 snapshot, portfolio_id="default", as_of=values["observed_at"]
             )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_rejects_reduction_payload_relabelled_as_entry(ledger):
+    from robo_trader.database_migrations import _PAPER_REDUCTION_SETTLEMENT_TRIGGER_SQL
+
+    database, runtime, _ = ledger
+    await _settle(ledger)
+    async with database.get_connection() as connection:
+        await connection.execute("DROP TRIGGER paper_reduction_settlements_no_update")
+        await connection.execute("UPDATE paper_reduction_settlements SET settlement_kind='ENTRY'")
+        await connection.execute(
+            _PAPER_REDUCTION_SETTLEMENT_TRIGGER_SQL["paper_reduction_settlements_no_update"]
+        )
+        await connection.commit()
+    with pytest.raises(PaperRiskLedgerSnapshotError, match="entry|stored"):
+        await collect_paper_risk_ledger_snapshot(database, runtime)
