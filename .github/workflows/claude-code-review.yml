@@ -34,47 +34,34 @@ jobs:
 
       - name: Run Claude Code Review
         id: claude-review
-        # TODO(R2-CFG-H1.4): pin to specific commit SHA
-        uses: anthropics/claude-code-action@beta
+        # v1.0.244: pin the reviewed release instead of the obsolete beta tag.
+        uses: anthropics/claude-code-action@58985842b834ed26087302ba27d07bc24ca8697a
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
-          # Optional: Specify model (defaults to Claude Sonnet 4, uncomment for Claude Opus 4.1)
-          # model: "claude-opus-4-1-20250805"
+          # Preserve review progress/comments while using the v1 prompt input.
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
 
-          # Direct prompt for automated review (no @claude mention needed)
-          direct_prompt: |
             Please review this pull request and provide feedback on:
             - Code quality and best practices
             - Potential bugs or issues
             - Performance considerations
             - Security concerns
             - Test coverage
-            
+
             Be constructive and helpful in your feedback.
+            This is a review only. Do not change files, commit, merge, deploy,
+            start services, or operate the trading system.
 
-          # Optional: Use sticky comments to make Claude reuse the same comment on subsequent pushes to the same PR
-          # use_sticky_comment: true
-          
-          # Optional: Customize review based on file types
-          # direct_prompt: |
-          #   Review this PR focusing on:
-          #   - For TypeScript files: Type safety and proper interface usage
-          #   - For API endpoints: Security, input validation, and error handling
-          #   - For React components: Performance, accessibility, and best practices
-          #   - For tests: Coverage, edge cases, and test quality
-          
-          # Optional: Different prompts for different authors
-          # direct_prompt: |
-          #   ${{ github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR' && 
-          #   'Welcome! Please review this PR from a first-time contributor. Be encouraging and provide detailed explanations for any suggestions.' ||
-          #   'Please provide a thorough code review focusing on our coding standards and best practices.' }}
-          
-          # Optional: Add specific tools for running tests or linting
-          # allowed_tools: "Bash(npm run test),Bash(npm run lint),Bash(npm run typecheck)"
-          
-          # Optional: Skip review for certain conditions
-          # if: |
-          #   !contains(github.event.pull_request.title, '[skip-review]') &&
-          #   !contains(github.event.pull_request.title, '[WIP]')
-
+      - name: Require completed review execution
+        if: success()
+        env:
+          REVIEW_CONCLUSION: ${{ steps.claude-review.outputs.conclusion }}
+        run: |
+          if [[ "$REVIEW_CONCLUSION" != "success" ]]; then
+            echo "::error::The review action did not complete a review. Check for a workflow-validation skip or authentication failure."
+            exit 1
+          fi
