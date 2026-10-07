@@ -88,6 +88,13 @@ def _exact_decimal_multiply(left: Decimal, right: Decimal, field_name: str) -> D
     return _strict_decimal(product, field_name)
 
 
+def _exact_commission_from_minor(value: int) -> Decimal:
+    """Convert validated USD cents without context-sensitive Decimal scaling."""
+    if type(value) is not int or abs(value) > 1_000_000_000_000:
+        raise ValidationError("commission_minor is outside the exact allowed range")
+    return Decimal((int(value < 0), tuple(int(digit) for digit in str(abs(value))), -2))
+
+
 def _parse_protective_quote_timestamp(value: object) -> datetime:
     """Parse the two UTC spellings used by canonical quote evidence.
 
@@ -177,9 +184,7 @@ class PaperAccountSettlementState:
         )
         if filled < 0:
             raise ValidationError("filled_quantity must be nonnegative")
-        if type(commission_minor) is not int or abs(commission_minor) > 1_000_000_000_000:
-            raise ValidationError("commission_minor is outside the exact allowed range")
-        commission = Decimal(commission_minor).scaleb(-2)
+        commission = _exact_commission_from_minor(commission_minor)
         if filled.is_zero():
             if fill_price is not None:
                 raise ValidationError("unfilled settlement cannot have a fill price")
@@ -273,7 +278,7 @@ class PaperAccountSettlementState:
         )
         mark_revaluation = _exact_decimal_multiply(
             mark_change_per_share,
-            abs(pre_quantity),
+            pre_quantity.copy_abs(),
             "pre-position mark revaluation",
         )
         daily_pnl = _exact_decimal_subtract(

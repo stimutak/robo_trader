@@ -18,6 +18,7 @@ import pandas as pd
 from ib_async import Stock
 
 from ..logger import get_logger
+from ..market_data_contract import CanonicalBarBatch, MarketDataContractError
 from ..market_hours import get_market_session, is_market_open
 from ..monitoring.performance import Timer
 
@@ -114,6 +115,21 @@ class DataFetcher:
         duration = duration or self.duration
         bar_size = bar_size or self.bar_size
 
+        if hasattr(self.ib, "get_canonical_historical_bars"):
+            batch = await self.ib.get_canonical_historical_bars(
+                symbol=symbol,
+                duration=duration,
+                bar_size=bar_size,
+                what_to_show=what_to_show,
+                use_rth=use_rth,
+            )
+            if type(batch) is not CanonicalBarBatch or batch.contract.symbol != symbol.upper():
+                raise MarketDataContractError(
+                    "historical fetch returned an invalid canonical batch"
+                )
+            self.ib.assert_current_canonical_batch(batch)
+            return batch.to_frame()
+
         # Check if subprocess client or legacy IB client
         if hasattr(self.ib, "get_historical_bars"):
             # Subprocess client - use async method
@@ -205,22 +221,29 @@ class DataFetcher:
             logger.info(f"Fetched {len(df)} bars for {symbol}")
 
             # Prepare batch data for efficient storage
-            batch_data = []
-            for timestamp, row in df.iterrows():
-                # Convert pandas Timestamp to datetime for SQLite compatibility
-                if hasattr(timestamp, "to_pydatetime"):
-                    timestamp = timestamp.to_pydatetime()
-                batch_data.append(
-                    {
-                        "symbol": symbol,
-                        "timestamp": timestamp,
-                        "open": float(row.get("open", 0)),
-                        "high": float(row.get("high", 0)),
-                        "low": float(row.get("low", 0)),
-                        "close": float(row.get("close", 0)),
-                        "volume": int(row.get("volume", 0)),
-                    }
-                )
+            canonical = df.attrs.get("canonical_bar_batch")
+            if canonical is not None:
+                if type(canonical) is not CanonicalBarBatch:
+                    raise MarketDataContractError("stored frame has an invalid canonical batch")
+                self.ib.assert_current_canonical_batch(canonical)
+                batch_data = canonical.storage_rows()
+            else:
+                batch_data = []
+                for timestamp, row in df.iterrows():
+                    # Convert pandas Timestamp to datetime for SQLite compatibility
+                    if hasattr(timestamp, "to_pydatetime"):
+                        timestamp = timestamp.to_pydatetime()
+                    batch_data.append(
+                        {
+                            "symbol": symbol,
+                            "timestamp": timestamp,
+                            "open": float(row.get("open", 0)),
+                            "high": float(row.get("high", 0)),
+                            "low": float(row.get("low", 0)),
+                            "close": float(row.get("close", 0)),
+                            "volume": int(row.get("volume", 0)),
+                        }
+                    )
 
             if batch_data:
                 with Timer("database_write", self.monitor, instance=symbol):

@@ -1,5 +1,10 @@
 # RoboTrader Production ML Platform - Implementation Plan
 
+> **Current continuation point (2026-09-29):** Read [CURRENT_STATE.md](CURRENT_STATE.md)
+> and the [remediation plan](docs/ROBOTRADER_REMEDIATION_PLAN_2026-07-20.md).
+> Gate A remains closed and runtime BUY is disabled. The ML phase completion
+> entries below are historical; they do not establish current trading readiness.
+
 ## Current Status (2026-01-21)
 **Active Phase:** Phase 4 - Stabilization & Code Quality
 **Phase 2 Status:** 100% Complete ✅

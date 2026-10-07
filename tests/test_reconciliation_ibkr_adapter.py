@@ -20,6 +20,7 @@ from robo_trader.reconciliation.ibkr_adapter import (
     IBKRDiagnosticSnapshotProvider,
     ProtectiveQuoteSourceCapability,
     ProtectiveQuoteSourceIdentity,
+    assert_factory_owned_diagnostic_provider,
     assert_factory_owned_protective_quote_source,
     assert_producer_owned_broker_snapshot_result,
     build_diagnostic_provider,
@@ -90,6 +91,9 @@ def _contract():
 
 
 def _payload(*, now: datetime = NOW):
+    execution_start = (now - timedelta(seconds=2)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
     return {
         "snapshot_schema_version": 3,
         "account": ACCOUNT,
@@ -152,7 +156,7 @@ def _payload(*, now: datetime = NOW):
                 "quantity": "1.25",
                 "price": "120.25",
                 "average_price": "120.25",
-                "executed_at": (now - timedelta(minutes=1)).isoformat(),
+                "executed_at": max(execution_start, now - timedelta(minutes=1)).isoformat(),
                 "execution_exchange": "NASDAQ",
                 "commission": "1.23",
                 "commission_currency": "USD",
@@ -216,9 +220,7 @@ def _payload(*, now: datetime = NOW):
         ],
         "execution_scope": {
             "kind": "broker_date_since_midnight",
-            "start_at": (now - timedelta(seconds=2))
-            .replace(hour=0, minute=0, second=0, microsecond=0)
-            .isoformat(),
+            "start_at": execution_start.isoformat(),
             "end_at": now.isoformat(),
             "retention_scope": "ibkr_gateway_broker_date_since_midnight",
             "full_history": False,
@@ -550,6 +552,139 @@ async def test_quote_source_rejects_copy_wrong_runtime_reconnect_and_cleanup(mon
         )
 
 
+@pytest.mark.asyncio
+async def test_factory_provider_refreshes_one_shared_read_only_transport(monkeypatch):
+    provider, transport, runtime = await _factory_provider(monkeypatch)
+    transport.ping = AsyncMock(return_value=True)
+
+    shared = provider._shared_gateway_transport(runtime_context=runtime)
+    await provider.refresh()
+
+    assert shared is transport
+    transport.stop.assert_awaited_once_with()
+    transport.start.assert_awaited()
+    transport.connect.assert_awaited_with(
+        host="127.0.0.1",
+        port=4002,
+        client_id=997,
+        readonly=True,
+        timeout=30.0,
+    )
+    transport.ping.assert_awaited_once_with()
+    assert provider._shared_gateway_transport(runtime_context=runtime) is transport
+
+
+@pytest.mark.asyncio
+async def test_generation_lease_blocks_refresh_until_evidence_collection_releases(
+    monkeypatch,
+):
+    provider, transport, _runtime = await _factory_provider(monkeypatch)
+    transport.ping = AsyncMock(return_value=True)
+    transport.start.reset_mock()
+
+    token, generation = await provider._acquire_generation_lease()
+    refresh = asyncio.create_task(provider.refresh())
+    await asyncio.sleep(0)
+
+    assert generation == "quote-generation-1"
+    assert refresh.done() is False
+    transport.stop.assert_not_awaited()
+
+    provider._release_generation_lease(token, generation)
+    await refresh
+
+    transport.stop.assert_awaited_once_with()
+    transport.start.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_suspended_factory_provider_recovers_with_new_transport_generation(monkeypatch):
+    provider, transport, runtime = await _factory_provider(monkeypatch)
+    replacement = _WorkerGeneration("quote-generation-2", Mock())
+
+    async def stop_transport() -> None:
+        transport._generation = None
+        transport._connected = False
+        transport._connection_generation_id = None
+
+    async def connect_transport(**kwargs) -> bool:
+        assert kwargs["readonly"] is True
+        transport._generation = replacement
+        transport._connected = True
+        transport._connection_identity = ("127.0.0.1", 4002, 997, True)
+        transport._connection_generation_id = replacement.generation_id
+        return True
+
+    transport.stop = AsyncMock(side_effect=stop_transport)
+    transport.connect = AsyncMock(side_effect=connect_transport)
+    transport.ping = AsyncMock(return_value=True)
+
+    await provider.suspend()
+
+    with pytest.raises(BrokerEvidenceError, match="factory-owned"):
+        assert_factory_owned_diagnostic_provider(provider)
+    with pytest.raises(BrokerEvidenceError, match="factory-owned"):
+        provider._shared_gateway_transport(runtime_context=runtime)
+
+    await provider.refresh()
+
+    assert transport.stop.await_count == 2
+    assert provider._shared_gateway_transport(runtime_context=runtime) is transport
+    assert transport.protective_quote_generation == "quote-generation-2"
+
+
+@pytest.mark.asyncio
+async def test_poisoned_generation_can_suspend_then_refresh(monkeypatch):
+    provider, transport, runtime = await _factory_provider(monkeypatch)
+    replacement = _WorkerGeneration("quote-generation-recovered", Mock())
+    transport._generation = None
+    transport._connection_generation_id = None
+
+    async def connect_transport(**kwargs) -> bool:
+        transport._generation = replacement
+        transport._connected = True
+        transport._connection_identity = (
+            kwargs["host"],
+            kwargs["port"],
+            kwargs["client_id"],
+            kwargs["readonly"],
+        )
+        transport._connection_generation_id = replacement.generation_id
+        return True
+
+    transport.connect = AsyncMock(side_effect=connect_transport)
+    transport.ping = AsyncMock(return_value=True)
+
+    await provider.suspend()
+    await provider.refresh()
+
+    assert provider._closed is False
+    assert provider._suspended is False
+    assert provider._shared_gateway_transport(runtime_context=runtime) is transport
+    assert transport.protective_quote_generation == replacement.generation_id
+
+
+@pytest.mark.asyncio
+async def test_failed_refresh_remains_suspended_and_retryable(monkeypatch):
+    provider, transport, runtime = await _factory_provider(monkeypatch)
+    transport.ping = AsyncMock(return_value=True)
+    await provider.suspend()
+    transport.start = AsyncMock(side_effect=[RuntimeError("transient start failure"), None])
+
+    with pytest.raises(RuntimeError, match="transient start failure"):
+        await provider.refresh()
+
+    assert provider._closed is False
+    assert provider._suspended is True
+
+    await provider.refresh()
+
+    assert provider._closed is False
+    assert provider._suspended is False
+    assert provider._shared_gateway_transport(runtime_context=runtime) is transport
+    assert transport.start.await_count == 2
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -694,6 +829,7 @@ def _runtime():
         runtime_contract=SimpleNamespace(
             safety_account_scope=ACCOUNT_SCOPE,
             fingerprint=RUNTIME_FINGERPRINT,
+            environment="dev",
         ),
         diagnostic_connection=SimpleNamespace(
             host="127.0.0.1",
@@ -703,6 +839,41 @@ def _runtime():
         ),
         expected_account_for_provider=ACCOUNT,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_environment", ["dev", "test", "production"])
+async def test_default_diagnostic_transport_receives_validated_worker_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_environment: str,
+) -> None:
+    observed: list[object] = []
+    if runtime_environment == "production":
+        production_transport = SubprocessIBKRClient(worker_runtime_environment=runtime_environment)
+        assert production_transport._worker_synthetic_account_environment == ""
+
+    class _EnvironmentCapturingTransport:
+        def __init__(self, *, worker_runtime_environment: object = None) -> None:
+            observed.append(worker_runtime_environment)
+
+        async def start(self) -> None:
+            raise RuntimeError("stop after constructor proof")
+
+        async def stop(self) -> None:
+            return None
+
+    runtime = _runtime()
+    runtime.runtime_contract.environment = runtime_environment
+    monkeypatch.setattr(
+        adapter_module,
+        "SubprocessIBKRClient",
+        _EnvironmentCapturingTransport,
+    )
+
+    with pytest.raises(BrokerEvidenceError, match="initialization failed"):
+        await build_diagnostic_provider(runtime)
+
+    assert observed == [runtime_environment]
 
 
 @pytest.mark.asyncio
@@ -903,3 +1074,15 @@ async def test_factory_rejects_missing_account_before_constructing_transport():
         await build_diagnostic_provider(runtime, transport_factory=transport_factory)
 
     assert constructed is False
+
+
+@pytest.mark.parametrize("second", [0, 1, 2, 30, 59, 60])
+def test_snapshot_fixture_keeps_executions_within_scope_at_midnight(second):
+    now = datetime(2026, 9, 17, tzinfo=timezone.utc) + timedelta(seconds=second)
+    normalized_snapshot_from_transport(
+        _payload(now=now),
+        expected_account=ACCOUNT,
+        account_scope=ACCOUNT_SCOPE,
+        max_age_seconds=30.0,
+        now=now + timedelta(seconds=1),
+    )

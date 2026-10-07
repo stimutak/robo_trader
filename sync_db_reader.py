@@ -17,6 +17,7 @@ from robo_trader.database_validator import ValidationError, validate_portfolio_i
 from robo_trader.market_data_contract import (
     MarketDataContractError,
     bar_interval_seconds,
+    canonical_market_data_relation,
     market_data_max_age_seconds,
     validate_canonical_storage_row,
 )
@@ -242,16 +243,23 @@ class SyncDatabaseReader:
             timeframe, interval_seconds, timezone_name, session_policy,
             session, source, retrieval_timestamp, broker_timestamp,
             adjustment_state, quality_flags, transport_generation,
-            timestamp_semantics, use_rth, what_to_show
+            timestamp_semantics, use_rth, what_to_show, volume_unit
         """
         try:
+            v2_objects = self._fetch_all(
+                "SELECT type FROM sqlite_master WHERE name = 'canonical_market_data_v2'"
+            )
+            if v2_objects and (len(v2_objects) != 1 or v2_objects[0]["type"] != "table"):
+                raise MarketDataContractError("canonical version-2 storage is not a table")
+            include_v2 = bool(v2_objects)
+            relation = canonical_market_data_relation(include_v2=include_v2)
             try:
                 selector_sql = f"""
                     SELECT {columns}
-                    FROM canonical_market_data
+                    FROM {relation}
                     WHERE symbol = ? {"AND timeframe = ?" if timeframe is not None else ""}
                     ORDER BY timestamp DESC, interval_seconds ASC,
-                             retrieval_timestamp DESC, con_id DESC
+                             retrieval_timestamp DESC, con_id DESC, schema_version DESC
                     LIMIT 1
                 """
                 selector_params = (symbol, timeframe) if timeframe is not None else (symbol,)
@@ -262,11 +270,11 @@ class SyncDatabaseReader:
                     rows = self._fetch_all(
                         f"""
                         SELECT {columns}
-                        FROM canonical_market_data
+                        FROM {relation}
                         WHERE symbol = ? AND con_id = ? AND timeframe = ?
                           AND session_policy = ? AND source = ?
                           AND adjustment_state = ? AND timestamp_semantics = ?
-                          AND use_rth = ? AND what_to_show = ?
+                          AND use_rth = ? AND what_to_show = ? AND schema_version = ?
                         ORDER BY timestamp DESC, retrieval_timestamp DESC
                         LIMIT ?
                         """,
@@ -280,11 +288,12 @@ class SyncDatabaseReader:
                             selected["timestamp_semantics"],
                             selected["use_rth"],
                             selected["what_to_show"],
+                            selected["schema_version"],
                             limit,
                         ),
                     )
             except sqlite3.OperationalError as error:
-                if "no such table" not in str(error).lower():
+                if include_v2 or "no such table" not in str(error).lower():
                     raise
                 rows = []
             if rows:
@@ -294,6 +303,8 @@ class SyncDatabaseReader:
                     stored_item = dict(row)
                     stored_item["symbol"] = symbol
                     stored_item["use_rth"] = bool(stored_item["use_rth"])
+                    if stored_item["schema_version"] == 1:
+                        stored_item.pop("volume_unit")
                     item = validate_canonical_storage_row(stored_item)
                     event_time = datetime.fromisoformat(
                         str(item["timestamp"]).replace("Z", "+00:00")

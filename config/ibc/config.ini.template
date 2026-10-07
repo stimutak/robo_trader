@@ -80,5 +80,9 @@ AllowBlindTrading=no
 DismissPasswordExpiryWarning=no
 DismissNSEComplianceNotice=yes
 AcceptBidAskLastSizeDisplayUpdateNotification=accept
+# Accepting that notification can enable lot-based historical volume. Explicitly
+# request shares; verify the running Gateway setting before admitting liquidity.
+# This template is configuration intent, not evidence that Gateway applied it.
+SendMarketDataInLotsForUSstocks=no
 LogStructureWhen=never
 LogStructureScope=known

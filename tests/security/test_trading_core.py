@@ -15,7 +15,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -327,21 +327,106 @@ def test_ai_alone_does_not_buy() -> None:
 
 
 # ---------------------------------------------------------------------------
-# TC-H3 — pairs BUY validates against risk gates (smoke / TODO)
+# TC-H3 — pairs execution containment (BUY risk validation remains deferred)
 # ---------------------------------------------------------------------------
 
 
-def test_pairs_buy_calls_validate_order() -> None:
-    """Smoke check: the pairs-trading code path now calls validate_order
-    before placing each leg. The full integration test would require
-    spinning up an AsyncRunner with a stubbed strategy. For now we assert
-    the expected method exists on RiskManager and is callable."""
-    rm = create_risk_manager_from_config(_build_config())
-    assert callable(rm.validate_order)
-    pytest.skip(
-        "TODO: integration test exercising AsyncRunner pairs path with mocked "
-        "_place_order_with_circuit_breaker to capture validate_order calls."
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal_type", ["long_a_short_b", "long_b_short_a"])
+async def test_pairs_signals_remain_quarantined_before_state_or_orders(
+    monkeypatch: pytest.MonkeyPatch, signal_type: str
+) -> None:
+    """Real pairs dispatch must stay quarantined even with fresh protection.
+
+    This replaces the obsolete smoke-test skip with current containment
+    coverage. TC-H3 BUY-leg validate_order integration remains a backlog
+    item for the atomic two-leg lifecycle; this test never enables pairs
+    admission to reach that currently unreachable execution path.
+    """
+    import pandas as pd
+
+    import robo_trader.runner_async as runner_module
+
+    pair = ("AAPL", "MSFT")
+    prices = {"AAPL": 100.0, "MSFT": 200.0}
+    runner = runner_module.AsyncRunner.__new__(runner_module.AsyncRunner)
+    # Isolate resource startup and unrelated symbol work; dispatch and the
+    # pairs admission decision below are the real production methods.
+    runner.setup = AsyncMock()
+    runner._ensure_health_monitor_for_activation = AsyncMock()
+    runner._activate_after_setup = MagicMock()
+    runner.teardown = AsyncMock()
+    runner.run_parallel = AsyncMock(return_value=[])
+    runner.update_account_summary = AsyncMock()
+    runner.monitor = SimpleNamespace(log_performance_summary=AsyncMock())
+    runner.cfg = SimpleNamespace(symbols=list(pair), risk=SimpleNamespace(max_open_positions=10))
+    runner.max_concurrent_symbols = 1
+    runner.ai_analyst = None
+    runner.stat_arb_strategy = None
+    runner.use_correlation_sizing = False
+    runner.positions = {}
+    runner.portfolio = Portfolio(starting_cash=100_000.0)
+    runner.portfolio_id = "default"
+    runner.market_data_cache = {
+        symbol: pd.DataFrame({"close": [price]}) for symbol, price in prices.items()
+    }
+    runner.pairs_strategy = SimpleNamespace(
+        pair_stats={pair: object()},
+        analyze_pairs=AsyncMock(return_value=[{"pair": pair, "signal": signal_type}]),
+        update_position=MagicMock(),
     )
+    runner.db = SimpleNamespace(
+        get_positions=AsyncMock(return_value=[]),
+        has_recent_buy_trade=AsyncMock(return_value=False),
+        has_recent_sell_trade=AsyncMock(return_value=False),
+        record_trade=AsyncMock(),
+        update_position=AsyncMock(),
+    )
+    runner.risk = MagicMock()
+    runner._place_order_with_circuit_breaker = AsyncMock()
+    runner.stop_loss_monitor = StopLossMonitor(
+        execute_reduction=AsyncMock(), risk_manager=runner.risk, portfolio_id="default"
+    )
+    now = datetime(2026, 7, 23, 15, 0, tzinfo=timezone.utc)
+    runner.stop_loss_monitor._utcnow = lambda: now
+    runner.stop_loss_monitor._monotonic = lambda: 1000.0
+    for index, (symbol, price) in enumerate(prices.items(), start=1):
+        assert await runner.stop_loss_monitor.update_price(
+            symbol,
+            price,
+            source_timestamp=now,
+            source=ProtectiveQuoteSource.LIVE_BROKER,
+            con_id=265_000 + index,
+            transport_generation="test-pairs-generation",
+            source_event_id=f"test-pairs-event-{index}",
+        )
+        assert runner._has_live_protective_feed(symbol)
+
+    admission_decisions = []
+
+    def observe_real_admission(candidate):
+        admitted = runner_module.AsyncRunner._pairs_execution_admitted(runner, candidate)
+        admission_decisions.append((candidate, admitted))
+        return admitted
+
+    runner._pairs_execution_admitted = observe_real_admission
+    monkeypatch.setattr(runner_module, "MEAN_REVERSION_AVAILABLE", True)
+    monkeypatch.setattr(runner_module, "is_trading_allowed", lambda: True)
+
+    await runner.run(list(pair))
+
+    runner.pairs_strategy.analyze_pairs.assert_awaited_once_with([pair], prices)
+    assert admission_decisions == [(pair, False)]
+    runner.risk.validate_order.assert_not_called()
+    runner._place_order_with_circuit_breaker.assert_not_awaited()
+    runner.pairs_strategy.update_position.assert_not_called()
+    runner.db.record_trade.assert_not_awaited()
+    runner.db.update_position.assert_not_awaited()
+    assert runner.positions == runner.portfolio.positions == {}
+    assert runner.portfolio.cash == Decimal("100000")
+    assert runner.portfolio.realized_pnl == Decimal("0")
+    runner.update_account_summary.assert_awaited_once()
+    runner.teardown.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1454,23 +1539,81 @@ async def test_circuit_breaker_rejects_non_finite_price_c_13(monkeypatch) -> Non
     assert "Non-finite" in result.message or "non-finite" in result.message.lower()
 
 
-def test_config_does_not_silently_flip_readonly_b_12(monkeypatch):
-    """B-12: setting ENVIRONMENT=production alone must NOT clear the
-    readonly flag. Live order placement requires the explicit
-    IBKR_LIVE_ALLOW_ORDERS=true consent flag.
-    """
-    monkeypatch.setenv("ENVIRONMENT", "production")
-    monkeypatch.delenv("IBKR_LIVE_ALLOW_ORDERS", raising=False)
+@pytest.fixture
+def production_paper_config_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Supply production readiness only inside a disposable paper environment."""
     import robo_trader.config as cfg_mod
 
-    try:
-        cfg = cfg_mod.load_config()
-    except Exception:
-        pytest.skip("load_config requires additional environment for production mode")
-        return
-    assert (
-        cfg.ibkr.readonly is True
-    ), "ENVIRONMENT=production without IBKR_LIVE_ALLOW_ORDERS must keep readonly=True"
+    account = "DU1234567"
+    scope_key = "0123456789abcdef" * 4
+    environment = {
+        "ENVIRONMENT": "production",
+        "EXECUTION_MODE": "paper",
+        "TRADING_MODE": "paper",
+        "IBKR_HOST": "127.0.0.1",
+        "IBKR_PORT": "4002",
+        "IBKR_CLIENT_ID": "123",
+        "IBKR_ACCOUNT": account,
+        "IBKR_APPROVED_ACCOUNTS": account,
+        "IBKR_ACCOUNT_TYPE": "paper",
+        "RT_DB_PATH": str(tmp_path / "paper.db"),
+        "RT_STATE_NAMESPACE": "paper",
+        "LOG_FILE": str(tmp_path / "config-test.log"),
+        "SAFETY_ACCOUNT_SCOPE_KEY": scope_key,
+        "SAFETY_ACCOUNT_SCOPE": cfg_mod._derive_safety_account_scope(scope_key, account),
+        "SAFETY_JOURNAL_PATH": str(tmp_path / "safety-journal.db"),
+        "DASH_AUTH_ENABLED": "true",
+        "MODEL_SIGNING_REQUIRED": "true",
+        "MONITORING_ENABLE_ALERTS": "true",
+        "MONITORING_LOG_LEVEL": "INFO",
+        "BACKUP_READY": "true",
+        "MODEL_ARTIFACT_SET": "readonly-test-fixtures",
+        "BUILD_ID": "readonly-test",
+    }
+    # Do not import the operator's .env or relax any config validators.
+    monkeypatch.setattr(cfg_mod, "load_dotenv", lambda: None)
+    with patch.dict("os.environ", environment, clear=True):
+        yield cfg_mod.os.environ
+
+
+@pytest.mark.parametrize("readonly", [None, "true"], ids=["default", "explicit"])
+@pytest.mark.parametrize("legacy_consent", [None, "true"], ids=["no-consent", "legacy-consent"])
+def test_config_does_not_silently_flip_readonly_b_12(
+    production_paper_config_environment,
+    readonly: str | None,
+    legacy_consent: str | None,
+) -> None:
+    """B-12: production settings and legacy consent cannot enable broker writes."""
+    import robo_trader.config as cfg_mod
+
+    if readonly is not None:
+        production_paper_config_environment["IBKR_READONLY"] = readonly
+    if legacy_consent is not None:
+        production_paper_config_environment["IBKR_LIVE_ALLOW_ORDERS"] = legacy_consent
+
+    cfg = cfg_mod.load_config()
+
+    assert cfg.environment is cfg_mod.Environment.PRODUCTION
+    assert cfg.execution.mode is cfg_mod.TradingMode.PAPER
+    assert cfg.ibkr.port == 4002
+    assert cfg.ibkr.readonly is True
+    assert cfg.runtime_contract.ibkr_readonly is True
+    assert cfg.runtime_contract.public_dict()["live_capability"] == "disabled"
+
+
+@pytest.mark.parametrize("legacy_consent", [None, "true"], ids=["no-consent", "legacy-consent"])
+def test_production_config_rejects_writable_ibkr_even_with_legacy_consent(
+    production_paper_config_environment,
+    legacy_consent: str | None,
+) -> None:
+    import robo_trader.config as cfg_mod
+
+    production_paper_config_environment["IBKR_READONLY"] = "false"
+    if legacy_consent is not None:
+        production_paper_config_environment["IBKR_LIVE_ALLOW_ORDERS"] = legacy_consent
+
+    with pytest.raises(cfg_mod.ConfigValidationError, match="IBKR_READONLY=true"):
+        cfg_mod.load_config()
 
 
 # ---------------------------------------------------------------------------

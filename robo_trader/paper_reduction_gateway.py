@@ -10,26 +10,36 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
+import math
 import os
 import stat
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, Optional
+from zoneinfo import ZoneInfo
 
 from .broker_safety_evidence import BrokerContractSafetySnapshot
 from .clients.subprocess_ibkr_client import SubprocessIBKRClient
 from .database_async import AsyncTradingDatabase
 from .execution import ExecutionResult, Order, PaperExecutor
-from .market_data_contract import BrokerProtectiveQuote
+from .market_data_contract import (
+    BrokerProtectiveQuote,
+    CanonicalBarBatch,
+    bar_interval_seconds,
+    market_data_max_age_seconds,
+)
 from .paper_execution_capability import (
     PaperReductionExecutionAuthority,
     _bind_gateway_reduction_execution,
     _issue_gateway_reduction_binding_capability,
 )
+from .paper_execution_cost import PaperEntryCost, paper_entry_cost
 from .paper_reduction_submitter import (
     LocalPaperOrderStatus,
     LocalPaperTerminalOutcome,
@@ -43,9 +53,21 @@ from .protective_quote_evidence import (
     ProtectiveQuoteSource,
     assert_current_authoritative_protective_quote,
 )
+from .reconciliation.ibkr_adapter import IBKRDiagnosticSnapshotProvider
 from .reconciliation.identity import (
     RuntimeSafetyContext,
     assert_validated_runtime_safety_context,
+)
+from .risk.canonical_correlation import CanonicalCorrelation, canonical_correlation
+from .risk.entry_contract import _exact_multiply, _exact_subtract, _sector, _symbol
+from .risk.entry_reservations import PendingEntryCapacity, summarize_entry_capacity
+from .risk.paper_fill_accounting import PaperFillAccounting, PaperFillReplayResult
+from .risk.paper_ledger_snapshot import (
+    PaperRiskLedgerSnapshot,
+    PaperRiskLedgerSnapshotError,
+    assert_complete_paper_daily_history,
+    assert_owned_paper_risk_ledger_snapshot,
+    collect_paper_risk_ledger_snapshot,
 )
 from .safety import (
     OrderSide,
@@ -67,6 +89,50 @@ class PaperReductionGatewayError(RuntimeError):
 
 
 _REFERENCE_PRICE_TICK = Decimal("0.0001")
+_ENTRY_COOLDOWN = timedelta(minutes=10)
+
+
+@dataclass(frozen=True, slots=True)
+class PaperEntryValuation:
+    """Exact held exposure and history, not an order authorization.
+
+    Symbol gross and held-position presence cover all account portfolios.
+    Pending reservations are a separate required admission input.
+    """
+
+    portfolio_cash_usd: Decimal
+    portfolio_equity_usd: Decimal
+    portfolio_gross_notional_usd: Decimal
+    account_equity_usd: Decimal
+    account_gross_notional_usd: Decimal
+    account_occupied_position_slots: int
+    observed_at: datetime
+    symbol: str
+    current_symbol_gross_notional_usd: Decimal
+    symbol_has_position: bool
+    symbol_entry_allowed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PaperEntrySectorExposure:
+    """Non-authorizing exposure under an explicit immutable classification policy."""
+
+    sector: str
+    current_sector_gross_notional_usd: Decimal
+    pending_sector_notional_usd: Decimal
+    classifications: tuple[tuple[str, str], ...]
+    journal_head: tuple[int, str]
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryMarketContext:
+    owner: asyncio.Task
+    portfolio_id: str
+    symbol: str
+    ledger: PaperRiskLedgerSnapshot
+    quotes: tuple[BrokerProtectiveQuote, ...]
+    started_monotonic: float
+    journal_head: tuple[int, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +141,7 @@ class _PaperRuntimeBinding:
     reduction_execution_authority: PaperReductionExecutionAuthority
     protective_quote_producer: object
     settlement_participant: PaperRuntimeSettlementParticipant
+    executor: PaperExecutor | None = None
 
 
 @dataclass(slots=True)
@@ -95,6 +162,8 @@ class PaperReductionGateway:
         coordinator: SafetyRuntimeCoordinator,
         database: AsyncTradingDatabase,
         *,
+        diagnostic_provider: IBKRDiagnosticSnapshotProvider | None = None,
+        fill_accounting: PaperFillAccounting | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -141,9 +210,25 @@ class PaperReductionGateway:
                 "shared safety database does not match the runtime ledger path"
             )
         self._database = database
-        self._client = SubprocessIBKRClient(
-            worker_runtime_environment=self._runtime_context.runtime_contract.environment,
-        )
+        if fill_accounting is not None and type(fill_accounting) is not PaperFillAccounting:
+            raise PaperReductionGatewayError("exact paper fill accounting is required")
+        self._fill_accounting = fill_accounting
+        self._entry_accounting_ready = False
+        self._diagnostic_provider = diagnostic_provider
+        self._owns_diagnostic_client = diagnostic_provider is None
+        if diagnostic_provider is None:
+            self._client = SubprocessIBKRClient(
+                worker_runtime_environment=self._runtime_context.runtime_contract.environment,
+            )
+        else:
+            try:
+                self._client = diagnostic_provider._shared_gateway_transport(
+                    runtime_context=self._runtime_context,
+                )
+            except Exception as exc:
+                raise PaperReductionGatewayError(
+                    "shared diagnostic provider binding is invalid"
+                ) from exc
         self._account_order_gate = asyncio.Lock()
         self._bindings: dict[str, _PaperRuntimeBinding] = {}
         self._active_runtime_binding_session: _PaperRuntimeBindingSession | None = None
@@ -209,14 +294,27 @@ class PaperReductionGateway:
             context = assert_validated_runtime_safety_context(self._runtime_context)
             connection = context.diagnostic_connection
             try:
-                await self._client.start()
-                connected = await self._client.connect(
-                    host=connection.host,
-                    port=connection.port,
-                    client_id=connection.client_id,
-                    readonly=connection.readonly,
-                    timeout=30.0,
-                )
+                if getattr(self, "_fill_accounting", None) is not None:
+                    await self._prepare_entry_accounting_locked(self._fill_accounting)
+                if getattr(self, "_owns_diagnostic_client", True):
+                    await self._client.start()
+                    connected = await self._client.connect(
+                        host=connection.host,
+                        port=connection.port,
+                        client_id=connection.client_id,
+                        readonly=connection.readonly,
+                        timeout=30.0,
+                    )
+                else:
+                    provider = self._diagnostic_provider
+                    if type(provider) is not IBKRDiagnosticSnapshotProvider:
+                        raise PaperReductionGatewayError(
+                            "shared diagnostic provider is unavailable"
+                        )
+                    self._client = provider._shared_gateway_transport(
+                        runtime_context=context,
+                    )
+                    connected = await self._client.ping()
                 if connected is not True:
                     raise PaperReductionGatewayError(
                         "diagnostic broker connection was not established"
@@ -225,6 +323,66 @@ class PaperReductionGateway:
                 await self._stop_client_owned(error)
                 raise
             self._started = True
+
+    async def prepare_entry_accounting(
+        self, accounting: PaperFillAccounting
+    ) -> PaperFillReplayResult:
+        """Complete startup/recovery replay before daily entry evidence is usable."""
+        async with self._account_order_gate:
+            return await self._prepare_entry_accounting_locked(accounting)
+
+    async def _prepare_entry_accounting_locked(
+        self, accounting: PaperFillAccounting
+    ) -> PaperFillReplayResult:
+        self._entry_accounting_ready = False
+        if getattr(self, "_terminal_quarantine_reason", None) is not None:
+            raise PaperReductionGatewayError("quarantined gateway cannot prepare entry accounting")
+        if type(accounting) is not PaperFillAccounting:
+            raise PaperReductionGatewayError("exact paper fill accounting is required")
+        runtime = self._runtime_context.runtime_contract
+        snapshot = await collect_paper_risk_ledger_snapshot(self._database, runtime)
+        portfolios = tuple(p for p, _ in snapshot.portfolio_cash)
+        accounting.assert_runtime_coverage(runtime, portfolios)
+        self._fill_accounting = accounting
+        result = await accounting.replay(self._database)
+        # Empty scopes still require a fresh successful independent-authority
+        # read; an empty outbox must not skip authority validation.
+        for portfolio in portfolios:
+            await accounting.current_total(portfolio)
+        self._entry_accounting_ready = True
+        return result
+
+    async def entry_daily_notional(self, *, portfolio_id: str) -> Decimal:
+        """Read a fresh authenticated total within the task-owned entry context."""
+        self.entry_valuation(portfolio_id=portfolio_id)
+        accounting = getattr(self, "_fill_accounting", None)
+        if (
+            type(accounting) is not PaperFillAccounting
+            or getattr(self, "_entry_accounting_ready", False) is not True
+        ):
+            raise PaperReductionGatewayError("entry accounting replay is unavailable")
+        context = self._entry_market_context
+        accounting.assert_runtime_coverage(
+            self._runtime_context.runtime_contract,
+            tuple(p for p, _ in context.ledger.portfolio_cash),
+        )
+        as_of = datetime.now(timezone.utc)
+        try:
+            assert_complete_paper_daily_history(
+                context.ledger, portfolio_id=portfolio_id, as_of=as_of
+            )
+        except PaperRiskLedgerSnapshotError as exc:
+            raise PaperReductionGatewayError("entry daily history is incomplete") from exc
+        try:
+            total = await accounting.current_total(portfolio_id, as_of=as_of)
+        except BaseException:
+            self._entry_accounting_ready = False
+            raise
+        self.entry_valuation(portfolio_id=portfolio_id)
+        zone = ZoneInfo("America/New_York")
+        if datetime.now(timezone.utc).astimezone(zone).date() != as_of.astimezone(zone).date():
+            raise PaperReductionGatewayError("entry daily history changed trading date during read")
+        return total
 
     async def _stop_client_owned(
         self,
@@ -249,7 +407,14 @@ class PaperReductionGateway:
         if subscribed is not None:
             subscribed.clear()
 
-        task = asyncio.create_task(self._client.stop())
+        if getattr(self, "_owns_diagnostic_client", True):
+            cleanup = self._client.stop()
+        else:
+            provider = self._diagnostic_provider
+            if type(provider) is not IBKRDiagnosticSnapshotProvider:
+                raise PaperReductionGatewayError("shared diagnostic provider is unavailable")
+            cleanup = provider.suspend()
+        task = asyncio.create_task(cleanup)
         cancellation: asyncio.CancelledError | None = None
         stop_failure: BaseException | None = None
         while not task.done():
@@ -558,7 +723,8 @@ class PaperReductionGateway:
                     pass
             await self._invalidate_protective_quote_producers()
             try:
-                await self._stop_client_owned()
+                if getattr(self, "_owns_diagnostic_client", True):
+                    await self._stop_client_owned()
             finally:
                 self._started = False
                 self._diagnostic_recovery_required = False
@@ -572,15 +738,22 @@ class PaperReductionGateway:
         try:
             context = assert_validated_runtime_safety_context(self._runtime_context)
             connection = context.diagnostic_connection
-            await self._stop_client_owned()
-            await self._client.start()
-            connected = await self._client.connect(
-                host=connection.host,
-                port=connection.port,
-                client_id=connection.client_id,
-                readonly=connection.readonly,
-                timeout=30.0,
-            )
+            if getattr(self, "_owns_diagnostic_client", True):
+                await self._stop_client_owned()
+                await self._client.start()
+                connected = await self._client.connect(
+                    host=connection.host,
+                    port=connection.port,
+                    client_id=connection.client_id,
+                    readonly=connection.readonly,
+                    timeout=30.0,
+                )
+            else:
+                provider = self._diagnostic_provider
+                if type(provider) is not IBKRDiagnosticSnapshotProvider:
+                    raise PaperReductionGatewayError("shared diagnostic provider is unavailable")
+                await provider.refresh()
+                connected = True
             if connected is not True or await self._client.ping() is not True:
                 raise PaperReductionGatewayError("diagnostic broker connection did not recover")
         except BaseException as error:
@@ -593,11 +766,13 @@ class PaperReductionGateway:
     async def refresh_diagnostic_connection(self) -> None:
         """Replace stale broker state before order admission can resume.
 
-        The runner and this gateway intentionally own separate read-only IBKR
-        clients.  A runner recovery therefore cannot prove that the gateway's
-        diagnostic session survived the same outage.  Hold the account-wide
-        gate, mark this boundary unavailable before the first await, and only
-        restore ``started`` after a fresh connect and active ping both succeed.
+        The gateway borrows the reconciliation provider's read-only generation
+        in production. A runner recovery therefore must replace that shared
+        diagnostic generation before either reconciliation or reductions may
+        resume. Hold the account-wide gate, mark this boundary unavailable
+        before the first await, and only restore ``started`` after a fresh
+        connect and active ping both succeed. Legacy isolated construction
+        retains the independently owned-client path for compatibility.
         """
 
         require_paper_terminal_settlement_ready()
@@ -750,6 +925,7 @@ class PaperReductionGateway:
             reduction_execution_authority=reduction_execution_authority,
             protective_quote_producer=protective_quote_producer,
             settlement_participant=settlement_participant,
+            executor=executor,
         )
         return None
 
@@ -781,9 +957,37 @@ class PaperReductionGateway:
                 raise PaperReductionGatewayError(
                     "diagnostic broker is unavailable for entry admission"
                 )
+            entry_ledger = None
+            entry_started = getattr(self, "_monotonic", time.monotonic)()
+            if portfolio_id is not None:
+                if (
+                    symbol is None
+                    or type(self._bindings.get(portfolio_id)) is not _PaperRuntimeBinding
+                ):
+                    raise PaperReductionGatewayError(
+                        "entry portfolio has no registered runtime binding"
+                    )
+                entry_journal = await self._read_entry_journal_locked()
+                entry_ledger = await collect_paper_risk_ledger_snapshot(
+                    self._database, self._runtime_context.runtime_contract
+                )
+                if portfolio_id not in dict(entry_ledger.portfolio_cash):
+                    raise PaperReductionGatewayError("entry portfolio has no ledger coverage")
+                if any(
+                    event.portfolio_id not in dict(entry_ledger.portfolio_cash)
+                    for event in entry_journal.pending_entry_events
+                ):
+                    raise PaperReductionGatewayError(
+                        "pending entry portfolio has no ledger coverage"
+                    )
             current_quote: BrokerProtectiveQuote | None = None
             if symbol is not None:
-                effective_symbols = tuple(sorted(set((symbol,)).union(self._protected_symbols())))
+                held_symbols = (
+                    () if entry_ledger is None else tuple(p.symbol for p in entry_ledger.positions)
+                )
+                effective_symbols = tuple(
+                    sorted(set((symbol,)).union(self._protected_symbols(), held_symbols))
+                )
                 try:
                     quotes = await self._fetch_protective_quotes_locked(
                         effective_symbols,
@@ -824,7 +1028,353 @@ class PaperReductionGateway:
                     )
                 if symbol is None or current_quote is None:
                     raise PaperReductionGatewayError("entry serialization scope is malformed")
-            yield current_quote
+            try:
+                if entry_ledger is not None:
+                    self._entry_market_context = _EntryMarketContext(
+                        asyncio.current_task(),
+                        portfolio_id,
+                        symbol,
+                        entry_ledger,
+                        quotes,
+                        entry_started,
+                        (entry_journal.last_sequence, entry_journal.last_chain_hash),
+                    )
+                    self.entry_valuation(portfolio_id=portfolio_id)
+                    await self._assert_entry_journal_current(self._entry_market_context)
+                    self.entry_valuation(portfolio_id=portfolio_id)
+                yield current_quote
+            finally:
+                self._entry_market_context = None
+
+    async def _read_entry_journal_locked(self):
+        coordinator = getattr(self, "_coordinator", None)
+        runtime = self._runtime_context.runtime_contract
+        if (
+            not self._account_order_gate.locked()
+            or type(coordinator) is not SafetyRuntimeCoordinator
+            or not coordinator.started
+            or coordinator.identity_account_scope != runtime.safety_account_scope
+            or coordinator.identity_execution_domain_scope != runtime.safety_execution_domain_scope
+            or coordinator.safety_journal_database_path
+            != lexical_path_preserving_leaf(runtime.safety_journal_path)
+        ):
+            raise PaperReductionGatewayError("entry journal coordinator binding is invalid")
+        task = asyncio.create_task(asyncio.to_thread(coordinator.replay_for_entry))
+        cancellation = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                if task.cancelled():
+                    raise
+                cancellation = error
+            except BaseException:
+                break
+        try:
+            state = task.result()
+        except Exception as error:
+            raise PaperReductionGatewayError("entry journal replay failed") from error
+        if cancellation is not None:
+            raise cancellation
+        if state.active_reservations or state.quarantined_reservations:
+            raise PaperReductionGatewayError("entry blocked by unresolved reduction authority")
+        return state
+
+    async def _assert_entry_journal_current(self, context):
+        state = await self._read_entry_journal_locked()
+        if (state.last_sequence, state.last_chain_hash) != context.journal_head:
+            raise PaperReductionGatewayError("entry journal changed during evaluation")
+        return state
+
+    def entry_execution_cost(self, *, portfolio_id: str) -> PaperEntryCost:
+        """Estimate current registered paper pricing inside the owning context."""
+        self.entry_valuation(portfolio_id=portfolio_id)
+        binding = self._bindings[portfolio_id]
+        if type(binding.executor) is not PaperExecutor:
+            raise PaperReductionGatewayError("entry cost requires a registered exact executor")
+        slippage = binding.executor.slippage_bps
+        if type(slippage) is not float or not math.isfinite(slippage) or not 0 <= slippage < 10000:
+            raise PaperReductionGatewayError("entry executor slippage is invalid")
+        context = self._entry_market_context
+        quote = next(quote for quote in context.quotes if quote.symbol == context.symbol)
+        try:
+            return paper_entry_cost(quote.price, Decimal(str(slippage)))
+        except ValueError as error:
+            raise PaperReductionGatewayError("entry executable price is invalid") from error
+
+    async def entry_pending_exposure(
+        self, *, portfolio_id: str, sector: str
+    ) -> PendingEntryCapacity:
+        """Read current pending capacity only inside the task-owned entry context."""
+        self.entry_valuation(portfolio_id=portfolio_id)
+        context = self._entry_market_context
+        state = await self._assert_entry_journal_current(context)
+        self.entry_valuation(portfolio_id=portfolio_id)
+        return summarize_entry_capacity(
+            state,
+            portfolio_id=portfolio_id,
+            symbol=context.symbol,
+            sector=sector,
+            held_symbols=tuple(position.symbol for position in context.ledger.positions),
+        )
+
+    async def entry_correlation(
+        self, *, portfolio_id: str, batches: tuple[CanonicalBarBatch, ...], return_count: int
+    ) -> CanonicalCorrelation:
+        """Compute account-wide correlation from current transport-owned history.
+
+        Fetch the configured history window before entering serialization. This
+        read performs no broker I/O and grants no order authority. Final admission
+        must bind the window policy, source version and journal/ledger state.
+        """
+        self.entry_valuation(portfolio_id=portfolio_id)
+        context = self._entry_market_context
+        producer = self._client
+        if type(producer) is not SubprocessIBKRClient or type(batches) is not tuple:
+            raise PaperReductionGatewayError("correlation requires exact owned source batches")
+        state = await self._assert_entry_journal_current(context)
+        self.entry_valuation(portfolio_id=portfolio_id)
+        required_symbols = {context.symbol} | {p.symbol for p in context.ledger.positions}
+        identities = {
+            q.symbol: (q.con_id, q.primary_exchange)
+            for q in context.quotes
+            if q.symbol in required_symbols
+        }
+        for event in state.pending_entry_events:
+            payload = json.loads(event.payload_json)
+            symbol = payload["symbol"]
+            contract = payload["broker_contract"]
+            identity = (contract[0], contract[6])
+            if symbol in identities and identities[symbol] != identity:
+                raise PaperReductionGatewayError(
+                    "correlation pending contract conflicts with marks"
+                )
+            identities[symbol] = identity
+
+        def authenticate():
+            if self._client is not producer:
+                raise ValueError("correlation source client was replaced")
+            owned = {}
+            for batch in batches:
+                producer.assert_current_canonical_batch(batch)
+                symbol = batch.contract.symbol
+                if symbol in owned:
+                    raise ValueError("correlation source coverage is ambiguous")
+                owned[symbol] = batch
+            if set(owned) != set(identities):
+                raise ValueError("correlation source coverage is incomplete")
+            return owned
+
+        try:
+            owned = authenticate()
+            result = canonical_correlation(
+                candidate=owned[context.symbol],
+                held=tuple(owned[symbol] for symbol in sorted(owned) if symbol != context.symbol),
+                expected_contracts=tuple(
+                    (symbol, *identity) for symbol, identity in sorted(identities.items())
+                ),
+                transport_generation=producer.protective_quote_generation,
+                return_count=return_count,
+                now=datetime.now(timezone.utc),
+            )
+            await self._assert_entry_journal_current(context)
+            authenticate()
+        except ValueError as error:
+            raise PaperReductionGatewayError("correlation source evidence is invalid") from error
+        self.entry_valuation(portfolio_id=portfolio_id)
+        max_age = timedelta(
+            seconds=market_data_max_age_seconds(
+                bar_interval_seconds(owned[context.symbol].contract.timeframe)
+            )
+        )
+        now = datetime.now(timezone.utc)
+        if any(
+            not timedelta(0) <= now - timestamp <= max_age
+            for timestamp in (result.observed_at, result.window_end)
+        ):
+            raise PaperReductionGatewayError("correlation history became stale during evaluation")
+        return result
+
+    async def entry_sector_exposure(
+        self, *, portfolio_id: str, classifications: tuple[tuple[str, str], ...]
+    ) -> PaperEntrySectorExposure:
+        """Value all held and pending sectors against explicit policy groupings.
+
+        The caller supplies a complete immutable policy, not a market-data claim.
+        Final admission must bind this same policy and revalidate the ledger and
+        journal; this read cannot authorize an order.
+        """
+        self.entry_valuation(portfolio_id=portfolio_id)
+        context = self._entry_market_context
+        try:
+            if type(classifications) is not tuple:
+                raise ValueError("immutable tuple required")
+            policy = {}
+            for pair in classifications:
+                if type(pair) is not tuple or len(pair) != 2:
+                    raise ValueError("invalid classification pair")
+                symbol, sector = _symbol(pair[0]), _sector(pair[1])
+                if symbol in policy or sector.casefold() in {
+                    "unknown",
+                    "unclassified",
+                    "n/a",
+                    "none",
+                    "other",
+                }:
+                    raise ValueError("ambiguous classification")
+                policy[symbol] = sector
+        except ValueError as error:
+            raise PaperReductionGatewayError("entry classification policy is invalid") from error
+        state = await self._assert_entry_journal_current(context)
+        self.entry_valuation(portfolio_id=portfolio_id)
+        required = {context.symbol} | {p.symbol for p in context.ledger.positions}
+        pending_payloads = tuple(json.loads(e.payload_json) for e in state.pending_entry_events)
+        required.update(payload["symbol"] for payload in pending_payloads)
+        if not required.issubset(policy):
+            raise PaperReductionGatewayError("entry classification coverage is incomplete")
+        for payload in pending_payloads:
+            if policy[payload["symbol"]] != payload["sector"]:
+                raise PaperReductionGatewayError(
+                    "pending entry classification conflicts with policy"
+                )
+        sector = policy[context.symbol]
+        prices = {quote.symbol: quote.price for quote in context.quotes}
+        gross = Decimal("0")
+        for position in context.ledger.positions:
+            if policy[position.symbol] == sector:
+                value = _exact_multiply(
+                    position.quantity, prices[position.symbol], "entry sector valuation"
+                ).copy_abs()
+                gross = _exact_subtract(gross, value.copy_negate(), "entry sector valuation")
+        pending = summarize_entry_capacity(
+            state,
+            portfolio_id=portfolio_id,
+            symbol=context.symbol,
+            sector=sector,
+            held_symbols=tuple(p.symbol for p in context.ledger.positions),
+        )
+        return PaperEntrySectorExposure(
+            sector,
+            gross,
+            pending.pending_sector_notional_usd,
+            tuple(sorted(policy.items())),
+            context.journal_head,
+        )
+
+    def entry_valuation(self, *, portfolio_id: str) -> PaperEntryValuation:
+        """Revalidate all held marks while the calling task owns entry serialization.
+
+        The caller must still revalidate database/reconciliation state at final
+        submission and apply exact entry limits and pending reservations. This
+        view grants no authority and must never replace those admission checks.
+        """
+        context = getattr(self, "_entry_market_context", None)
+        if (
+            type(context) is not _EntryMarketContext
+            or context.owner is not asyncio.current_task()
+            or context.portfolio_id != portfolio_id
+            or not self._account_order_gate.locked()
+        ):
+            raise PaperReductionGatewayError("valuation requires the owning entry context")
+        ledger = context.ledger
+        assert_owned_paper_risk_ledger_snapshot(ledger)
+        age = datetime.now(timezone.utc) - ledger.observed_at
+        monotonic_now = getattr(self, "_monotonic", time.monotonic)()
+        if (
+            type(monotonic_now) is not float
+            or not math.isfinite(monotonic_now)
+            or type(context.started_monotonic) is not float
+            or not math.isfinite(context.started_monotonic)
+            or not 0 <= monotonic_now - context.started_monotonic <= 5
+            or not timedelta(0) <= age <= timedelta(seconds=5)
+        ):
+            raise PaperReductionGatewayError("entry ledger evidence is stale")
+        generation = self._client.protective_quote_generation
+        quotes = {}
+        for quote in context.quotes:
+            if type(quote) is not BrokerProtectiveQuote or replace(quote) != quote:
+                raise PaperReductionGatewayError("entry quote is malformed")
+            if quote.symbol in quotes or quote.transport_generation != generation:
+                raise PaperReductionGatewayError("entry quote identity/generation is ambiguous")
+            quotes[quote.symbol] = quote
+        for position in ledger.positions:
+            quote = quotes.get(position.symbol)
+            if quote is None or quote.con_id != position.con_id:
+                raise PaperReductionGatewayError(
+                    "entry held contract quote is missing or mismatched"
+                )
+        # Market prices are account-wide. The active entry portfolio's exact
+        # monitor authenticates all marks; inactive portfolios need no executor
+        # or monitor registration to contribute their verified balances.
+        scopes = {(portfolio_id, q.symbol, q.con_id) for q in context.quotes}
+        for scope, symbol, con_id in scopes:
+            quote = quotes.get(symbol)
+            if quote is None or quote.con_id != con_id:
+                raise PaperReductionGatewayError(
+                    "entry held contract quote is missing or mismatched"
+                )
+            producer = self._protective_quote_producers.get(scope)
+            getter = getattr(producer, "get_protective_quote_evidence", None)
+            if not callable(getter):
+                raise PaperReductionGatewayError("entry portfolio quote producer is unavailable")
+            try:
+                evidence = assert_current_authoritative_protective_quote(
+                    getter(symbol),
+                    producer=producer,
+                    expected_portfolio_id=scope,
+                    expected_symbol=symbol,
+                    expected_con_id=con_id,
+                    expected_transport_generation=generation,
+                    expected_source_event_id=quote.source_event_id,
+                )
+            except Exception as exc:
+                raise PaperReductionGatewayError("entry quote authority is not current") from exc
+            if evidence.price != quote.price or evidence.source_timestamp != quote.source_timestamp:
+                raise PaperReductionGatewayError("entry quote differs from producer evidence")
+        equities = dict(ledger.portfolio_cash)
+        grosses = {p: Decimal("0") for p in equities}
+
+        def add(a, b):
+            return _exact_subtract(a, b.copy_negate(), "entry valuation")
+
+        symbol_gross = Decimal("0")
+        for position in ledger.positions:
+            value = _exact_multiply(
+                position.quantity, quotes[position.symbol].price, "entry valuation"
+            )
+            scope = position.portfolio_id
+            equities[scope] = add(equities[scope], value)
+            grosses[scope] = add(grosses[scope], value.copy_abs())
+            if position.symbol == context.symbol:
+                symbol_gross = add(symbol_gross, value.copy_abs())
+        total_equity = total_gross = Decimal("0")
+        for scope in equities:
+            if equities[scope] <= 0:
+                raise PaperReductionGatewayError("entry portfolio equity must be positive")
+            total_equity = add(total_equity, equities[scope])
+            total_gross = add(total_gross, grosses[scope])
+        # The legacy runtime's 600-second BUY/SELL churn rule becomes durable
+        # account-wide evidence. Prior bootstrap history is unknown, so its
+        # latest boundary conservatively establishes the earliest cooldown.
+        history_boundary = max(at for _, at in ledger.bootstrap_effective_at)
+        last_activity = max(
+            (fill.occurred_at for fill in ledger.fills if fill.symbol == context.symbol),
+            default=history_boundary,
+        )
+        allowed_at = max(history_boundary, last_activity) + _ENTRY_COOLDOWN
+        return PaperEntryValuation(
+            dict(ledger.portfolio_cash)[portfolio_id],
+            equities[portfolio_id],
+            grosses[portfolio_id],
+            total_equity,
+            total_gross,
+            len({p.symbol for p in ledger.positions}),
+            ledger.observed_at,
+            context.symbol,
+            symbol_gross,
+            symbol_gross > 0,
+            allowed_at,
+        )
 
     def submit_baseline_entry(
         self,
@@ -1198,6 +1748,14 @@ class PaperReductionGateway:
             runtime_contract=runtime_contract,
         )
         await binding.settlement_participant.apply_and_verify(receipt)
+        accounting = getattr(self, "_fill_accounting", None)
+        if accounting is not None:
+            was_ready = getattr(self, "_entry_accounting_ready", False) is True
+            self._entry_accounting_ready = False
+            if type(accounting) is not PaperFillAccounting:
+                raise PaperReductionGatewayError("terminal paper accounting binding is invalid")
+            await accounting.ingest(receipt)
+            self._entry_accounting_ready = was_ready
 
         post_snapshot = await self._database.get_safety_allocation_snapshot(
             final_contract.symbol,

@@ -506,6 +506,129 @@ def _verified_canonical_json(path: Path, label: str) -> tuple[Mapping[str, Any],
     return raw, hashlib.sha256(payload).hexdigest()
 
 
+def _verified_manifest_file_at(
+    directory_fd: int,
+    filename: str,
+) -> tuple[bytes, os.stat_result]:
+    """Read one manifest entry by held directory identity without following links."""
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(filename, flags, dir_fd=directory_fd)
+        before = os.fstat(descriptor)
+        getuid = getattr(os, "getuid", None)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or (getuid is not None and before.st_uid != getuid())
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or before.st_size > MAX_EVIDENCE_BYTES
+        ):
+            raise ExactStateBootstrapError("bundle manifest entry is not an owner-only file")
+        chunks: list[bytes] = []
+        remaining = MAX_EVIDENCE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        current = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            len(payload) > MAX_EVIDENCE_BYTES
+            or os.read(descriptor, 1)
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
+            or current.st_nlink != 1
+        ):
+            raise ExactStateBootstrapError("bundle manifest entry changed while read")
+        return payload, after
+    except OSError as exc:
+        raise ExactStateBootstrapError("bundle manifest entry cannot be read safely") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _verify_published_bundle_manifest(
+    publication_directory: Path,
+    raw_manifest: object,
+) -> None:
+    """Bind a completion marker to every exact file in its published directory."""
+
+    if type(raw_manifest) is not list or not raw_manifest:
+        raise ExactStateBootstrapError("bundle completion manifest is malformed")
+    expected: dict[str, tuple[int, int, int, str]] = {}
+    for raw_entry in raw_manifest:
+        if type(raw_entry) is not dict:
+            raise ExactStateBootstrapError("bundle completion manifest is malformed")
+        _exact_keys(
+            raw_entry,
+            {"device", "filename", "inode", "sha256", "size_bytes"},
+            "bundle completion manifest entry",
+        )
+        filename = _json_string(raw_entry["filename"], "manifest filename")
+        if (
+            not filename
+            or Path(filename).name != filename
+            or filename in {".", "..", "bundle_complete.json"}
+            or filename in expected
+        ):
+            raise ExactStateBootstrapError("bundle completion manifest filename is malformed")
+        expected[filename] = (
+            _json_int(raw_entry["device"], "manifest device"),
+            _json_int(raw_entry["inode"], "manifest inode", minimum=1),
+            _json_int(raw_entry["size_bytes"], "manifest size_bytes"),
+            _hash(raw_entry["sha256"], "manifest sha256"),
+        )
+    if list(expected) != sorted(expected):
+        raise ExactStateBootstrapError("bundle completion manifest is not sorted")
+
+    directory_fd: int | None = None
+    try:
+        directory_fd = os.open(
+            publication_directory,
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        held_directory = os.fstat(directory_fd)
+        if not stat.S_ISDIR(held_directory.st_mode):
+            raise ExactStateBootstrapError("evidence publication path is not a directory")
+        expected_names = set(expected) | {"bundle_complete.json"}
+        if set(os.listdir(directory_fd)) != expected_names:
+            raise ExactStateBootstrapError(
+                "published evidence entries do not match the completion manifest"
+            )
+        for filename, binding in expected.items():
+            payload, metadata = _verified_manifest_file_at(directory_fd, filename)
+            if (
+                metadata.st_dev,
+                metadata.st_ino,
+                len(payload),
+                hashlib.sha256(payload).hexdigest(),
+            ) != binding:
+                raise ExactStateBootstrapError(
+                    "published evidence entry does not match the completion manifest"
+                )
+        current_directory = os.stat(publication_directory, follow_symlinks=False)
+        if (held_directory.st_dev, held_directory.st_ino) != (
+            current_directory.st_dev,
+            current_directory.st_ino,
+        ) or set(os.listdir(directory_fd)) != expected_names:
+            raise ExactStateBootstrapError("published evidence directory changed during validation")
+    except OSError as exc:
+        raise ExactStateBootstrapError("bundle completion manifest cannot be verified") from exc
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+
 def _verify_artifact_authentication(
     *,
     artifact_path: Path,
@@ -1478,6 +1601,7 @@ def load_exact_state_bootstrap_evidence(
     _exact_keys(
         completion,
         {
+            "artifact_manifest",
             "bundle_id",
             "publication_directory",
             "publication_nonce",
@@ -1486,7 +1610,7 @@ def load_exact_state_bootstrap_evidence(
         "bundle completion record",
     )
     if (
-        _json_int(completion["schema_version"], "completion schema_version") != 1
+        _json_int(completion["schema_version"], "completion schema_version") != 2
         or _json_string(completion["bundle_id"], "completion bundle_id") != bundle_id
         or _json_string(
             completion["publication_directory"],
@@ -1499,6 +1623,10 @@ def load_exact_state_bootstrap_evidence(
         raise ExactStateBootstrapError(
             "bundle completion record is outside the signed publication lineage"
         )
+    _verify_published_bundle_manifest(
+        publication_directory,
+        completion["artifact_manifest"],
+    )
     _assert_authentication_receipts_unconsumed(database_path, authentication_receipts)
 
     evidence = ExactStateBootstrapEvidence(

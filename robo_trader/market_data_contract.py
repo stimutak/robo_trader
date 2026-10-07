@@ -17,7 +17,8 @@ import pandas as pd
 from .market_hours import get_market_session
 from .protective_quote_evidence import MAX_PROTECTIVE_SOURCE_EVENT_ID_LENGTH
 
-CANONICAL_BAR_SCHEMA_VERSION = 1
+CANONICAL_BAR_SCHEMA_VERSION = 1  # Legacy default; subprocess transport selects v2 explicitly.
+DECIMAL_VOLUME_SCHEMA_VERSION = 2
 MAX_MARKET_DATA_AGE_SECONDS = 24 * 60 * 60
 _EXCHANGE_TIMEZONE = ZoneInfo("America/New_York")
 
@@ -231,13 +232,16 @@ class HistoricalBarContract:
     timestamp_semantics: BarTimestampSemantics
     use_rth: bool
     what_to_show: str
+    volume_unit: str = "unknown"
 
     def __post_init__(self) -> None:
-        if (
-            type(self.schema_version) is not int
-            or self.schema_version != CANONICAL_BAR_SCHEMA_VERSION
+        if type(self.schema_version) is not int or self.schema_version not in (
+            1,
+            DECIMAL_VOLUME_SCHEMA_VERSION,
         ):
             raise MarketDataContractError("canonical bar schema version is unsupported")
+        if type(self.volume_unit) is not str or self.volume_unit != "unknown":
+            raise MarketDataContractError("canonical volume unit is not verified")
         if not isinstance(self.symbol, str) or not re.fullmatch(
             r"[A-Z0-9][A-Z0-9._-]{0,31}", self.symbol
         ):
@@ -281,6 +285,31 @@ class HistoricalBarContract:
             raise MarketDataIdentityError("bar transport generation is malformed")
 
 
+def _exact_volume(value: Any) -> Decimal:
+    """Parse exact v2 quantities; floats have already lost wire precision."""
+    if type(value) not in (str, int, Decimal):
+        raise MarketDataContractError("version-2 volume requires exact decimal input")
+    try:
+        volume = Decimal(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise MarketDataContractError("version-2 volume is malformed") from exc
+    if not volume.is_finite() or volume < 0:
+        raise MarketDataContractError("version-2 volume must be finite and nonnegative")
+    digits = volume.as_tuple().digits
+    exponent = volume.as_tuple().exponent
+    if len(digits) + max(exponent, 0) > 128 or not -128 <= exponent <= 128:
+        raise MarketDataContractError("version-2 volume exceeds decimal representation limits")
+    return volume
+
+
+def _volume_text(value: Decimal) -> str:
+    volume = _exact_volume(value)
+    if volume == 0:
+        return "0"
+    text = format(volume, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
 @dataclass(frozen=True, slots=True)
 class CanonicalBar:
     """One immutable validated OHLCV event."""
@@ -291,7 +320,7 @@ class CanonicalBar:
     high: Decimal
     low: Decimal
     close: Decimal
-    volume: int
+    volume: int | Decimal
     session: MarketSession
     quality_flags: tuple[BarQualityFlag, ...] = ()
 
@@ -307,8 +336,13 @@ class CanonicalBar:
             self.open, self.high, self.close
         ):
             raise MarketDataContractError("broker OHLC ordering is invalid")
-        if type(self.volume) is not int or self.volume < 0:
-            raise MarketDataContractError("broker volume cannot be negative")
+        if self.contract.schema_version == 1:
+            if type(self.volume) is not int or self.volume < 0:
+                raise MarketDataContractError("broker volume cannot be negative")
+        elif type(self.volume) is not Decimal:
+            raise MarketDataContractError("version-2 volume must be Decimal")
+        else:
+            _exact_volume(self.volume)
         if type(self.session) is not MarketSession:
             raise MarketDataContractError("canonical bar session is invalid")
         if (
@@ -341,7 +375,10 @@ class CanonicalBarBatch:
                 "high": [float(bar.high) for bar in self.bars],
                 "low": [float(bar.low) for bar in self.bars],
                 "close": [float(bar.close) for bar in self.bars],
-                "volume": [bar.volume for bar in self.bars],
+                "volume": [
+                    float(bar.volume) if self.contract.schema_version == 2 else bar.volume
+                    for bar in self.bars
+                ],
             },
             index=pd.DatetimeIndex([bar.timestamp for bar in self.bars], name="timestamp"),
         )
@@ -369,7 +406,14 @@ class CanonicalBarBatch:
                 "high": float(bar.high),
                 "low": float(bar.low),
                 "close": float(bar.close),
-                "volume": bar.volume,
+                "volume": (
+                    _volume_text(bar.volume) if self.contract.schema_version == 2 else bar.volume
+                ),
+                **(
+                    {"volume_unit": self.contract.volume_unit}
+                    if self.contract.schema_version == 2
+                    else {}
+                ),
                 "session": bar.session.value,
                 "source": self.contract.source.value,
                 "retrieval_timestamp": self.contract.retrieval_time.isoformat(),
@@ -416,10 +460,26 @@ CANONICAL_STORAGE_KEYS = frozenset(
 )
 
 
+def canonical_market_data_relation(*, include_v2: bool = True) -> str:
+    """A fixed-identifier SQL relation preserving both storage representations."""
+    # Column identifiers come only from the immutable, literal key set above.
+    columns = ", ".join(sorted(CANONICAL_STORAGE_KEYS))
+    legacy = f"SELECT {columns}, 'unknown' AS volume_unit FROM canonical_market_data"  # nosec B608
+    if not include_v2:
+        return f"({legacy})"
+    current = f"SELECT {columns}, volume_unit FROM canonical_market_data_v2"  # nosec B608
+    return f"({legacy} UNION ALL {current})"
+
+
 def validate_canonical_storage_row(row: Mapping[str, Any]) -> dict[str, Any]:
     """Reconstruct and validate one complete canonical persistence record."""
 
-    if not isinstance(row, Mapping) or set(row) != CANONICAL_STORAGE_KEYS:
+    if not isinstance(row, Mapping):
+        raise MarketDataContractError("canonical storage row schema is invalid")
+    expected_keys = CANONICAL_STORAGE_KEYS | (
+        {"volume_unit"} if row.get("schema_version") == 2 else set()
+    )
+    if set(row) != expected_keys:
         raise MarketDataContractError("canonical storage row schema is invalid")
     try:
         session_policy = MarketSessionPolicy(row["session_policy"])
@@ -437,6 +497,7 @@ def validate_canonical_storage_row(row: Mapping[str, Any]) -> dict[str, Any]:
         raise MarketDataContractError("canonical storage interval is inconsistent")
     contract = HistoricalBarContract(
         schema_version=row["schema_version"],
+        volume_unit=row.get("volume_unit", "unknown"),
         symbol=row["symbol"],
         con_id=row["con_id"],
         exchange=row["exchange"],
@@ -459,8 +520,13 @@ def validate_canonical_storage_row(row: Mapping[str, Any]) -> dict[str, Any]:
     if get_market_session(timestamp) != session.value:
         raise MarketDataContractError("canonical storage session contradicts event time")
     volume = row["volume"]
-    if type(volume) is not int:
-        raise MarketDataContractError("canonical storage volume must be an integer")
+    if contract.schema_version == 1:
+        if type(volume) is not int:
+            raise MarketDataContractError("canonical storage volume must be an integer")
+    else:
+        if type(volume) is not str:
+            raise MarketDataContractError("version-2 storage volume must be exact text")
+        volume = _exact_volume(volume)
     flags_text = row["quality_flags"]
     if not isinstance(flags_text, str):
         raise MarketDataContractError("canonical storage quality flags are malformed")
@@ -481,6 +547,7 @@ def validate_canonical_storage_row(row: Mapping[str, Any]) -> dict[str, Any]:
     )
     return {
         **row,
+        "volume": _volume_text(volume) if contract.schema_version == 2 else volume,
         "timestamp": bar.timestamp.isoformat(),
         "open": float(bar.open),
         "high": float(bar.high),
@@ -503,6 +570,7 @@ def canonicalize_historical_bars(
     use_rth: bool,
     what_to_show: str,
     now: Optional[datetime] = None,
+    schema_version: int = CANONICAL_BAR_SCHEMA_VERSION,
 ) -> CanonicalBarBatch:
     """Validate wire records and bind them atomically to broker lineage."""
 
@@ -529,7 +597,7 @@ def canonicalize_historical_bars(
     if type(transport_generation) is not str:
         raise MarketDataIdentityError("historical lineage generation is invalid")
     contract = HistoricalBarContract(
-        schema_version=CANONICAL_BAR_SCHEMA_VERSION,
+        schema_version=schema_version,
         symbol=requested,
         con_id=con_id,
         exchange=exchange,
@@ -567,13 +635,16 @@ def canonicalize_historical_bars(
         session = MarketSession(session_text)
         if use_rth and session is not MarketSession.REGULAR:
             raise MarketDataContractError("regular-hours response contains an extended-session bar")
-        volume_decimal = _decimal(raw.get("volume"), "volume")
-        if volume_decimal != volume_decimal.to_integral_value():
-            raise MarketDataContractError("broker bar volume is invalid")
-        try:
-            volume = int(volume_decimal)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise MarketDataContractError("broker bar volume is invalid") from exc
+        if schema_version == 2:
+            volume = _exact_volume(raw.get("volume"))
+        else:
+            volume_decimal = _decimal(raw.get("volume"), "volume")
+            if volume_decimal != volume_decimal.to_integral_value():
+                raise MarketDataContractError("broker bar volume is invalid")
+            try:
+                volume = int(volume_decimal)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise MarketDataContractError("broker bar volume is invalid") from exc
         bar = CanonicalBar(
             contract=contract,
             timestamp=timestamp,

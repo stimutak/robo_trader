@@ -289,7 +289,7 @@ def _read_only_authorizer(
     database: str | None,
     source: str | None,
 ) -> int:
-    del argument2, database, source
+    del database, source
     allowed = {
         sqlite3.SQLITE_SELECT,
         sqlite3.SQLITE_READ,
@@ -297,6 +297,12 @@ def _read_only_authorizer(
         sqlite3.SQLITE_TRANSACTION,
     }
     if action in allowed:
+        return sqlite3.SQLITE_OK
+    if (
+        action == sqlite3.SQLITE_PRAGMA
+        and argument2 is None
+        and str(argument1).casefold() in {"foreign_keys", "foreign_key_check", "database_list"}
+    ):
         return sqlite3.SQLITE_OK
     if action == sqlite3.SQLITE_PRAGMA and str(argument1).casefold() in {
         "data_version",
@@ -489,6 +495,8 @@ def _crosslink_safety_journal_orders(
     database_device: int,
     database_inode: int,
 ) -> tuple[bool, bool, int, int]:
+    if getattr(replay_state, "pending_entry_events", ()):
+        raise BootstrapReconciliationBlocked("safety journal has unresolved entry capacity")
     reservations = tuple(getattr(replay_state, "reservations", ()))
     active = tuple(getattr(replay_state, "active_reservations", ()))
     quarantined = tuple(getattr(replay_state, "quarantined_reservations", ()))
@@ -499,20 +507,66 @@ def _crosslink_safety_journal_orders(
     if any(not item.released or item.terminal_sequence is None for item in reservations):
         raise BootstrapReconciliationBlocked("safety journal has unresolved reservations")
 
+    entry_events = tuple(
+        e
+        for e in getattr(replay_state, "events", ())
+        if e.event_type
+        in {
+            JournalEventType.ENTRY_CAPACITY_RESERVED,
+            JournalEventType.ENTRY_SUBMISSION_CLAIMED,
+            JournalEventType.ENTRY_SETTLEMENT_RELEASED,
+        }
+    )
     if "paper_reduction_settlements" not in actual_tables:
-        if reservations:
+        if reservations or entry_events:
             raise BootstrapReconciliationBlocked(
                 "terminal safety journal orders lack the settlement authority table"
             )
         return True, True, 0, 0
+    # Raw pre-v4 ledgers legitimately lack the discriminator. Once present,
+    # never reinterpret entry data as reduction evidence during bootstrap.
+    columns = {
+        row[1] for row in connection.execute("PRAGMA main.table_info(paper_reduction_settlements)")
+    }
+    if (
+        "settlement_kind" in columns
+        and connection.execute(
+            "SELECT 1 FROM main.paper_reduction_settlements "
+            "WHERE settlement_kind IS NULL OR settlement_kind NOT IN ('REDUCTION','ENTRY') LIMIT 1"
+        ).fetchone()
+        is not None
+    ):
+        raise BootstrapReconciliationBlocked(
+            "unknown terminal kind prevents mixed settlement recovery"
+        )
+    entry_count = entry_fills = 0
+    if "settlement_kind" in columns and (
+        entry_events
+        or connection.execute(
+            "SELECT 1 FROM main.paper_reduction_settlements WHERE settlement_kind='ENTRY' LIMIT 1"
+        ).fetchone()
+        is not None
+    ):
+        from .entry_settlement_crosslink import crosslink_entry_settlements
+
+        try:
+            entry_count, entry_fills = crosslink_entry_settlements(
+                connection, replay_state, runtime, database_device, database_inode
+            )
+        except Exception as exc:
+            raise BootstrapReconciliationBlocked("entry terminal crosslink failed") from exc
+    elif entry_events:
+        raise BootstrapReconciliationBlocked("entry journal lacks discriminated terminal storage")
+    # Schema presence selects one of two fixed SQL fragments; no row value is interpolated.
+    reduction_filter = " WHERE settlement_kind='REDUCTION'" if "settlement_kind" in columns else ""
     settlement_rows = tuple(
         connection.execute(
-            "SELECT settlement_id,execution_domain_scope,account_scope,portfolio_id,"
+            "SELECT settlement_id,execution_domain_scope,account_scope,portfolio_id,"  # nosec B608
             "con_id,symbol,reservation_id,claim_id,order_ref,protective_quote_payload,"
             "request_fingerprint,request_payload_json,terminal_status,trade_id,"
             "database_path,database_identity,database_device,database_inode,committed_at,"
             "receipt_fingerprint,schema_version "
-            "FROM paper_reduction_settlements ORDER BY settlement_id"
+            "FROM paper_reduction_settlements" + reduction_filter + " ORDER BY settlement_id"
         ).fetchall()
     )
     if len(settlement_rows) != len(reservations):
@@ -601,7 +655,7 @@ def _crosslink_safety_journal_orders(
             raise BootstrapReconciliationBlocked(
                 "unfilled terminal settlement unexpectedly identifies a trade"
             )
-    return True, True, len(settlement_rows), terminal_fill_count
+    return True, True, len(settlement_rows) + entry_count, terminal_fill_count + entry_fills
 
 
 def _validate_legacy_rows(
@@ -765,6 +819,9 @@ def _collect_wal_visible_ledger(
             isolation_level=None,
         )
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+            raise BootstrapReconciliationBlocked("SQLite foreign-key enforcement is unavailable")
         connection.execute("PRAGMA query_only=ON")
         if connection.execute("PRAGMA query_only").fetchone()[0] != 1:
             raise BootstrapReconciliationBlocked("SQLite query-only mode could not be proven")
@@ -1269,6 +1326,7 @@ class BootstrapReconciliationDelivery(Generic[ReceiverResult]):
 
     receiver_result: ReceiverResult
     local_position_identities: tuple[tuple[str, str], ...]
+    verified_broker_evidence: VerifiedBrokerEvidenceEnvelope = field(repr=False)
 
 
 def _validate_runtime(runtime: object) -> RuntimeContract:
@@ -1319,6 +1377,27 @@ def _consume_verified_broker_evidence(
         return assert_and_consume_verified_broker_evidence(envelope)
     except Exception as exc:
         raise BootstrapReconciliationBlocked("broker evidence is not verifier-owned") from exc
+
+
+def _handoff_verified_broker_evidence_to_runtime(
+    envelope: VerifiedBrokerEvidenceEnvelope,
+) -> VerifiedBrokerEvidenceEnvelope:
+    """Move one consumed broker envelope into the runtime binder registry."""
+
+    try:
+        from robo_trader.bootstrap_evidence_receivers import (
+            _handoff_consumed_verified_broker_evidence_to_runtime,
+        )
+    except (ImportError, AttributeError) as exc:
+        raise BootstrapReconciliationBlocked(
+            "runtime broker evidence handoff is unavailable"
+        ) from exc
+    try:
+        return _handoff_consumed_verified_broker_evidence_to_runtime(envelope)
+    except Exception as exc:
+        raise BootstrapReconciliationBlocked(
+            "runtime broker evidence handoff failed closed"
+        ) from exc
 
 
 def _assert_core_reconciliation_receiver_capability(
@@ -1491,9 +1570,11 @@ def produce_bootstrap_reconciliation(
             collection.assert_unchanged_after_receiver_claim()
             receiver_result = receiver.commit_staged_bootstrap_reconciliation(stage)
             committed = True
+            runtime_broker_evidence = _handoff_verified_broker_evidence_to_runtime(envelope)
             return BootstrapReconciliationDelivery(
                 receiver_result=receiver_result,
                 local_position_identities=position_identities,
+                verified_broker_evidence=runtime_broker_evidence,
             )
     except BaseException:
         if stage is not _NO_RECEIVER_STAGE and not committed:

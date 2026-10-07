@@ -1083,6 +1083,7 @@ async def collect_and_produce_bootstrap_protective_mark(
     expected_con_id: int,
     expected_transport_generation: str,
     expected_source_event_id: str | None = None,
+    expected_active_symbols: tuple[str, ...] | None = None,
 ) -> ReceiverResult:
     """Collect one live quote and deliver its producer-owned accounting mark.
 
@@ -1113,6 +1114,18 @@ async def collect_and_produce_bootstrap_protective_mark(
             _SOURCE_EVENT_ID,
         )
     )
+    active_symbols = (
+        (symbol,)
+        if expected_active_symbols is None
+        else tuple(
+            _strict_text(active_symbol, "expected_active_symbol", _SYMBOL)
+            for active_symbol in expected_active_symbols
+        )
+    )
+    if not active_symbols or len(set(active_symbols)) != len(active_symbols):
+        raise BootstrapMarkBlocked("active protective symbol scope is invalid")
+    if symbol not in active_symbols:
+        raise BootstrapMarkBlocked("protective symbol is outside the active account scope")
     runtime, database_binding = _validate_runtime(runtime_contract)
     _assert_producer_context(
         producer,
@@ -1128,7 +1141,7 @@ async def collect_and_produce_bootstrap_protective_mark(
     )
     capability, capability_identity = _quote_collector_capability(quote_source)
     try:
-        collected = await capability((symbol,), active_symbols=(symbol,))
+        collected = await capability((symbol,), active_symbols=active_symbols)
     except BootstrapMarkBlocked:
         raise
     except Exception as exc:

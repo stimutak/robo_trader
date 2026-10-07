@@ -6,6 +6,14 @@
 
 ## Current Operating Contract
 
+- **Read first:** `CURRENT_STATE.md` and `handoff/LATEST_HANDOFF.md` describe the
+  September 29 source checkpoint and remaining work. Gate A is closed: source
+  publication is not a deployment or permission to start trading. Keep runtime
+  readiness false and the BUY rejection intact until the separate release gate.
+- The user's two main IBKR accounts are personal and **Cap**; Robo paper is
+  believed to be linked under one, but its parent is unverified. Both main
+  logins require a currently unavailable 2FA phone. Read the operational recovery
+  handoff before revisiting access, subscriptions, reconciliation, or startup.
 - The remediation program is tracked in
   `docs/ROBOTRADER_REMEDIATION_PLAN_2026-07-20.md`; execute its PRs in order and
   record evidence in that document as each gate is completed.

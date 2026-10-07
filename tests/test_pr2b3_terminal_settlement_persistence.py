@@ -24,7 +24,6 @@ from robo_trader.accounting.fifo_runtime import (
 from robo_trader.config import RuntimeContract
 from robo_trader.database_async import AsyncTradingDatabase
 from robo_trader.database_validator import ValidationError as DatabaseValidationError
-from robo_trader.multiuser.migration import MultiuserMigration
 from robo_trader.paper_terminal_settlement import (
     PaperAccountSettlementState,
     PaperTerminalSettlementConflict,
@@ -50,9 +49,118 @@ from robo_trader.safety.models import (
 )
 from tests.fifo_runtime_test_support import install_synthetic_fifo_epoch
 from tests.safety.conftest import make_case
-from tests.test_multiuser import create_legacy_schema
 
 ACCOUNT_SCOPE = "acct_v1_0123456789abcdef0123456789abcdef" "fedcba9876543210fedcba9876543210"
+
+
+def _create_supported_multiuser_v1_schema(path: Path, *, with_legacy_rows: bool) -> None:
+    """Install the historical v1 result without invoking its quarantined migrator."""
+
+    with sqlite3.connect(path) as connection:
+        connection.executescript("""
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                description TEXT NOT NULL,
+                applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE portfolios (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                starting_cash REAL NOT NULL DEFAULT 100000,
+                symbols TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                max_position_pct REAL,
+                max_daily_loss_pct REAL,
+                max_open_positions INTEGER,
+                stop_loss_pct REAL,
+                trailing_stop_pct REAL,
+                use_trailing_stop INTEGER,
+                enabled_strategies TEXT,
+                min_confidence REAL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id TEXT NOT NULL DEFAULT 'default',
+                symbol TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                avg_cost REAL NOT NULL,
+                market_price REAL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(portfolio_id, symbol)
+            );
+            CREATE INDEX idx_positions_portfolio ON positions (portfolio_id);
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id TEXT NOT NULL DEFAULT 'default',
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                price REAL NOT NULL,
+                notional REAL DEFAULT 0,
+                slippage REAL DEFAULT 0,
+                commission REAL DEFAULT 0,
+                pnl REAL DEFAULT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX idx_trades_portfolio ON trades (portfolio_id);
+            CREATE INDEX idx_trades_portfolio_symbol
+                ON trades (portfolio_id, symbol, timestamp DESC);
+            CREATE TABLE account (
+                portfolio_id TEXT PRIMARY KEY,
+                cash REAL NOT NULL,
+                equity REAL NOT NULL,
+                daily_pnl REAL DEFAULT 0,
+                realized_pnl REAL DEFAULT 0,
+                unrealized_pnl REAL DEFAULT 0,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE equity_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id TEXT NOT NULL DEFAULT 'default',
+                date TEXT NOT NULL,
+                equity REAL NOT NULL,
+                cash REAL DEFAULT 0,
+                positions_value REAL DEFAULT 0,
+                realized_pnl REAL DEFAULT 0,
+                unrealized_pnl REAL DEFAULT 0,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(portfolio_id, date)
+            );
+            CREATE INDEX idx_equity_history_portfolio
+                ON equity_history (portfolio_id, date);
+            CREATE TABLE signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                portfolio_id TEXT NOT NULL DEFAULT 'default',
+                symbol TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                signal_type TEXT NOT NULL,
+                strength REAL,
+                metadata TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX idx_signals_portfolio ON signals (portfolio_id);
+            INSERT INTO schema_migrations(version, description)
+                VALUES (1, 'synthetic test fixture for historical multiuser v1');
+            INSERT INTO portfolios(id, name, starting_cash)
+                VALUES ('default', 'Default Portfolio', 100000);
+            """)
+        if with_legacy_rows:
+            connection.executescript("""
+                INSERT INTO positions(portfolio_id,symbol,quantity,avg_cost,market_price)
+                    VALUES ('default','AAPL',100,180.50,185.00),
+                           ('default','NVDA',50,450.00,470.00);
+                INSERT INTO trades(portfolio_id,symbol,side,quantity,price,notional)
+                    VALUES ('default','AAPL','BUY',100,180.50,18050.0);
+                INSERT INTO account(portfolio_id,cash,equity)
+                    VALUES ('default',80000,100000);
+                INSERT INTO equity_history(
+                    portfolio_id,date,equity,cash,positions_value
+                ) VALUES ('default','2026-02-05',100000,80000,20000);
+                INSERT INTO signals(portfolio_id,symbol,strategy,signal_type,strength)
+                    VALUES ('default','AAPL','momentum','BUY',0.8);
+                """)
 
 
 @pytest.mark.parametrize(
@@ -753,6 +861,46 @@ async def test_cross_symbol_realized_pnl_settles_against_epoch_total(tmp_path: P
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "commission,post_cash,post_pnl",
+    [
+        (12345, "100079.05", "-120.95"),
+        (-12345, "100325.95", "125.95"),
+    ],
+)
+async def test_commission_trade_projection_is_independent_of_decimal_context(
+    tmp_path, commission, post_cash, post_pnl
+):
+    contract = _runtime_contract(tmp_path)
+    database = AsyncTradingDatabase(Path(contract.database_path), pool_size=1)
+    await database.initialize()
+    try:
+        await _seed(database)
+        request = replace(
+            _request(outcome_at=datetime.now(timezone.utc) - timedelta(seconds=1)),
+            fill_commission_minor=commission,
+            expected_post_cash=Decimal(post_cash),
+            expected_post_realized_pnl=Decimal(post_pnl),
+            expected_post_daily_pnl=Decimal(post_pnl),
+        )
+        with localcontext() as context:
+            context.prec = 4
+            receipt = await database.commit_paper_reduction_outcome(
+                request, runtime_contract=contract
+            )
+        assert receipt.post_cash == Decimal(post_cash)
+        async with database.get_connection() as connection:
+            trade = await (
+                await connection.execute(
+                    "SELECT commission FROM trades WHERE portfolio_id = ?", ("portfolio-a",)
+                )
+            ).fetchone()
+        assert trade == (123.45 if commission > 0 else -123.45,)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_expected_fifo_delta_is_independent_of_ambient_decimal_precision(
     tmp_path: Path,
 ):
@@ -778,7 +926,7 @@ async def test_expected_fifo_delta_is_independent_of_ambient_decimal_precision(
         )
 
         with localcontext() as context:
-            context.prec = 6
+            context.prec = 5
             receipt = await database.commit_paper_reduction_outcome(
                 request,
                 runtime_contract=contract,
@@ -789,6 +937,13 @@ async def test_expected_fifo_delta_is_independent_of_ambient_decimal_precision(
         account = await database.get_account_info(portfolio_id="portfolio-a")
         assert account["realized_pnl_exact"] == Decimal("0.01")
         async with database.get_connection() as connection:
+            trade = await (
+                await connection.execute(
+                    "SELECT notional FROM trades WHERE portfolio_id = ?",
+                    ("portfolio-a",),
+                )
+            ).fetchone()
+            assert trade == (7654.34,)
             fifo_delta = await (
                 await connection.execute(
                     """
@@ -1025,8 +1180,7 @@ async def test_quoted_literal_case_change_fails_before_mutation(tmp_path: Path):
 async def test_supported_multiuser_v1_hot_schema_can_settle(tmp_path: Path):
     contract = _runtime_contract(tmp_path)
     database_path = Path(contract.database_path)
-    await create_legacy_schema(database_path)
-    assert await MultiuserMigration(database_path).migrate() is True
+    _create_supported_multiuser_v1_schema(database_path, with_legacy_rows=True)
 
     database = AsyncTradingDatabase(database_path, pool_size=1)
     await database.initialize()
@@ -1056,9 +1210,7 @@ async def test_supported_multiuser_v1_hot_schema_can_settle(tmp_path: Path):
 async def test_supported_multiuser_v1_direct_create_schema_can_settle(tmp_path: Path):
     contract = _runtime_contract(tmp_path)
     database_path = Path(contract.database_path)
-    with sqlite3.connect(database_path):
-        pass
-    assert await MultiuserMigration(database_path).migrate() is True
+    _create_supported_multiuser_v1_schema(database_path, with_legacy_rows=False)
 
     database = AsyncTradingDatabase(database_path, pool_size=1)
     await database.initialize()

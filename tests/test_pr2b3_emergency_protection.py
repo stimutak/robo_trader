@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from robo_trader.execution import Order
+from robo_trader.reconciliation.runtime_integration import RuntimeReconciliationController
 from robo_trader.runner_async import AsyncRunner
 
 
@@ -30,6 +31,9 @@ def _minimal_runner() -> AsyncRunner:
     runner.stop_loss_monitor = None
     runner._baseline_entry_handle = object()
     runner._baseline_entry_intent = object()
+    reconciliation = object.__new__(RuntimeReconciliationController)
+    reconciliation.entry_eligible = lambda: True
+    runner.reconciliation_controller = reconciliation
     return runner
 
 

@@ -108,6 +108,9 @@ def _limits(**changes: object) -> EntryRiskLimits:
         "minimum_average_daily_dollar_volume_usd": Decimal("1000000"),
         "max_order_fraction_of_daily_dollar_volume": Decimal("0.01"),
         "max_daily_notional_usd": Decimal("50000"),
+        "max_order_notional_usd": None,
+        "max_open_positions": 20,
+        "max_account_leverage": Decimal("2"),
         "max_quote_age": timedelta(seconds=10),
         "max_account_evidence_age": timedelta(seconds=30),
     }
@@ -205,17 +208,32 @@ def _evidence(**changes: object) -> EntryRiskEvidence:
         "symbol": "AAPL",
         "observed_at": NOW - timedelta(seconds=1),
         "quote": quote,
+        # Test producer explicitly models zero slippage; production must use
+        # its independently validated executor cost ceiling.
+        "execution_price_ceiling_usd": None if quote is None else quote.price_usd,
         "sector": "Technology",
         "correlation": correlation,
         "liquidity": liquidity,
         "ml_corroboration": ml,
         "portfolio_equity_usd": Decimal("100000"),
+        "account_equity_usd": Decimal("100000"),
+        "account_gross_notional_usd": Decimal("0"),
+        "pending_symbol_notional_usd": Decimal("0"),
+        "pending_sector_notional_usd": Decimal("0"),
+        "pending_portfolio_notional_usd": Decimal("0"),
+        "pending_account_notional_usd": Decimal("0"),
+        "pending_cash_usd": Decimal("0"),
+        "pending_buying_power_usd": Decimal("0"),
+        "pending_daily_notional_usd": Decimal("0"),
         "cash_available_usd": Decimal("50000"),
         "buying_power_usd": Decimal("100000"),
         "current_symbol_gross_notional_usd": Decimal("0"),
         "current_sector_gross_notional_usd": Decimal("0"),
         "portfolio_gross_notional_usd": Decimal("0"),
         "daily_executed_notional_usd": Decimal("0"),
+        "account_occupied_position_slots": 0,
+        "symbol_has_position_or_pending_entry": False,
+        "symbol_entry_allowed_at": NOW - timedelta(minutes=10),
     }
     values.update(changes)
     return build_entry_risk_evidence(**values)  # type: ignore[arg-type]
@@ -858,6 +876,7 @@ def test_large_coefficients_remain_exact_under_hostile_ambient_context() -> None
     price = Decimal("1" + "0" * 248)
     evidence = _evidence(
         portfolio_equity_usd=equity,
+        account_equity_usd=equity,
         cash_available_usd=generous_capacity,
         buying_power_usd=generous_capacity,
         current_symbol_gross_notional_usd=Decimal("0.01"),
@@ -1397,3 +1416,224 @@ def test_risk_decision_cannot_be_consumed_at_or_after_exact_expiry() -> None:
             decision,
             consumed_at=decision.expires_at,
         )
+
+
+@pytest.mark.parametrize("cap, quantity", [("1000", 3), ("999", 3), ("998.999999999999999999", 2)])
+def test_order_notional_cap_floors_exactly(cap, quantity):
+    decision = _evaluate(limits=_limits(max_order_notional_usd=Decimal(cap)))
+    assert decision.risk_approved
+    assert decision.approved_quantity == quantity
+    assert decision.approved_notional_usd <= Decimal(cap)
+    assert decision.limiting_capacity is LimitingCapacity.ORDER_NOTIONAL
+
+
+def test_order_cap_below_one_share_blocks_entry():
+    decision = _evaluate(limits=_limits(max_order_notional_usd=Decimal("332.99")))
+    assert not decision.risk_approved
+    assert decision.reasons == (RiskReason.NO_CAPACITY,)
+
+
+@pytest.mark.parametrize(
+    "cap",
+    [0, True, 1000.0, "1000", Decimal("0"), Decimal("-1"), Decimal("NaN"), Decimal("Infinity")],
+)
+def test_order_notional_cap_rejects_malformed_configuration(cap):
+    with pytest.raises(EntryRiskContractError):
+        _limits(max_order_notional_usd=cap)
+
+
+def test_order_cap_preserves_exact_floor_under_hostile_decimal_context():
+    limits = _limits(max_order_notional_usd=Decimal("998.999999999999999999"))
+    evidence = _evidence()
+    intent = _intent()
+    with localcontext() as context:
+        context.prec = 2
+        context.rounding = ROUND_UP
+        decision = _evaluate(limits=limits, evidence=evidence, intent=intent)
+    assert decision.approved_quantity == 2
+    assert decision.approved_notional_usd == Decimal("666")
+
+
+@pytest.mark.parametrize(
+    "field, reason",
+    [
+        ("account_occupied_position_slots", "missing_admission_state"),
+        ("symbol_has_position_or_pending_entry", "missing_admission_state"),
+        ("symbol_entry_allowed_at", "missing_admission_state"),
+    ],
+)
+def test_missing_admission_state_blocks_entry(field, reason):
+    decision = _evaluate(evidence=_evidence(**{field: None}))
+    assert not decision.risk_approved
+    assert reason in decision.reasons
+
+
+def test_open_position_limit_includes_pending_slots():
+    decision = _evaluate(evidence=_evidence(account_occupied_position_slots=20))
+    assert not decision.risk_approved
+    assert RiskReason.OPEN_POSITION_LIMIT in decision.reasons
+    assert _evaluate(evidence=_evidence(account_occupied_position_slots=19)).risk_approved
+
+
+def test_duplicate_symbol_blocks_entry_even_with_spare_capacity():
+    decision = _evaluate(evidence=_evidence(symbol_has_position_or_pending_entry=True))
+    assert not decision.risk_approved
+    assert RiskReason.DUPLICATE_ENTRY in decision.reasons
+
+
+def test_churn_window_requires_exact_expiry():
+    decision = _evaluate(
+        evidence=_evidence(symbol_entry_allowed_at=NOW + timedelta(microseconds=1))
+    )
+    assert not decision.risk_approved
+    assert RiskReason.CHURN_LIMIT in decision.reasons
+    assert _evaluate(evidence=_evidence(symbol_entry_allowed_at=NOW)).risk_approved
+
+
+@pytest.mark.parametrize("value", [True, -1, 1.0, "1"])
+def test_occupied_slots_require_exact_nonnegative_integer(value):
+    with pytest.raises(EntryRiskContractError):
+        _evidence(account_occupied_position_slots=value)
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, 1.0, "1", None])
+def test_max_open_positions_requires_exact_positive_integer(value):
+    with pytest.raises(EntryRiskContractError):
+        _limits(max_open_positions=value)
+
+
+@pytest.mark.parametrize("value", [0, 1, "false"])
+def test_duplicate_evidence_requires_boolean(value):
+    with pytest.raises(EntryRiskContractError):
+        _evidence(symbol_has_position_or_pending_entry=value)
+
+
+@pytest.mark.parametrize(
+    "field, original, replacement",
+    [
+        ("account_occupied_position_slots", 20, 0),
+        ("symbol_has_position_or_pending_entry", True, False),
+        ("symbol_entry_allowed_at", NOW + timedelta(minutes=10), NOW),
+    ],
+)
+def test_admission_evidence_cannot_be_mutated_after_sealing(field, original, replacement):
+    evidence = _evidence(**{field: original})
+    object.__setattr__(evidence, field, replacement)
+    with pytest.raises(EntryRiskContractError):
+        _evaluate(evidence=evidence)
+
+
+_PENDING_FIELDS = (
+    "pending_symbol_notional_usd",
+    "pending_sector_notional_usd",
+    "pending_portfolio_notional_usd",
+    "pending_account_notional_usd",
+    "pending_cash_usd",
+    "pending_buying_power_usd",
+    "pending_daily_notional_usd",
+)
+
+
+@pytest.mark.parametrize(
+    "field", ("account_equity_usd", "account_gross_notional_usd") + _PENDING_FIELDS
+)
+def test_missing_account_or_pending_evidence_blocks_entry(field):
+    decision = _evaluate(evidence=_evidence(**{field: None}))
+    assert not decision.risk_approved
+
+
+@pytest.mark.parametrize(
+    "changes, capacity",
+    [
+        ({"pending_symbol_notional_usd": Decimal("1500")}, "symbol"),
+        (
+            {
+                "current_sector_gross_notional_usd": Decimal("24000"),
+                "pending_sector_notional_usd": Decimal("500"),
+            },
+            "sector",
+        ),
+        (
+            {
+                "portfolio_gross_notional_usd": Decimal("74000"),
+                "pending_portfolio_notional_usd": Decimal("500"),
+            },
+            "portfolio",
+        ),
+        (
+            {
+                "account_gross_notional_usd": Decimal("199000"),
+                "pending_account_notional_usd": Decimal("500"),
+            },
+            "account_leverage",
+        ),
+        ({"cash_available_usd": Decimal("1000"), "pending_cash_usd": Decimal("500")}, "cash"),
+        (
+            {"buying_power_usd": Decimal("1000"), "pending_buying_power_usd": Decimal("500")},
+            "buying_power",
+        ),
+        (
+            {
+                "daily_executed_notional_usd": Decimal("49000"),
+                "pending_daily_notional_usd": Decimal("500"),
+            },
+            "daily_notional",
+        ),
+    ],
+)
+def test_pending_commitments_reduce_every_applicable_capacity(changes, capacity):
+    decision = _evaluate(evidence=_evidence(**changes))
+    assert decision.risk_approved
+    assert decision.approved_quantity == 1
+    assert decision.approved_notional_usd == Decimal("333")
+    assert decision.limiting_capacity.value == capacity
+
+
+def test_other_portfolios_exhaust_account_leverage_even_with_local_capacity():
+    decision = _evaluate(evidence=_evidence(account_gross_notional_usd=Decimal("200000")))
+    assert not decision.risk_approved
+    assert decision.reasons == (RiskReason.NO_CAPACITY,)
+
+
+def test_pending_account_leverage_floors_at_exact_boundary_under_hostile_context():
+    evidence = _evidence(
+        account_gross_notional_usd=Decimal("199000"),
+        pending_account_notional_usd=Decimal("1.000000000000000001"),
+    )
+    intent = _intent()
+    limits = _limits()
+    with localcontext() as context:
+        context.prec = 2
+        context.rounding = ROUND_UP
+        decision = _evaluate(evidence=evidence, intent=intent, limits=limits)
+    assert decision.approved_quantity == 2
+    assert decision.limiting_capacity.value == "account_leverage"
+
+
+@pytest.mark.parametrize(
+    "field", ("account_equity_usd", "account_gross_notional_usd") + _PENDING_FIELDS
+)
+@pytest.mark.parametrize(
+    "value", [True, 0.0, "0", Decimal("NaN"), Decimal("Infinity"), Decimal("-1")]
+)
+def test_account_and_pending_money_require_exact_finite_decimals(field, value):
+    with pytest.raises(EntryRiskContractError):
+        _evidence(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "field", ("account_equity_usd", "account_gross_notional_usd") + _PENDING_FIELDS
+)
+def test_account_and_pending_evidence_is_sealed(field):
+    evidence = _evidence(**{field: Decimal("1000")})
+    object.__setattr__(evidence, field, Decimal("2000"))
+    with pytest.raises(EntryRiskContractError):
+        _evaluate(evidence=evidence)
+
+
+@pytest.mark.parametrize(
+    "value", [None, True, 2.0, "2", Decimal("0.99"), Decimal("4.01"), Decimal("NaN")]
+)
+def test_account_leverage_config_requires_exact_supported_decimal(value):
+    with pytest.raises(EntryRiskContractError):
+        _limits(max_account_leverage=value)

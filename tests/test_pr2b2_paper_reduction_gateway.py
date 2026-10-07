@@ -1480,3 +1480,114 @@ async def test_successful_fill_is_settled_and_journal_released_before_gateway_un
     portfolio_a = next(row for row in allocation.allocations if row.portfolio_id == "portfolio-a")
     assert portfolio_a.quantity == 5
     assert harness.journal.replay().active_reservations == ()
+
+
+@pytest.mark.asyncio
+async def test_gateway_ingests_daily_notional_before_journal_release(harness, monkeypatch):
+    from datetime import datetime, timezone
+
+    from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
+    from tests.risk.test_daily_filled_notional import MutableClock, _service
+
+    executor = PaperExecutor()
+    await _bind_runtime(harness, "portfolio-a", executor)
+    _install_broker_boundary(harness, monkeypatch)
+    runtime = harness.context.runtime_contract
+    risk = _service(
+        harness.database.db_path.parent / "risk.db",
+        account_id="paper-simulator-v1:" + runtime.safety_account_scope,
+        portfolio_id="portfolio-a",
+        clock=MutableClock(datetime.now(timezone.utc)),
+    )
+    accounting = PaperFillAccounting(runtime, {"portfolio-a": risk})
+    # Fixture uses reduction-only legacy allocation setup; the dedicated entry
+    # tests exercise real authenticated bootstrap and replay preparation.
+    harness.gateway._fill_accounting = accounting
+    harness.gateway._entry_accounting_ready = True
+    ingest = accounting.ingest
+    calls = []
+
+    async def checked(receipt):
+        assert harness.gateway._account_order_gate.locked()
+        assert harness.journal.replay().active_reservations
+        calls.append(receipt)
+        return await ingest(receipt)
+
+    monkeypatch.setattr(accounting, "ingest", checked)
+    result = await harness.gateway.submit_reduction(
+        order=_order(order_ref="daily-ingest"), portfolio_id="portfolio-a"
+    )
+    assert result.ok is True
+    assert len(calls) == 1
+    assert (
+        risk.current_gross_filled_notional()
+        == calls[0].request.filled_quantity * calls[0].request.fill_price
+    )
+    assert not harness.journal.replay().active_reservations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, True])
+async def test_daily_ingestion_failure_and_cancellation_preserve_committed_fill(
+    harness, monkeypatch, failure
+):
+    from datetime import datetime, timezone
+
+    from robo_trader.risk.paper_fill_accounting import PaperFillAccounting
+    from tests.risk.test_daily_filled_notional import MutableClock, _service
+
+    await _bind_runtime(harness, "portfolio-a", PaperExecutor())
+    _install_broker_boundary(harness, monkeypatch)
+    runtime = harness.context.runtime_contract
+    risk = _service(
+        harness.database.db_path.parent / "risk.db",
+        account_id="paper-simulator-v1:" + runtime.safety_account_scope,
+        portfolio_id="portfolio-a",
+        clock=MutableClock(datetime.now(timezone.utc)),
+    )
+    accounting = PaperFillAccounting(runtime, {"portfolio-a": risk})
+    harness.gateway._fill_accounting = accounting
+    harness.gateway._entry_accounting_ready = True
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = accounting.ingest
+    receipts = []
+
+    async def delayed(receipt):
+        receipts.append(receipt)
+        entered.set()
+        await release.wait()
+        if failure:
+            raise RuntimeError("independent risk authority unavailable")
+        return await original(receipt)
+
+    monkeypatch.setattr(accounting, "ingest", delayed)
+    task = asyncio.create_task(
+        harness.gateway.submit_reduction(
+            order=_order(order_ref="daily-ingest-failure"), portfolio_id="portfolio-a"
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    assert harness.gateway._account_order_gate.locked()
+    assert harness.gateway._entry_accounting_ready is False
+    if not failure:
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    release.set()
+    with pytest.raises(RuntimeError if failure else asyncio.CancelledError):
+        await task
+    receipt = receipts[0]
+    expected = receipt.request.filled_quantity * receipt.request.fill_price
+    if failure:
+        assert harness.gateway._entry_accounting_ready is False
+        assert harness.gateway.terminal_quarantine_reason
+        assert harness.journal.replay().active_reservations
+        assert risk.current_gross_filled_notional() == 0
+        # Recovery projection reads the actual committed outbox. Gateway
+        # quarantine still requires the existing supervised recovery path.
+        monkeypatch.setattr(accounting, "ingest", original)
+        assert (await accounting.replay(harness.database)).fills_recorded == 1
+    else:
+        assert not harness.journal.replay().active_reservations
+    assert risk.current_gross_filled_notional() == expected
+    assert (await accounting.replay(harness.database)).fills_recorded == 0

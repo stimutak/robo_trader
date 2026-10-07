@@ -1,1 +1,1 @@
-HANDOFF_2026-06-13_pnl-and-data-quality-investigation.md
+HANDOFF_2026-09-29_paper_rebuild.md

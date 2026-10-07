@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable
 import aiosqlite
 
 EXACT_STATE_COMPONENT = "paper_exact_state"
-EXACT_STATE_SCHEMA_VERSION = 3
+EXACT_STATE_SCHEMA_VERSION = 4
 
 
 async def _columns(connection: aiosqlite.Connection, table: str) -> set[str]:
@@ -191,10 +191,21 @@ async def _migration_v3(connection: aiosqlite.Connection) -> None:
     """)
 
 
+async def _migration_v4(connection: aiosqlite.Connection) -> None:
+    # Preserve the historical terminal table and every existing FK/payload.
+    await _add_column(
+        connection,
+        "paper_reduction_settlements",
+        "settlement_kind TEXT NOT NULL DEFAULT 'REDUCTION' "
+        "CHECK (settlement_kind IN ('REDUCTION', 'ENTRY'))",
+    )
+
+
 _MIGRATIONS: tuple[tuple[int, Callable[[aiosqlite.Connection], Awaitable[None]]], ...] = (
     (1, _migration_v1),
     (2, _migration_v2),
     (3, _migration_v3),
+    (4, _migration_v4),
 )
 
 _EXPECTED_COLUMNS = {
@@ -498,6 +509,7 @@ _PAPER_SETTLEMENT_HOT_COLUMNS = {
         "timestamp",
     },
     "paper_reduction_settlements": {
+        "settlement_kind",
         "settlement_id",
         "execution_domain_scope",
         "account_scope",
@@ -576,6 +588,7 @@ _PAPER_SETTLEMENT_HOT_COLUMN_TYPES = {
         "timestamp": ("DATETIME", 0),
     },
     "paper_reduction_settlements": {
+        "settlement_kind": ("TEXT", 0),
         "settlement_id": ("TEXT", 1),
         "execution_domain_scope": ("TEXT", 0),
         "account_scope": ("TEXT", 0),
@@ -710,6 +723,8 @@ _PAPER_SETTLEMENT_HOT_TABLE_SQL = {
             committed_at TEXT NOT NULL,
             receipt_fingerprint TEXT NOT NULL,
             schema_version INTEGER NOT NULL,
+            settlement_kind TEXT NOT NULL DEFAULT 'REDUCTION'
+                CHECK (settlement_kind IN ('REDUCTION', 'ENTRY')),
             UNIQUE(execution_domain_scope, account_scope, order_ref),
             FOREIGN KEY(trade_id) REFERENCES trades(id)
         )

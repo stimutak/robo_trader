@@ -252,8 +252,6 @@ def test_exact_fresh_monitor_owned_live_price_satisfies_startup_invariant() -> N
         ("position_qty", True),
         ("position_qty", 1.5),
         ("stop_type", "fixed"),
-        ("created_at", datetime.now()),
-        ("created_at", datetime.now(timezone.utc) + timedelta(hours=1)),
     ],
 )
 def test_stop_structure_matrix_fails_closed(field, value) -> None:
@@ -265,6 +263,34 @@ def test_stop_structure_matrix_fails_closed(field, value) -> None:
         _assert_protection(runner)
 
     assert caught.value.reason_code == "stop_structure_invalid"
+
+
+@pytest.mark.parametrize("tamper", ["naive", "past_tolerance", "future"])
+def test_stop_creation_timestamp_fails_closed(tamper) -> None:
+    runner = _protected_runner()
+    monitor = runner.stop_loss_monitor
+    stop = monitor.active_stops["default:AAPL"]
+    # Derive malformed timestamps from the validation clock, never collection time.
+    now = monitor._utcnow()
+    if tamper == "naive":
+        stop.created_at = now.replace(tzinfo=None)
+    elif tamper == "past_tolerance":
+        stop.created_at = now + timedelta(seconds=5, microseconds=1)
+    else:
+        stop.created_at = now + timedelta(hours=1)
+
+    with pytest.raises(UnprotectedExistingPositionsError) as caught:
+        _assert_protection(runner)
+
+    assert caught.value.reason_code == "stop_structure_invalid"
+
+
+def test_stop_creation_timestamp_at_clock_skew_tolerance_is_valid() -> None:
+    runner = _protected_runner()
+    monitor = runner.stop_loss_monitor
+    monitor.active_stops["default:AAPL"].created_at = monitor._utcnow() + timedelta(seconds=5)
+
+    _assert_protection(runner)
 
 
 @pytest.mark.parametrize("tamper", ["naive", "before_created", "future"])

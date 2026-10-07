@@ -155,10 +155,11 @@ async def _collect_production_marks(
         runtime_contract=runtime_contract,
     )
     artifacts: list[SealedBootstrapEvidenceArtifact] = []
+    active_symbols = tuple(sorted({symbol for _, symbol in mark_identities}))
     for portfolio_id, symbol in mark_identities:
         discovery = await quote_source.get_protective_quotes(
             (symbol,),
-            active_symbols=(symbol,),
+            active_symbols=active_symbols,
         )
         if type(discovery) is not tuple or len(discovery) != 1:
             raise BootstrapEvidencePipelineError(
@@ -182,6 +183,7 @@ async def _collect_production_marks(
             expected_symbol=symbol,
             expected_con_id=quote.con_id,
             expected_transport_generation=identity.transport_generation,
+            expected_active_symbols=active_symbols,
         )
         if type(artifact) is not SealedBootstrapEvidenceArtifact:
             raise BootstrapEvidencePipelineError(

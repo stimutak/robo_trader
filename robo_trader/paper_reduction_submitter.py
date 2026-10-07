@@ -10,7 +10,16 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import (
+    MAX_EMAX,
+    MIN_EMIN,
+    Context,
+    Decimal,
+    DecimalException,
+    Inexact,
+    InvalidOperation,
+    Overflow,
+)
 from enum import Enum
 from typing import Optional
 
@@ -111,7 +120,22 @@ class LocalPaperTerminalOutcome:
                 raise PaperReductionSubmissionError(f"{name} must be an exact non-negative Decimal")
         if self.requested_quantity <= 0:
             raise PaperReductionSubmissionError("requested_quantity must be positive")
-        if self.filled_quantity + self.remaining_quantity != self.requested_quantity:
+        # Nonnegative operands cannot cancel. An exact sum equal to the
+        # requested quantity fits its coefficient length; reject any inexact
+        # sum instead of allowing rounding to disguise an imbalance. This
+        # bounded precision also avoids allocating across large exponent gaps.
+        quantities = (self.requested_quantity, self.filled_quantity, self.remaining_quantity)
+        context = Context(
+            prec=max(len(value.as_tuple().digits) for value in quantities) + 1,
+            Emin=MIN_EMIN,
+            Emax=MAX_EMAX,
+            traps=[Inexact, InvalidOperation, Overflow],
+        )
+        try:
+            reconciled = context.add(self.filled_quantity, self.remaining_quantity)
+        except DecimalException as error:
+            raise PaperReductionSubmissionError("terminal quantities do not reconcile") from error
+        if reconciled != self.requested_quantity:
             raise PaperReductionSubmissionError("terminal quantities do not reconcile")
         if type(self.terminal) is not bool:
             raise PaperReductionSubmissionError("terminal must be a bool")

@@ -1,0 +1,230 @@
+"""Bridge durable simulator settlements into daily gross-filled-notional.
+
+No broker executions are invented: simulator records use a separate account
+namespace and producer-owned local execution IDs. Startup must complete replay
+before any entry admission; this adapter itself grants no order authority.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from contextlib import aclosing
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from typing import Mapping
+
+from robo_trader.config import RuntimeContract
+from robo_trader.database_async import AsyncTradingDatabase
+from robo_trader.paper_entry_receipt import PaperEntrySettlementReceipt, assert_owned_entry_receipt
+from robo_trader.paper_terminal_settlement import (
+    PaperTerminalSettlementReceipt,
+    assert_producer_owned_paper_terminal_settlement_receipt,
+)
+from robo_trader.risk.filled_notional import DailyFilledNotional, ExecutedFill, FillSide
+from robo_trader.safety.journal import SafetyJournal
+from robo_trader.safety.models import parse_fixed_decimal, parse_utc_text
+
+
+class PaperFillAccountingError(RuntimeError):
+    """Paper risk accounting is incomplete or bound to a different scope."""
+
+
+@dataclass(frozen=True)
+class PaperFillReplayResult:
+    receipts_seen: int
+    fills_recorded: int
+
+
+class PaperFillAccounting:
+    """Idempotent projection of the terminal outbox into independent risk state."""
+
+    def __init__(
+        self, runtime: RuntimeContract, ledgers: Mapping[str, DailyFilledNotional]
+    ) -> None:
+        if (
+            type(runtime) is not RuntimeContract
+            or runtime.execution_mode != "paper"
+            or runtime.execution_source != "paper_simulator"
+            or runtime.state_namespace != "paper"
+            or runtime.ibkr_readonly is not True
+            or runtime.safety_execution_domain_scope != "paper-simulator-v1"
+            or not runtime.safety_account_scope
+        ):
+            raise PaperFillAccountingError("accounting requires an explicit paper runtime scope")
+        self._runtime = runtime
+        self._account = "paper-simulator-v1:" + runtime.safety_account_scope
+        self._ledgers = dict(ledgers)
+        if not self._ledgers:
+            raise PaperFillAccountingError("paper risk accounting has no configured scopes")
+        for portfolio, ledger in self._ledgers.items():
+            if type(ledger) is not DailyFilledNotional or ledger.accounting_scope != (
+                self._account,
+                portfolio,
+                "USD",
+            ):
+                raise PaperFillAccountingError("paper risk ledger scope is mismatched")
+        if (
+            len({(ledger.database_path, ledger.anchor_path) for ledger in self._ledgers.values()})
+            != 1
+        ):
+            raise PaperFillAccountingError("paper scopes must share one account-wide risk ledger")
+
+        first = next(iter(self._ledgers.values()))
+        self._ledger_binding = (first.database_path, first.anchor_path)
+
+    def assert_runtime_coverage(
+        self, runtime: RuntimeContract, portfolios: tuple[str, ...]
+    ) -> None:
+        """Require every bootstrapped account portfolio, including inactive scopes."""
+        if type(runtime) is not RuntimeContract or runtime != self._runtime:
+            raise PaperFillAccountingError("paper accounting runtime binding differs")
+        if type(portfolios) is not tuple or not portfolios or set(portfolios) != set(self._ledgers):
+            raise PaperFillAccountingError("paper accounting portfolio coverage is incomplete")
+        for portfolio, ledger in self._ledgers.items():
+            if (
+                type(ledger) is not DailyFilledNotional
+                or ledger.accounting_scope != (self._account, portfolio, "USD")
+                or (ledger.database_path, ledger.anchor_path) != self._ledger_binding
+            ):
+                raise PaperFillAccountingError("paper accounting ledger binding differs")
+
+    async def current_total(self, portfolio_id: str, *, as_of: datetime | None = None) -> Decimal:
+        """Read an independently authenticated daily total without blocking asyncio."""
+        self.assert_runtime_coverage(self._runtime, tuple(self._ledgers))
+        ledger = self._ledgers.get(portfolio_id)
+        if ledger is None:
+            raise PaperFillAccountingError("paper daily total has no matching scope")
+        return await self._run_owned(ledger.current_gross_filled_notional, as_of=as_of)
+
+    @staticmethod
+    async def _run_owned(function, *args, **kwargs):
+        task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        cancellation = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+        result = task.result()
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    def _record_entry(self, receipt, database):
+        assert_owned_entry_receipt(receipt, database=database, runtime_contract=self._runtime)
+        data = json.loads(receipt.record.payload_json)
+        portfolio = data["claim"]["portfolio_id"]
+        ledger = self._ledgers.get(portfolio)
+        if ledger is None:
+            raise PaperFillAccountingError("entry receipt has no matching risk ledger scope")
+        outcome = data["outcome"]
+        quantity = parse_fixed_decimal(outcome["filled_quantity"])
+        if quantity == 0:
+            return False
+        fill = outcome["fill_evidence"]
+        return ledger.record_fill(
+            ExecutedFill(
+                broker_execution_id=fill["execution_id"],
+                side=FillSide.BUY,
+                quantity=quantity,
+                price=parse_fixed_decimal(outcome["exact_fill_price"]),
+                currency="USD",
+                executed_at=parse_utc_text(fill["occurred_at"]),
+            )
+        ).recorded
+
+    def _record(
+        self,
+        receipt: PaperTerminalSettlementReceipt | PaperEntrySettlementReceipt,
+        *,
+        database: AsyncTradingDatabase | None = None,
+    ) -> bool:
+        self.assert_runtime_coverage(self._runtime, tuple(self._ledgers))
+        if type(receipt) is PaperEntrySettlementReceipt:
+            return self._record_entry(receipt, database)
+        assert_producer_owned_paper_terminal_settlement_receipt(receipt)
+        request = receipt.request
+        if (
+            request.execution_domain_scope != self._runtime.safety_execution_domain_scope
+            or request.account_scope != self._runtime.safety_account_scope
+            or receipt.database_path != self._runtime.database_path
+            or receipt.database_identity != self._runtime.database_identity
+        ):
+            raise PaperFillAccountingError("paper receipt scope is mismatched")
+        ledger = self._ledgers.get(request.portfolio_id)
+        if ledger is None or ledger.accounting_scope != (
+            self._account,
+            request.portfolio_id,
+            "USD",
+        ):
+            raise PaperFillAccountingError("paper receipt has no matching risk ledger scope")
+        if request.filled_quantity == 0:
+            return False
+        if request.fill_execution_id is None or request.fill_price is None:
+            raise PaperFillAccountingError("paper fill is missing exact execution evidence")
+        result = ledger.record_fill(
+            ExecutedFill(
+                broker_execution_id=request.fill_execution_id,
+                side=FillSide(request.side.value),
+                quantity=request.filled_quantity,
+                price=request.fill_price,
+                currency="USD",
+                executed_at=request.outcome_at,
+            )
+        )
+        return result.recorded
+
+    async def ingest(
+        self,
+        receipt: PaperTerminalSettlementReceipt | PaperEntrySettlementReceipt,
+        *,
+        database: AsyncTradingDatabase | None = None,
+    ) -> bool:
+        """Record a committed fill without blocking the event loop on fsync.
+
+        If cancelled, drain the durable append before propagating cancellation.
+        Repeating ingestion after a lost response is safe through execution-ID
+        deduplication in the independently authenticated ledger.
+        """
+
+        if database is not None:
+            return await self._run_owned(self._record, receipt, database=database)
+        return await self._run_owned(self._record, receipt)
+
+    async def confirm_entry_settlement(self, receipt, *, database: AsyncTradingDatabase):
+        """Drain accounting and return fresh one-use evidence for journal release.
+
+        Cancellation drains durable accounting before propagating and never
+        returns a confirmation. It does not release reserved entry capacity.
+        """
+        from .paper_entry_accounting_confirmation import _produce_entry_accounting_confirmation
+
+        return await self._run_owned(
+            _produce_entry_accounting_confirmation, self, receipt, database=database
+        )
+
+    async def replay(self, database: AsyncTradingDatabase) -> PaperFillReplayResult:
+        """Replay one complete outbox snapshot; never return success for a prefix."""
+
+        if type(database) is not AsyncTradingDatabase:
+            raise PaperFillAccountingError("replay requires the account-wide database")
+        seen = recorded = 0
+        async with aclosing(
+            database.iter_paper_terminal_receipts(
+                runtime_contract=self._runtime,
+                journal=(
+                    SafetyJournal(self._runtime.safety_journal_path)
+                    if self._runtime.safety_journal_path
+                    else None
+                ),
+            )
+        ) as receipts:
+            async for receipt in receipts:
+                if type(receipt) is PaperEntrySettlementReceipt:
+                    recorded += int(await self.ingest(receipt, database=database))
+                else:
+                    recorded += int(await self.ingest(receipt))
+                seen += 1
+        return PaperFillReplayResult(seen, recorded)

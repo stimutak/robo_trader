@@ -102,7 +102,7 @@ def test_every_direct_ib_import_explicitly_imports_disconnect_guard() -> None:
     expected_direct_users = {
         "robo_trader.connection_manager",
         "robo_trader.clients.async_ibkr_client",
-        "robo_trader.clients.ibkr_subprocess_worker",
+        "robo_trader.clients.exact_historical_decoder",
         "robo_trader.utils.robust_connection",
         "robo_trader.utils.tws_health",
     }
