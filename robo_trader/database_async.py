@@ -2021,6 +2021,17 @@ class AsyncTradingDatabase:
                     await conn.execute("BEGIN IMMEDIATE")
                     await self._prepare_exact_bootstrap_schema(conn)
                 journal_guard.assert_unchanged()
+                if append_equity_checkpoint:
+                    prior_bootstrap = await conn.execute(
+                        "SELECT 1 FROM paper_state_bootstraps "
+                        "WHERE bootstrap_id = ? OR candidate_fingerprint = ?",
+                        (candidate.bootstrap_id, candidate.fingerprint()),
+                    )
+                    if await prior_bootstrap.fetchone() is not None:
+                        raise ExactStateBootstrapError(
+                            "equity checkpoint requires a first bootstrap; "
+                            "it cannot be appended or refreshed by replaying an existing bootstrap"
+                        )
                 for authentication in evidence.authentication_receipts:
                     replay = await conn.execute(
                         """

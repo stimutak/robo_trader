@@ -110,7 +110,7 @@ def assert_running_gateway_matches(selection: GatewaySelection) -> None:
     Full process commands may contain credentials and must never be reported.
     """
     result = subprocess.run(
-        ["ps", "-axo", "command="], capture_output=True, text=True, timeout=5, check=False
+        ["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=5, check=False
     )
     if result.returncode:
         raise GatewaySelectionError("cannot identify existing Gateway processes")

@@ -31,6 +31,8 @@ remain mandatory. An already-running Gateway must have a process classpath
 matching both selected installations; otherwise startup/recovery blocks
 before stopping processes. This proves installation identity, not login,
 API handshake, or that an in-place software replacement updated a loaded JVM.
+Process inspection requests untruncated command output on macOS so long JVM
+classpaths retain the installation and IBC identity evidence.
 
 Before connected-machine verification, install the approved Gateway and IBC
 pair side by side, retain the previous pair and secure settings backups, and
@@ -93,6 +95,8 @@ bootstrapped stale ledger, changed allocation, incomplete evidence or expired
 checkpoint remains blocked. It needs current reconciliation and a separately
 reviewed accounting recovery; no historical timestamp or balance may be
 rewritten to make the check pass.
+Requesting a checkpoint on an existing bootstrap explicitly fails, including
+when that bootstrap already has a checkpoint; replay cannot attach or refresh one.
 
 Read-only broker evidence collection still requires a separately authorized
 connected-machine task. A checkpoint fixes only the freshness condition; it

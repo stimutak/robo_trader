@@ -151,6 +151,28 @@ def test_gateway_manager_launches_exact_pair_without_vendor_defaults(tmp_path, m
     assert kwargs["start_new_session"] is True
 
 
+def test_running_gateway_uses_untruncated_process_evidence(tmp_path, monkeypatch):
+    base = tmp_path / "Applications"
+    _install(base, "10.51")
+    ibc = _ibc(tmp_path)
+    selected = select_gateway(tmp_path, base, {"ROBOTRADER_IBC_PATH": str(ibc)})
+    gateway = base / "IB Gateway 10.51"
+    command = (
+        f"{gateway}/.install4j/jre.bundle/Contents/Home/bin/java "
+        f"-cp {gateway}/jars/gateway.jar:"
+        + ":".join(["dependency.jar"] * 80)
+        + f":{ibc}/IBC.jar ibcalpha.ibc.IbcGateway"
+    )
+
+    def process_list(args, **kwargs):
+        assert args == ["ps", "-axww", "-o", "command="]
+        assert kwargs["capture_output"] and kwargs["text"]
+        return subprocess.CompletedProcess(args, 0, command)
+
+    monkeypatch.setattr(subprocess, "run", process_list)
+    assert_running_gateway_matches(selected)
+
+
 def test_selection_cli_exports_safe_fields_from_synthetic_installations(tmp_path):
     import os
     import sys

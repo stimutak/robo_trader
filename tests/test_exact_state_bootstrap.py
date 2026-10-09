@@ -2289,6 +2289,44 @@ async def test_checkpoint_provenance_tampering_and_copied_ledger_block(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("first_checkpoint", [False, True])
+async def test_requested_checkpoint_cannot_report_success_on_bootstrap_replay(
+    tmp_path: Path, first_checkpoint: bool
+) -> None:
+    from scripts.bootstrap_exact_paper_state import _apply
+
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    candidate, evidence, runtime = _candidate_bundle(path, tmp_path)
+    backup = _backup_receipt(path, tmp_path / "first-backup.db", candidate)
+    result = await _apply(
+        candidate,
+        path,
+        "Seal this synthetic reviewed epoch once, preserving all legacy history.",
+        evidence=evidence,
+        backup_receipt=backup,
+        runtime_contract=runtime,
+        append_equity_checkpoint=first_checkpoint,
+    )
+    assert result["status"] == "BOOTSTRAPPED_GATE_A_STILL_CLOSED"
+    with sqlite3.connect(path) as connection:
+        before = tuple(connection.iterdump())
+    replay_backup = _backup_receipt(path, tmp_path / "replay-backup.db", candidate)
+    with pytest.raises(ExactStateBootstrapError, match="checkpoint requires a first bootstrap"):
+        await _apply(
+            candidate,
+            path,
+            "Request a checkpoint on an existing synthetic epoch; must reject without mutation.",
+            evidence=evidence,
+            backup_receipt=replay_backup,
+            runtime_contract=runtime,
+            append_equity_checkpoint=True,
+        )
+    with sqlite3.connect(path) as connection:
+        assert tuple(connection.iterdump()) == before
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_schema_failure_rolls_back_bootstrap_without_modifying_legacy(tmp_path):
     path = tmp_path / "legacy.db"
     _legacy_database(path)
