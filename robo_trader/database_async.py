@@ -2053,6 +2053,24 @@ class AsyncTradingDatabase:
                         raise ExactStateBootstrapError(
                             "bootstrap identity is already bound to different evidence"
                         )
+                    if append_equity_checkpoint:
+                        checkpoint_table = await conn.execute(
+                            "SELECT 1 FROM main.sqlite_master "
+                            "WHERE name='bootstrap_equity_checkpoints'"
+                        )
+                        checkpoint_row = None
+                        if await checkpoint_table.fetchone() is not None:
+                            checkpoint = await conn.execute(
+                                "SELECT 1 FROM main.bootstrap_equity_checkpoints "
+                                "WHERE bootstrap_id = ?",
+                                (candidate.bootstrap_id,),
+                            )
+                            checkpoint_row = await checkpoint.fetchone()
+                        if checkpoint_row is None:
+                            raise ExactStateBootstrapError(
+                                "bootstrap already committed without an equity checkpoint; "
+                                "the requested checkpoint was not written"
+                            )
                     await conn.rollback()
                     self._verify_exact_state_backup(
                         candidate,
