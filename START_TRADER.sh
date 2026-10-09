@@ -301,23 +301,21 @@ start_gateway() {
     cd "$SCRIPT_DIR"
 
     # Set up IBC environment
-    export TWS_MAJOR_VRSN="10.37"
-    if [ ! -d ~/Applications/"IB Gateway 10.37" ]; then
-        GATEWAY_DIR=$(ls -d ~/Applications/"IB Gateway"* 2>/dev/null | sort -V | tail -1)
-        if [ -n "$GATEWAY_DIR" ]; then
-            export TWS_MAJOR_VRSN=$(basename "$GATEWAY_DIR" | sed 's/IB Gateway //')
-        else
-            echo "   ERROR: No IB Gateway found in ~/Applications"
-            return 1
-        fi
-    fi
+    export TWS_MAJOR_VRSN="$GATEWAY_VERSION"
 
     export IBC_INI="${SCRIPT_DIR}/config/ibc/config.ini"
     export TRADING_MODE="paper"
     export TWOFA_TIMEOUT_ACTION="restart"
-    export IBC_PATH="${SCRIPT_DIR}/IBCMacos-3"
+    export IBC_PATH="$ROBOTRADER_IBC_PATH"
+    export APP=GATEWAY
     export TWS_PATH=~/Applications
     export TWS_SETTINGS_PATH=
+    # Use the runtime bundled and tested with the selected Gateway build.
+    export JAVA_PATH=
+    export TWSUSERID="${IBKR_USERNAME:-}"
+    export TWSPASSWORD="${IBKR_PASSWORD:-}"
+    export FIXUSERID=
+    export FIXPASSWORD=
     export LOG_PATH="${SCRIPT_DIR}/config/ibc/logs"
 
     # Check config exists
@@ -330,10 +328,6 @@ start_gateway() {
 
     # Create log directory
     mkdir -p "$LOG_PATH"
-
-    # Make scripts executable
-    chmod +x "${IBC_PATH}"/*.sh 2>/dev/null || true
-    chmod +x "${IBC_PATH}"/scripts/*.sh 2>/dev/null || true
 
     echo "   Using Gateway version: $TWS_MAJOR_VRSN"
     echo ""
@@ -350,7 +344,7 @@ start_gateway() {
     # Java descendant from a macOS controlling PTY, so preflight's expected
     # launcher exit could still terminate an authenticated paper Gateway.
     exec /usr/bin/nohup "$PYTHON" "$SCRIPT_DIR/scripts/launch_detached.py" \
-        "$IBC_PATH" "$IBC_PATH/gatewaystartmacos.sh" -inline </dev/null \
+        "$IBC_PATH" "$IBC_PATH/scripts/displaybannerandlaunch.sh" </dev/null \
         >"$GATEWAY_LAUNCH_LOG" 2>&1 200>&- &
     IBC_PID=$!
 
@@ -481,6 +475,17 @@ fi
 SAFETY_VERIFY_PYTHON="$PYTHON"
 echo "   ✓ Safety verification interpreter is ready"
 echo ""
+
+# Select once, before touching processes. Recovery inherits this exact pair.
+# The official IBC top-level script overwrites exported settings; use its
+# lower-level launcher with our explicit, validated environment instead.
+if ! GATEWAY_SELECTION=$("$PYTHON" "$SCRIPT_DIR/scripts/select_gateway.py"); then
+    echo "FATAL: Gateway/IBC selection failed; runtime was left untouched." >&2
+    exit 8
+fi
+IFS=$'\t' read -r GATEWAY_VERSION ROBOTRADER_IBC_PATH SELECTED_IBC_VERSION <<< "$GATEWAY_SELECTION"
+export GATEWAY_VERSION ROBOTRADER_IBC_PATH
+echo "   Selected Gateway $GATEWAY_VERSION with IBC $SELECTED_IBC_VERSION"
 
 # Step 0.5: Verify the safety journal before changing any running process or
 # Gateway state. Normal startup may replay this journal but must never create,

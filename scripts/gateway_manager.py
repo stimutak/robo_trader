@@ -50,6 +50,11 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from robo_trader.gateway_selection import (  # noqa: E402
+    GatewaySelectionError,
+    assert_running_gateway_matches,
+    select_gateway,
+)
 from robo_trader.runtime_lifecycle_lock import (  # noqa: E402
     RuntimeLifecycleLock,
     runtime_lifecycle_lock_path,
@@ -306,6 +311,16 @@ def start_gateway(trading_mode: str = "paper", version: Optional[str] = None) ->
         print(f"ERROR: {config_error}. Refusing to start Gateway.")
         return False
 
+    selection = None
+    if PLATFORM == "Darwin":
+        try:
+            selection = select_gateway(PROJECT_ROOT, GATEWAY_BASE, os.environ, version=version)
+            assert_running_gateway_matches(selection)
+        except (GatewaySelectionError, OSError) as exc:
+            print(f"ERROR: {exc}. Refusing to start Gateway.")
+            return False
+        version = selection.version
+
     # Check if already running
     if is_gateway_running():
         print("Gateway is already running.")
@@ -354,9 +369,17 @@ def start_gateway(trading_mode: str = "paper", version: Optional[str] = None) ->
     env["IBC_INI"] = str(IBC_CONFIG)
     env["TRADING_MODE"] = trading_mode
     env["TWOFA_TIMEOUT_ACTION"] = "restart"
-    env["IBC_PATH"] = str(IBC_DIR)
+    ibc_path = selection.ibc_path if selection else IBC_DIR
+    env["IBC_PATH"] = str(ibc_path)
+    env["APP"] = "GATEWAY"
     env["TWS_PATH"] = str(GATEWAY_BASE)
     env["LOG_PATH"] = str(IBC_LOGS)
+    # Explicit lower-level launcher contract: bundled JVM and default settings.
+    # The vendor top-level script normally defines these (and overrides pins).
+    env["JAVA_PATH"] = ""
+    env["TWS_SETTINGS_PATH"] = ""
+    for name in ("TWSUSERID", "TWSPASSWORD", "FIXUSERID", "FIXPASSWORD"):
+        env[name] = ""
 
     # Pass credentials from environment if set
     if os.environ.get("IBKR_USERNAME"):
@@ -366,18 +389,13 @@ def start_gateway(trading_mode: str = "paper", version: Optional[str] = None) ->
 
     # Start Gateway
     if PLATFORM == "Darwin":
-        script = IBC_DIR / "gatewaystartmacos.sh"
+        script = selection.launcher
         if not script.exists():
             print(f"ERROR: IBC script not found: {script}")
             return False
 
-        # Make executable
-        script.chmod(0o755)
-        (IBC_DIR / "scripts" / "displaybannerandlaunch.sh").chmod(0o755)
-        (IBC_DIR / "scripts" / "ibcstart.sh").chmod(0o755)
-
         print("Starting Gateway via IBC...")
-        print("(A new Terminal window will open)")
+        print("(IBC runs in a detached session)")
         print("")
         print("After Gateway starts and you complete 2FA:")
         print(f"  - Wait for Gateway to show 'IB Gateway - READY'")
@@ -385,7 +403,7 @@ def start_gateway(trading_mode: str = "paper", version: Optional[str] = None) ->
         print("")
 
         # Run the start script
-        subprocess.Popen([str(script)], env=env, cwd=str(IBC_DIR))
+        subprocess.Popen([str(script)], env=env, cwd=str(ibc_path), start_new_session=True)
 
     elif PLATFORM == "Windows":
         script = IBC_DIR / "StartGateway.bat"
@@ -480,6 +498,13 @@ def restart_gateway(trading_mode: str = "paper") -> bool:
     if config_error:
         print(f"ERROR: {config_error}. Refusing to restart Gateway.")
         return False
+    if PLATFORM == "Darwin":
+        try:
+            selection = select_gateway(PROJECT_ROOT, GATEWAY_BASE, os.environ)
+            assert_running_gateway_matches(selection)
+        except (GatewaySelectionError, OSError) as exc:
+            print(f"ERROR: {exc}. Refusing to stop Gateway for recovery.")
+            return False
     print("\n" + "=" * 60)
     print("Restarting IB Gateway")
     print("=" * 60 + "\n")

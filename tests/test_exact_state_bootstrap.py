@@ -2177,3 +2177,144 @@ async def test_portfolio_upsert_preserves_bootstrap_foreign_key_row(tmp_path: Pa
         assert connection.execute("SELECT bootstrap_id FROM paper_state_bootstraps").fetchone() == (
             candidate.bootstrap_id,
         )
+
+
+@pytest.mark.asyncio
+async def test_authenticated_equity_checkpoint_recovers_freshness_without_touching_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from robo_trader.equity_checkpoint import checkpoint_values
+    from robo_trader.preflight import CheckStatus, PreflightContext
+    from robo_trader.preflight.equity_history_freshness_check import EquityHistoryFreshnessCheck
+
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    before = inspect_legacy_state(path)
+    candidate, evidence, runtime = _candidate_bundle(path, tmp_path)
+    backup = _backup_receipt(path, tmp_path / "backup.db", candidate)
+    monkeypatch.setattr(
+        "robo_trader.config.load_runtime_contract_from_env", lambda *a, **k: runtime
+    )
+    context = PreflightContext.for_test(tmp_path, env={"RT_DB_PATH": str(path)})
+    assert EquityHistoryFreshnessCheck().run(context).status is CheckStatus.BLOCK
+    report = preview(candidate, path, evidence, runtime, append_equity_checkpoint=True)
+    assert report["authorizes_startup"] is False
+    assert report["equity_checkpoint"] == checkpoint_values(candidate)
+    assert inspect_legacy_state(path) == before
+    database = AsyncTradingDatabase(path, pool_size=1)
+    try:
+        await database.apply_exact_state_bootstrap_offline_atomic(
+            candidate,
+            evidence=evidence,
+            backup_receipt=backup,
+            operator_reason="Append a current reviewed simulator valuation without rewriting history.",
+            runtime_contract=runtime,
+            append_equity_checkpoint=True,
+        )
+    finally:
+        await database.close()
+    assert inspect_legacy_state(path) == before
+    result = EquityHistoryFreshnessCheck().run(context)
+    assert result.status is CheckStatus.PASS
+    assert result.details["max_timestamp"] == checkpoint_values(candidate)["observed_at"]
+    assert result.details["source"] == "authenticated_bootstrap_checkpoint"
+    # A genuine checkpoint expires under the unchanged trading-day threshold.
+    with monkeypatch.context() as time_patch:
+        time_patch.setattr(
+            "robo_trader.preflight.equity_history_freshness_check.get_market_time",
+            lambda: candidate.effective_at + timedelta(days=8),
+        )
+        assert EquityHistoryFreshnessCheck().run(context).status is CheckStatus.BLOCK
+    with sqlite3.connect(path) as conn:
+        stored = conn.execute(
+            "SELECT candidate_fingerprint,valuation_payload_json FROM bootstrap_equity_checkpoints"
+        ).fetchone()
+        assert stored[0] == candidate.fingerprint()
+        assert json.loads(stored[1]) == checkpoint_values(candidate)
+        assert json.loads(stored[1])["equity_text"] != str(before["account_rows"][0]["equity"])
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("DELETE FROM bootstrap_equity_checkpoints")
+    # Current valuation does not release any of the unrelated readiness/BUY gates.
+    assert report["authorizes_startup"] is False
+    # Altering legacy economics makes the checkpoint unusable even if its date is fresh.
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE positions SET quantity=quantity+1 WHERE symbol='NVDA'")
+    assert EquityHistoryFreshnessCheck().run(context).status is CheckStatus.BLOCK
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["tampered_values", "missing_trigger", "copied_database"])
+async def test_checkpoint_provenance_tampering_and_copied_ledger_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    from robo_trader.preflight import CheckStatus, PreflightContext
+    from robo_trader.preflight.equity_history_freshness_check import EquityHistoryFreshnessCheck
+
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    candidate, evidence, runtime = _candidate_bundle(path, tmp_path)
+    backup = _backup_receipt(path, tmp_path / "backup.db", candidate)
+    database = AsyncTradingDatabase(path, pool_size=1)
+    try:
+        await database.apply_exact_state_bootstrap_offline_atomic(
+            candidate,
+            evidence=evidence,
+            backup_receipt=backup,
+            operator_reason="Seal current independently authenticated test-only valuation.",
+            runtime_contract=runtime,
+            append_equity_checkpoint=True,
+        )
+    finally:
+        await database.close()
+    if fault == "copied_database":
+        original = path.with_name("original.db")
+        path.rename(original)
+        shutil.copy2(original, path)
+    else:
+        from robo_trader.equity_checkpoint import _TRIGGER_SQL
+
+        with sqlite3.connect(path) as conn:
+            conn.execute("DROP TRIGGER bootstrap_equity_checkpoints_no_update")
+            if fault == "tampered_values":
+                conn.execute("UPDATE bootstrap_equity_checkpoints SET valuation_payload_json='{}'")
+                conn.execute(_TRIGGER_SQL["bootstrap_equity_checkpoints_no_update"])
+    monkeypatch.setattr(
+        "robo_trader.config.load_runtime_contract_from_env", lambda *a, **k: runtime
+    )
+    context = PreflightContext.for_test(tmp_path, env={"RT_DB_PATH": str(path)})
+    assert EquityHistoryFreshnessCheck().run(context).status is CheckStatus.BLOCK
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_schema_failure_rolls_back_bootstrap_without_modifying_legacy(tmp_path):
+    path = tmp_path / "legacy.db"
+    _legacy_database(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE bootstrap_equity_checkpoints (bootstrap_id TEXT)")
+    candidate, evidence, runtime = _candidate_bundle(path, tmp_path)
+    backup = _backup_receipt(path, tmp_path / "backup.db", candidate)
+    before = inspect_legacy_state(path)
+    database = AsyncTradingDatabase(path, pool_size=1)
+    try:
+        with pytest.raises(ExactStateBootstrapError, match="schema is malformed"):
+            await database.apply_exact_state_bootstrap_offline_atomic(
+                candidate,
+                evidence=evidence,
+                backup_receipt=backup,
+                operator_reason="Test malformed checkpoint rollback with isolated synthetic state.",
+                runtime_contract=runtime,
+                append_equity_checkpoint=True,
+            )
+    finally:
+        await database.close()
+    assert inspect_legacy_state(path) == before
+    with sqlite3.connect(path) as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='paper_state_bootstraps'"
+            ).fetchone()
+            is None
+        )

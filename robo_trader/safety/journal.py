@@ -10,6 +10,7 @@ uses a fresh SQLite connection plus ``BEGIN IMMEDIATE``.
 
 from __future__ import annotations
 
+import _sqlite3
 import ctypes
 import json
 import os
@@ -24,8 +25,6 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional, Tuple
-
-import _sqlite3
 
 from .models import (
     MODEL_VERSION,

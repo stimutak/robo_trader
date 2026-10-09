@@ -7,13 +7,14 @@ Covers the decision matrix:
 - fresh row → PASS
 - Friday-row, Monday-now → PASS (weekend bridge)
 - 3-day-old row → BLOCK
-- multi-portfolio: any-fresh-passes
+- multi-portfolio: all active portfolios must be fresh
 - sqlite read error → BLOCK
 - parsing edge cases on ``count_trading_days``
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -282,22 +283,64 @@ class TestStaleRow:
 
 
 class TestMultiPortfolio:
-    def test_any_fresh_portfolio_passes(
+    @pytest.mark.parametrize(
+        "aggressive_active,expected", [(True, CheckStatus.BLOCK), (False, CheckStatus.PASS)]
+    )
+    def test_disabled_history_cannot_mask_active_portfolio(
         self,
-        equity_db: Callable[..., Path],
-        preflight_context: PreflightContext,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # Aggressive portfolio is stale (10 trading days ago).
-        # Conservative is fresh (today). PASS overall — MAX wins.
+        equity_db,
+        tmp_path,
+        monkeypatch,
+        aggressive_active,
+        expected,
+    ):
         now = datetime(2026, 5, 20, 10, 0, 0)
         equity_db("aggressive", "2026-05-04 16:30:00")
         equity_db("conservative", now.strftime("%Y-%m-%d %H:%M:%S"))
         _freeze_market_time(monkeypatch, now)
+        context = PreflightContext.for_test(
+            tmp_path,
+            env={
+                "PORTFOLIOS": json.dumps(
+                    [
+                        {"id": "aggressive", "active": aggressive_active},
+                        {"id": "conservative", "active": True},
+                    ]
+                )
+            },
+        )
+        result = EquityHistoryFreshnessCheck().run(context)
+        assert result.status is expected
 
+    @pytest.mark.parametrize(
+        "portfolios",
+        [
+            "",
+            "[]",
+            "{}",
+            '[{"id":"a","active":"false"}]',
+            '[{"id":"a","active":false}]',
+            '[{"id":"A"},{"id":"a"}]',
+        ],
+    )
+    def test_malformed_or_no_active_config_blocks(self, equity_db, tmp_path, portfolios):
+        equity_db("default", "2026-05-20 10:00:00")
+        result = EquityHistoryFreshnessCheck().run(
+            PreflightContext.for_test(tmp_path, env={"PORTFOLIOS": portfolios})
+        )
+        assert result.status is CheckStatus.BLOCK
+
+    def test_missing_active_history_cannot_borrow_other_portfolio(self, equity_db, tmp_path):
+        equity_db("other", "2026-05-20 10:00:00")
+        result = EquityHistoryFreshnessCheck().run(PreflightContext.for_test(tmp_path))
+        assert result.status is CheckStatus.BLOCK
+
+    def test_future_timestamp_blocks(self, equity_db, preflight_context, monkeypatch):
+        equity_db("default", "2026-05-21 10:00:00")
+        _freeze_market_time(monkeypatch, datetime(2026, 5, 20, 10, 0, 0))
         result = EquityHistoryFreshnessCheck().run(preflight_context)
-        assert result.status is CheckStatus.PASS
-        assert result.details["trading_days_elapsed"] == 0
+        assert result.status is CheckStatus.BLOCK
+        assert "future" in result.message
 
 
 class TestSqliteError:
@@ -319,7 +362,7 @@ class TestSqliteError:
 
         result = EquityHistoryFreshnessCheck().run(preflight_context)
         assert result.status is CheckStatus.BLOCK
-        assert "sqlite read error" in result.message
+        assert "equity freshness inspection blocked" in result.message
         assert "database is locked" in result.details["error"]
         assert "--force" not in result.remediation
         assert "does not authorize startup" in result.remediation

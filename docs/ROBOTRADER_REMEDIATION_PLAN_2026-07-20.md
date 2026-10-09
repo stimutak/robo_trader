@@ -1676,3 +1676,16 @@ The launch approver must answer all of the following with evidence:
 10. Is the live canary restricted to the approved account, symbols, position count, notional, and expiry?
 
 If any answer is no, unknown, stale, or based only on documentation rather than observed evidence, live trading remains disabled.
+
+### Gateway/startup follow-up (2026-10-09, draft implementation)
+
+The Gateway/software report follow-up adds common installation selection and
+compatibility checks for supervised startup/recovery, per-active-portfolio
+freshness, and an opt-in immutable valuation checkpoint in the existing
+stopped-system authenticated exact bootstrap transaction. Details and rollback
+boundaries are in `docs/GATEWAY_STARTUP_RECOVERY.md`. Synthetic offline tests
+cover provenance, history preservation and fail-closed behavior. This work
+completes no operational gate: actual Mac installation/build/login/handshake,
+operator-reviewed bootstrap, restore and runtime reconciliation evidence
+remain outstanding. Gate A and intentionally dormant BUY authority remain
+closed. PR130 and PR131 remain separate.
