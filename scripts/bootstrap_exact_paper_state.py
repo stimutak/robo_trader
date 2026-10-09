@@ -6,6 +6,9 @@ provide the reviewed reconciliation, zero-exposure broker snapshot, and every
 protective mark artifact. ``preview`` is read-only. ``apply`` additionally
 requires a stopped runtime, a destination-bound confirmation, and a new
 descriptor-verified SQLite online backup before insert-only bootstrap writes.
+The opt-in --append-equity-checkpoint adds a separate immutable valuation
+using the candidate's authenticated observation time and exact economics.
+It never changes daily equity history or authorizes startup/readiness.
 """
 
 from __future__ import annotations
@@ -504,6 +507,8 @@ def preview(
     database_path: Path,
     evidence: ExactStateBootstrapEvidence | None = None,
     runtime_contract: RuntimeContract | None = None,
+    *,
+    append_equity_checkpoint: bool = False,
 ) -> dict[str, object]:
     if Path(candidate.database_path) != database_path:
         raise ExactStateBootstrapError("candidate database path does not match --db-path")
@@ -530,7 +535,7 @@ def preview(
             "candidate does not cover every nonzero position in its portfolio"
         )
     fifo_plan = candidate.fifo_bootstrap_plan()
-    return {
+    result = {
         "authorizes_startup": False,
         "bootstrap_id": candidate.bootstrap_id,
         "candidate_fingerprint": candidate.fingerprint(),
@@ -540,6 +545,17 @@ def preview(
         "schema_version": 1,
         "status": "READY_FOR_OFFLINE_APPLY",
     }
+    if append_equity_checkpoint:
+        if evidence is None or runtime_contract is None:
+            raise ExactStateBootstrapError(
+                "equity checkpoint preview requires authenticated evidence"
+            )
+        from robo_trader.equity_checkpoint import checkpoint_values
+
+        values = checkpoint_values(candidate)
+        result["equity_checkpoint"] = values
+        result["equity_checkpoint_source"] = "AUTHENTICATED_LOCAL_PAPER_BOOTSTRAP"
+    return result
 
 
 async def _apply(
@@ -550,6 +566,7 @@ async def _apply(
     evidence: ExactStateBootstrapEvidence,
     backup_receipt: ExactStateBootstrapBackupReceipt,
     runtime_contract: RuntimeContract,
+    append_equity_checkpoint: bool = False,
 ) -> dict[str, object]:
     database = AsyncTradingDatabase(database_path)
     try:
@@ -559,6 +576,7 @@ async def _apply(
             backup_receipt=backup_receipt,
             operator_reason=operator_reason,
             runtime_contract=runtime_contract,
+            append_equity_checkpoint=append_equity_checkpoint,
         )
     finally:
         await database.close()
@@ -579,12 +597,17 @@ def _required_confirmation(
     candidate: ExactStateBootstrapCandidate,
     runtime_contract: RuntimeContract,
     backup_path: Path,
+    *,
+    append_equity_checkpoint: bool = False,
 ) -> str:
     protected_backup = _absolute_lexical_path(backup_path, "backup target")
-    return (
+    confirmation = (
         f"{APPLY_CONFIRMATION_PREFIX} candidate={candidate.fingerprint()} "
         f"database={runtime_contract.database_identity} backup={protected_backup}"
     )
+    if append_equity_checkpoint:
+        confirmation += " append-equity-checkpoint=yes"
+    return confirmation
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -604,6 +627,11 @@ def _parser() -> argparse.ArgumentParser:
             dest="protective_marks",
         )
         child.add_argument("--json", action="store_true", required=True)
+        child.add_argument(
+            "--append-equity-checkpoint",
+            action="store_true",
+            help="Append a separate current authenticated valuation checkpoint; preserve daily history.",
+        )
         if command == "apply":
             child.add_argument("--backup-path", type=Path, required=True)
             child.add_argument("--reason", required=True)
@@ -629,12 +657,19 @@ def main(argv: list[str] | None = None) -> int:
             expected_runtime_contract=runtime_contract,
         )
         candidate_binding.assert_identity()
-        report = preview(candidate, database_path, evidence, runtime_contract)
+        report = preview(
+            candidate,
+            database_path,
+            evidence,
+            runtime_contract,
+            append_equity_checkpoint=args.append_equity_checkpoint,
+        )
         if args.command == "apply":
             required_confirmation = _required_confirmation(
                 candidate,
                 runtime_contract,
                 args.backup_path,
+                append_equity_checkpoint=args.append_equity_checkpoint,
             )
             if not hmac.compare_digest(args.confirm, required_confirmation):
                 raise ExactStateBootstrapError(
@@ -656,7 +691,13 @@ def main(argv: list[str] | None = None) -> int:
                     expected_runtime_contract=runtime_contract,
                 )
                 candidate_binding.assert_identity()
-                report = preview(candidate, database_path, evidence, runtime_contract)
+                report = preview(
+                    candidate,
+                    database_path,
+                    evidence,
+                    runtime_contract,
+                    append_equity_checkpoint=args.append_equity_checkpoint,
+                )
                 _assert_stopped()
                 backup = _online_backup(database_path, args.backup_path, candidate)
                 candidate_binding.assert_identity()
@@ -671,6 +712,7 @@ def main(argv: list[str] | None = None) -> int:
                             evidence=evidence,
                             backup_receipt=backup.receipt,
                             runtime_contract=runtime_contract,
+                            append_equity_checkpoint=args.append_equity_checkpoint,
                         )
                     )
                     committed = True

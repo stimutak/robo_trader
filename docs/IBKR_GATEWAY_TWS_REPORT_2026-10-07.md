@@ -67,3 +67,23 @@ IBC was retired and its repository archived September 1, 2026. Existing releases
 8. Roll back application/IBC selection and settings if the new combination regresses, provided IBKR still accepts the old version. Retirement can make that rollback unavailable. Do not roll trading records back or restore an old database over newer activity.
 
 The proposed update addresses software currency; an independent investigation of the safety-gate/restart loop is still required to restore reliable operation.
+
+## Repository review and implementation follow-up — October 9
+
+The report was introduced by `1e61a50b8cc39d5fd52e4ccbc9a5f545ec8986b4`.
+Its host/version guidance remains applicable. Code references above describe
+an earlier launch layout: standalone `scripts/start_gateway.sh` is now inert,
+and the authoritative startup preference was at line 304 rather than 113.
+The official IBC top-level macOS script also overwrites exported settings;
+consistent selection must reach the service launcher directly.
+
+The follow-up implementation and recovery boundaries are documented in
+[GATEWAY_STARTUP_RECOVERY.md](GATEWAY_STARTUP_RECOVERY.md). It selects one
+validated Gateway/IBC pair for startup and recovery and checks freshness for
+every active portfolio. The optional authenticated bootstrap valuation is
+separate from daily history and cannot overwrite it. All genuine readiness
+and BUY gates remain in force. Steps 6–7 above are future operational work,
+not authorization to start the trader: Gate A remains closed. Connected-machine
+installation/read-only connectivity and paper simulation require separate
+scopes. Mac-only observations in this report have not been independently
+reproduced in the Linux implementation environment.

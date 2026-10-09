@@ -412,7 +412,7 @@ def test_gateway_launch_has_static_terminal_detachment_contract():
     ]
 
     assert '/usr/bin/nohup "$PYTHON" "$SCRIPT_DIR/scripts/launch_detached.py"' in gateway_launch
-    assert '"$IBC_PATH" "$IBC_PATH/gatewaystartmacos.sh" -inline' in gateway_launch
+    assert '"$IBC_PATH" "$IBC_PATH/scripts/displaybannerandlaunch.sh"' in gateway_launch
     assert "</dev/null" in gateway_launch
     assert 'rotate_log "$GATEWAY_LAUNCH_LOG"' in gateway_launch
     assert '>"$GATEWAY_LAUNCH_LOG" 2>&1' in gateway_launch

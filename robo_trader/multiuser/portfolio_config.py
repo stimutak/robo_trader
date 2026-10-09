@@ -14,7 +14,7 @@ from the existing SYMBOLS and DEFAULT_CASH env vars for backward compatibility.
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional
 
 from ..gatea_containment import validate_gate_a_portfolio_strategies
 from ..logger import get_logger
@@ -138,6 +138,8 @@ class PortfolioConfig:
             symbols = [s.strip() for s in symbols.split(",") if s.strip()]
 
         strategies = None
+        if type(data.get("active", True)) is not bool:
+            raise ValueError("Portfolio active must be a JSON boolean")
         if "enabled_strategies" in data and data["enabled_strategies"] is not None:
             strategies = list(
                 validate_gate_a_portfolio_strategies(
@@ -207,7 +209,7 @@ class PortfolioConfig:
         )
 
 
-def load_portfolio_configs() -> List[PortfolioConfig]:
+def load_portfolio_configs(environ: Mapping[str, str] | None = None) -> List[PortfolioConfig]:
     """Load portfolio configurations from environment.
 
     Reads PORTFOLIOS env var (JSON array of portfolio objects).
@@ -217,7 +219,8 @@ def load_portfolio_configs() -> List[PortfolioConfig]:
     Returns:
         List of PortfolioConfig objects
     """
-    portfolios_json = os.getenv("PORTFOLIOS")
+    env = os.environ if environ is None else environ
+    portfolios_json = env.get("PORTFOLIOS")
 
     if portfolios_json is not None:
         if not portfolios_json.strip():
@@ -271,9 +274,9 @@ def load_portfolio_configs() -> List[PortfolioConfig]:
             raise ValueError(f"Invalid PORTFOLIOS JSON: {e}") from e
 
     # Backward compatibility: create single 'default' portfolio from existing env vars
-    symbols_str = os.getenv("SYMBOLS", "AAPL,MSFT,SPY")
+    symbols_str = env.get("SYMBOLS", "AAPL,MSFT,SPY")
     symbols = [s.strip() for s in symbols_str.split(",") if s.strip()]
-    default_cash = float(os.getenv("DEFAULT_CASH", "100000"))
+    default_cash = float(env.get("DEFAULT_CASH", "100000"))
 
     logger.info(
         f"No PORTFOLIOS env var found. Creating default portfolio: "

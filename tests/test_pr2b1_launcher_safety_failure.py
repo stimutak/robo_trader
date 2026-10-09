@@ -172,6 +172,10 @@ case "$1:$2" in
     printf 'JOURNAL_VERIFIED\\n' >> "$CAPTURE"
     exit 0
     ;;
+  *select_gateway.py:)
+    printf '10.51\\t/synthetic/ibc\\t3.24.2\\n'
+    exit 0
+    ;;
 esac
 exit 99
 """,
@@ -236,6 +240,10 @@ case "$1:$2" in
     ;;
   *manage_paper_safety_journal.py:verify)
     printf 'JOURNAL_VERIFIED\\n' >> "$CAPTURE"
+    exit 0
+    ;;
+  *select_gateway.py:)
+    printf '10.51\\t/synthetic/ibc\\t3.24.2\\n'
     exit 0
     ;;
 esac

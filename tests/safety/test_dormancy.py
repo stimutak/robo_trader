@@ -79,6 +79,19 @@ def test_only_runner_startup_replays_safety_package_without_order_wiring():
     targets += tuple((ROOT / "robo_trader" / "preflight").glob("*.py"))
     for path in targets:
         text = path.read_text(encoding="utf-8")
+        # Preflight may use the inert SQLite descriptor-identity primitive,
+        # but must not import policy/coordinator/order authority or wire it.
+        if path.name == "equity_history_freshness_check.py":
+            tree = ast.parse(text)
+            imports = [
+                node.module
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+                and node.module
+                and node.module.startswith("robo_trader.safety")
+            ]
+            assert imports == ["robo_trader.safety.sqlite_identity"]
+            text = text.replace("robo_trader.safety.sqlite_identity", "sqlite_identity")
         assert "robo_trader.safety" not in text
         assert "safety_runtime_evidence" not in text
         assert "from .safety" not in text

@@ -1830,6 +1830,7 @@ class AsyncTradingDatabase:
         backup_receipt: ExactStateBootstrapBackupReceipt,
         operator_reason: str,
         runtime_contract: object,
+        append_equity_checkpoint: bool = False,
     ) -> ExactStateBootstrapReceipt:
         """Prepare schema and bootstrap an existing raw ledger in one commit."""
 
@@ -1880,6 +1881,7 @@ class AsyncTradingDatabase:
                 connection=connection,
                 transaction_started=True,
                 journal_guard=journal_guard,
+                append_equity_checkpoint=append_equity_checkpoint,
             )
             connection_binding.assert_connection_identity(
                 await self._sqlite_descriptor_identity(connection)
@@ -1956,6 +1958,7 @@ class AsyncTradingDatabase:
         connection: Optional[aiosqlite.Connection] = None,
         transaction_started: bool = False,
         journal_guard: Optional[ExactStateSafetyJournalGuard] = None,
+        append_equity_checkpoint: bool = False,
     ) -> ExactStateBootstrapReceipt:
         """Insert one sealed exact accounting epoch without rewriting legacy rows.
 
@@ -1963,8 +1966,8 @@ class AsyncTradingDatabase:
         trader and Gateway are stopped.  This transaction binds the candidate
         to the currently opened database descriptor, verifies the complete
         legacy projection fingerprint, and inserts only bootstrap/exact-shadow
-        rows.  Existing account, position, trade, and equity-history rows are
-        never updated or deleted.
+        rows. Existing history is never updated or deleted. The offline
+        operator path can explicitly request a separate evidence-backed valuation checkpoint.
         """
 
         if type(candidate) is not ExactStateBootstrapCandidate:
@@ -2018,6 +2021,17 @@ class AsyncTradingDatabase:
                     await conn.execute("BEGIN IMMEDIATE")
                     await self._prepare_exact_bootstrap_schema(conn)
                 journal_guard.assert_unchanged()
+                if append_equity_checkpoint:
+                    prior_bootstrap = await conn.execute(
+                        "SELECT 1 FROM paper_state_bootstraps "
+                        "WHERE bootstrap_id = ? OR candidate_fingerprint = ?",
+                        (candidate.bootstrap_id, candidate.fingerprint()),
+                    )
+                    if await prior_bootstrap.fetchone() is not None:
+                        raise ExactStateBootstrapError(
+                            "equity checkpoint requires a first bootstrap; "
+                            "it cannot be appended or refreshed by replaying an existing bootstrap"
+                        )
                 for authentication in evidence.authentication_receipts:
                     replay = await conn.execute(
                         """
@@ -2337,6 +2351,10 @@ class AsyncTradingDatabase:
                         raise ExactStateBootstrapError(
                             "exact position adoption lost its lineage race"
                         )
+                if append_equity_checkpoint:
+                    from robo_trader.equity_checkpoint import append_bootstrap_checkpoint
+
+                    await append_bootstrap_checkpoint(conn, candidate)
                 final_descriptor = await self._sqlite_descriptor_identity(conn)
                 if final_descriptor != descriptor:
                     raise ExactStateBootstrapError(

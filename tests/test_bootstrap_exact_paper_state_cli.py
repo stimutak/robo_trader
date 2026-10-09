@@ -357,13 +357,14 @@ def test_wrong_typed_confirmation_blocks_before_backup(
         reason="reviewed offline bootstrap",
         confirm="wrong confirmation",
         json=True,
+        append_equity_checkpoint=False,
     )
     parser = SimpleNamespace(parse_args=lambda _argv: args)
     monkeypatch.setattr(cli, "_parser", lambda: parser)
     monkeypatch.setattr(cli, "load_runtime_contract_from_env", lambda **_kwargs: runtime)
     monkeypatch.setattr(cli, "_open_candidate", lambda _path: binding)
     monkeypatch.setattr(cli, "load_exact_state_bootstrap_evidence", lambda **_kwargs: object())
-    monkeypatch.setattr(cli, "preview", lambda *_args: {"status": "ready"})
+    monkeypatch.setattr(cli, "preview", lambda *_args, **_kwargs: {"status": "ready"})
     called = False
 
     def forbidden_backup(*_args: object) -> None:
@@ -400,6 +401,7 @@ def test_post_return_backup_failure_prints_unmistakable_mutated_state(
         reason="reviewed offline bootstrap",
         confirm=confirmation,
         json=True,
+        append_equity_checkpoint=False,
     )
     binding = SimpleNamespace(candidate=candidate, assert_identity=lambda: None, close=lambda: None)
     verification_count = 0
@@ -424,7 +426,7 @@ def test_post_return_backup_failure_prints_unmistakable_mutated_state(
     monkeypatch.setattr(cli, "load_runtime_contract_from_env", lambda **_kwargs: runtime)
     monkeypatch.setattr(cli, "_open_candidate", lambda _path: binding)
     monkeypatch.setattr(cli, "load_exact_state_bootstrap_evidence", lambda **_kwargs: object())
-    monkeypatch.setattr(cli, "preview", lambda *_args: {"status": "ready"})
+    monkeypatch.setattr(cli, "preview", lambda *_args, **_kwargs: {"status": "ready"})
     monkeypatch.setattr(cli, "_assert_stopped", lambda: None)
     monkeypatch.setattr(cli, "_online_backup", lambda *_args: backup)
     monkeypatch.setattr(cli, "_apply", commit_then_return)
@@ -477,6 +479,7 @@ def test_backup_failure_precedes_schema_open_and_leaves_source_byte_identical(
         reason="reviewed offline bootstrap",
         confirm=confirmation,
         json=True,
+        append_equity_checkpoint=False,
     )
     binding = SimpleNamespace(candidate=candidate, assert_identity=lambda: None, close=lambda: None)
     applied = False
@@ -490,7 +493,7 @@ def test_backup_failure_precedes_schema_open_and_leaves_source_byte_identical(
     monkeypatch.setattr(cli, "load_runtime_contract_from_env", lambda **_kwargs: runtime)
     monkeypatch.setattr(cli, "_open_candidate", lambda _path: binding)
     monkeypatch.setattr(cli, "load_exact_state_bootstrap_evidence", lambda **_kwargs: object())
-    monkeypatch.setattr(cli, "preview", lambda *_args: {"status": "ready"})
+    monkeypatch.setattr(cli, "preview", lambda *_args, **_kwargs: {"status": "ready"})
     monkeypatch.setattr(cli, "_assert_stopped", lambda: None)
     monkeypatch.setattr(
         cli,
@@ -515,3 +518,19 @@ def test_backup_failure_precedes_schema_open_and_leaves_source_byte_identical(
             "WHERE name IN ('rt_schema_migrations','paper_state_bootstraps',"
             "'exact_bootstrap_evidence_consumptions')"
         ).fetchone() == (0,)
+
+
+def test_checkpoint_apply_requires_distinct_destination_bound_confirmation(tmp_path):
+    database_path = tmp_path / "ledger.db"
+    database_path.touch()
+    candidate = _candidate(database_path)
+    runtime = SimpleNamespace(database_identity="paper:identity")
+    without_checkpoint = cli._required_confirmation(candidate, runtime, tmp_path / "backup.db")
+    with_checkpoint = cli._required_confirmation(
+        candidate,
+        runtime,
+        tmp_path / "backup.db",
+        append_equity_checkpoint=True,
+    )
+    assert with_checkpoint != without_checkpoint
+    assert with_checkpoint.endswith(" append-equity-checkpoint=yes")

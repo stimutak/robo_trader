@@ -6,6 +6,7 @@ it without importing application configuration, logging, or runtime modules.
 
 from __future__ import annotations
 
+import _sqlite3
 import ctypes
 import os
 import sqlite3
@@ -15,8 +16,6 @@ import sysconfig
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Tuple
-
-import _sqlite3
 
 _SQLITE_FCNTL_FILE_POINTER = 7
 _SQLITE_FCNTL_VFS_POINTER = 27
